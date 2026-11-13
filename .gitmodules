@@ -1,0 +1,6 @@
+[submodule "references/opengfw"]
+	path = references/opengfw
+	url = https://github.com/HyNetworks/OpenGFW.git
+[submodule "references/gfw-rs"]
+	path = references/gfw-rs
+	url = https://github.com/tkob-vh/gfw-rs.git

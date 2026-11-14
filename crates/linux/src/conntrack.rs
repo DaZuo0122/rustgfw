@@ -1,8 +1,26 @@
 //! Conntrack destroy notifications from NETLINK_NETFILTER.
 use std::{
-    io,
+    error::Error,
+    fmt, io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
 };
+
+#[derive(Debug)]
+pub(crate) struct EventsLost;
+
+impl fmt::Display for EventsLost {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("conntrack destroy events lost")
+    }
+}
+
+impl Error for EventsLost {}
+
+pub(crate) fn events_lost(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<EventsLost>())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ConntrackKey {
@@ -26,6 +44,11 @@ pub struct DestroyEvents {
 }
 
 impl DestroyEvents {
+    #[cfg(test)]
+    pub(crate) fn from_fd(fd: OwnedFd) -> Self {
+        Self { fd }
+    }
+
     pub fn open() -> io::Result<Self> {
         // SAFETY: libc socket/bind arguments are initialized and the returned fd is owned.
         let raw = unsafe {
@@ -72,7 +95,7 @@ impl DestroyEvents {
             if size < 0 {
                 let error = io::Error::last_os_error();
                 if error.raw_os_error() == Some(libc::ENOBUFS) {
-                    return Err(io::Error::other("conntrack destroy events lost (ENOBUFS)"));
+                    return Err(io::Error::other(EventsLost));
                 }
                 return match error.kind() {
                     io::ErrorKind::WouldBlock => Ok(()),
@@ -120,9 +143,7 @@ fn parse_destroy_keys(buffer: &[u8]) -> io::Result<Vec<ConntrackKey>> {
             return Err(io::Error::other("malformed conntrack netlink message"));
         }
         if kind == libc::NLMSG_OVERRUN as u16 {
-            return Err(io::Error::other(
-                "conntrack destroy events lost (NLMSG_OVERRUN)",
-            ));
+            return Err(io::Error::other(EventsLost));
         }
         if kind == (1 << 8 | 2) {
             if len < 20 {
@@ -244,7 +265,7 @@ mod tests {
         let mut bytes = vec![0; 16];
         bytes[0..4].copy_from_slice(&16u32.to_ne_bytes());
         bytes[4..6].copy_from_slice(&(libc::NLMSG_OVERRUN as u16).to_ne_bytes());
-        assert!(parse_destroy_keys(&bytes).is_err());
+        assert!(events_lost(&parse_destroy_keys(&bytes).unwrap_err()));
         bytes[4..6].copy_from_slice(&(1u16 << 8 | 2).to_ne_bytes());
         assert!(parse_destroy_keys(&bytes).is_err());
     }

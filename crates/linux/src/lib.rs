@@ -91,7 +91,7 @@ impl PacketIo for NfQueue {
         self.closing_ct
             .retain(|_, at| at.elapsed() < Duration::from_secs(120));
         if let (Some(events), Some(table)) = (&self.destroy_events, &self.dynamic_table) {
-            events.drain(|key| {
+            let result = events.drain(|key| {
                 if let Some(block) = self.blocked_ct.remove(&key) {
                     self.closing_ct.insert(key, Instant::now());
                     if block.installed.is_some() {
@@ -102,7 +102,20 @@ impl PacketIo for NfQueue {
                 } else {
                     Ok(())
                 }
-            })?;
+            });
+            if let Err(error) = result {
+                if !conntrack::events_lost(&error) {
+                    return Err(error);
+                }
+                nft::NftPolicy::new("/usr/sbin/nft").flush_blocked_flows(table)?;
+                self.blocked_ct.clear();
+                self.closing_ct.clear();
+                self.dynamic_table = None;
+                self.destroy_events = None;
+                eprintln!(
+                    "conntrack destroy events lost; disabled ID offload, continuing in userspace"
+                );
+            }
         }
         let mut message = self.queue.recv()?;
         let bytes = message.get_payload();
@@ -250,5 +263,61 @@ mod tests {
         };
         assert!(!offload_due(Some(&failed), now));
         assert!(offload_due(Some(&failed), now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    #[ignore = "requires nft and NFQUEUE in an isolated network namespace"]
+    fn lost_destroy_events_flush_and_disable_id_offload() -> io::Result<()> {
+        use rustgfw_core::KernelPolicy;
+        use std::{os::unix::net::UnixDatagram, process::Command};
+
+        let mut nft = nft::NftPolicy::new("/usr/sbin/nft");
+        let handle = nft.install(&nft::Plan {
+            hook: nft::Hook::Output,
+            queue: 100,
+            rules: vec![],
+            dynamic: nft::DynamicOffload::IdSet,
+            bypass_without_listener: false,
+        })?;
+        let result = (|| {
+            let mut queue = NfQueue::open(100)?;
+            queue.set_dynamic_table(handle.table_name())?;
+            let key = conntrack::ConntrackKey {
+                id: 12345,
+                zone: nfq::ConntrackZone::default(),
+            };
+            nft.block_tcp_flow(handle.table_name(), key)?;
+            queue.blocked_ct.insert(
+                key,
+                BlockedFlow {
+                    installed: Some(Instant::now()),
+                    retry_after: Instant::now(),
+                },
+            );
+            let (sender, receiver) = UnixDatagram::pair()?;
+            queue.destroy_events = Some(conntrack::DestroyEvents::from_fd(receiver.into()));
+            let mut overrun = [0u8; 16];
+            overrun[..4].copy_from_slice(&16u32.to_ne_bytes());
+            overrun[4..6].copy_from_slice(&(libc::NLMSG_OVERRUN as u16).to_ne_bytes());
+            sender.send(&overrun)?;
+            let error = queue
+                .process_one(&mut rustgfw_core::ConstantPolicy(Verdict::Accept))
+                .unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ));
+            assert!(queue.dynamic_table.is_none());
+            assert!(queue.destroy_events.is_none());
+            assert!(queue.blocked_ct.is_empty());
+            let output = Command::new("/usr/sbin/nft")
+                .args(["list", "set", "inet", handle.table_name(), "blocked_ct"])
+                .output()?;
+            assert!(output.status.success());
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("elements ="));
+            Ok::<_, io::Error>(())
+        })();
+        nft.revoke(&handle)?;
+        result
     }
 }

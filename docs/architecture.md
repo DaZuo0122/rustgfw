@@ -15,7 +15,7 @@ Linux NFQUEUE 的 accept 表示恢复 netfilter 遍历，并不绕过其他链�
 
 ## 当前 Linux 路径
 
-`cargo run --release -- nfqueue 100 accept`（或 `drop`）。外部规则模式需要已有 NFQUEUE 规则；指定 `nft=input|output|forward` 则由进程安装和撤销独占 nft 表。使用 `ctmark=0x80000000` 可启用需要预留 mark bit 的动态连接阻断路径。两种模式都需要 CAP_NET_ADMIN。默认队列拥塞不 fail-open；NFQUEUE 接收缓冲溢出时内核丢弃受影响的包，进程限频记录 `ENOBUFS` 后继续处理，避免撤销策略。ID 集合模式下 conntrack 销毁事件流的 `ENOBUFS` 则表示生命周期信息丢失，作为错误退出。关闭 GSO，截断或空载荷丢弃。进程不运行 sudo。
+`cargo run --release -- nfqueue 100 accept`（或 `drop`）。外部规则模式需要已有 NFQUEUE 规则；指定 `nft=input|output|forward` 则由进程安装和撤销独占 nft 表。使用 `ctmark=0x80000000` 可启用需要预留 mark bit 的动态连接阻断路径。两种模式都需要 CAP_NET_ADMIN。默认队列拥塞不 fail-open；NFQUEUE 接收缓冲溢出时内核丢弃受影响的包，进程限频记录 `ENOBUFS` 后继续处理，避免撤销策略。ID 集合模式下 conntrack 销毁事件流的 `ENOBUFS` 或 netlink overrun 表示生命周期信息丢失；后端先清空可能含过期 ID 的内核阻断集合，再关闭 ID 卸载并继续逐包裁决。若集合清空失败，则返回错误。关闭 GSO，截断或空载荷丢弃。进程不运行 sudo。
 
 规则中的 queue bypass（无监听者）与 queue fail-open（队列满）是不同配置。托管模式收到 SIGINT/SIGTERM 时撤销表；崩溃和 SIGKILL 后仍可能留下表。没有无损排空保证。
 
@@ -37,6 +37,8 @@ TCP 重组模块 `core::tcp` 已接入 `core::inspect` 的双向分析路径，�
 
 多 zone 改造后，在隔离本机拓扑中设置 zone 7，与默认 zone 0 同时运行：两条 HTTP 阻断连接分别写入 `(7, id)` 和 `(0, id)` 集合项，后续包经内核丢弃，RST 撤销两个条目。又在隔离转发拓扑中以同一 IPv4/TCP 五元组分别建立 zone 7 与 zone 8 连接，完整握手后前者 HTTP 阻断并内核卸载，后者及后续包放行。缺少握手导致后续包无 conntrack 元数据时，按不同接口路径区分作用域，前者用户态阻断、后者放行。既有 IPv4/IPv6 FORWARD ID 模式和 `ctmark=` 模式回归通过；相同接口与 mark 下的无 conntrack 多 zone 流尚不可区分。
 
+销毁事件丢失恢复在 Debian 隔离网络命名空间中注入 `NLMSG_OVERRUN` 验证：已有内核阻断集合被清空，ID 卸载和销毁事件订阅被停用。IPv4/IPv6 转发及 HTTP 阻断回归通过；真实高负载事件溢出仍未复现。
+
 `ctmark=` 模式另在隔离 IPv4/IPv6 本机与双 veth 转发拓扑验证：HTTP 命中后当前包进入后续 hook 写入 conntrack mark，后续同方向和反向包由内核丢弃；本机被阻断流的 RST 命中清标放行规则。本机每种 IP 版本并行测试 32 条 TCP 连接，16 条命中阻断、16 条允许且可收到反向响应，未见跨连接误阻断。未测试主机与其他防火墙规则共享 mark 位的场景，部署时须预留该位。
 
 现有规则示例：`rustgfw nfqueue 100 accept udp:53:drop tcp:443:drop`。
@@ -44,7 +46,7 @@ TCP 重组模块 `core::tcp` 已接入 `core::inspect` 的双向分析路径，�
 IPv6 扩展头会跳过；原子分片可解析，其他 IP 分片暂时丢弃，需要在 Linux conntrack 重组后入队。非 TCP/UDP 使用默认动作。
 流缓存上限 65536，空闲 120 秒过期；缓存只加速静态传输层规则，不代表 TCP 连接跟踪或重组。规则替换立即清空缓存。单个引擎实例处理一个网络命名空间；同一命名空间内的 conntrack zone 由 `FlowScope` 区分。
 
-1. Linux 长时间压力与故障测试：裁决错误、conntrack 事件丢失和 ID 复用；量化队列拥塞时的丢包率，并验证卸载故障后的恢复。
+1. Linux 长时间压力与故障测试：裁决错误、真实 conntrack 事件丢失和 ID 复用；量化队列拥塞时的丢包率，并验证卸载故障后的恢复。
 2. 方向性 zone 的卸载碰撞风险、同接口同 mark 的无 conntrack 多 zone 流隔离、规则版本与配置热更新；解析 IPv4 非首片及更复杂的 IPv6 扩展头组合。
 3. 用户态内存和时间预算配置、HTTP keep-alive 多请求检查，以及未识别协议的处理策略。
 4. 验证 Windows WFP 静态规则和真实 WinDivert 收发；再设计精确流阻断的生命周期与转发流量卸载。

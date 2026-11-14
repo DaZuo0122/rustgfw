@@ -96,6 +96,9 @@ impl NftPolicy {
             key.zone.id, key.id,
         ))
     }
+    pub fn flush_blocked_flows(&self, table: &str) -> io::Result<()> {
+        self.execute(&format!("flush set inet {table} blocked_ct\n"))
+    }
 }
 impl KernelPolicy for NftPolicy {
     type Rule = Plan;

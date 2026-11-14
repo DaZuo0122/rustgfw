@@ -50,25 +50,54 @@ impl StreamAnalyzer for HttpHost {
             self.header.push(byte);
             if self.header.ends_with(b"\r\n\r\n") {
                 self.finished = true;
-                let Ok(text) = std::str::from_utf8(&self.header) else {
+                let mut lines = self.header.split(|&byte| byte == b'\n');
+                let first = lines.next().unwrap_or_default();
+                let Ok(first) = std::str::from_utf8(first.strip_suffix(b"\r").unwrap_or(first))
+                else {
                     return Analysis::Finished;
                 };
-                let mut lines = text.split("\r\n");
-                let first = lines.next().unwrap_or_default();
-                if !first.ends_with(" HTTP/1.1") && !first.ends_with(" HTTP/1.0") {
+                let mut request = first.split_ascii_whitespace();
+                let (Some(method), Some(target), Some(version)) =
+                    (request.next(), request.next(), request.next())
+                else {
+                    return Analysis::Finished;
+                };
+                if request.next().is_some() || !matches!(version, "HTTP/1.1" | "HTTP/1.0") {
                     return Analysis::Finished;
                 }
+                let mut hosts = Vec::new();
+                let absolute = target
+                    .split_once("://")
+                    .filter(|(scheme, _)| {
+                        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+                    })
+                    .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or_default());
+                if let Some(authority) =
+                    absolute.or_else(|| method.eq_ignore_ascii_case("CONNECT").then_some(target))
+                    && !authority.is_empty()
+                {
+                    hosts.push(Observation {
+                        field: "http.host",
+                        value: authority.to_ascii_lowercase(),
+                    });
+                }
                 for line in lines {
-                    if let Some((key, value)) = line.split_once(':')
-                        && key.eq_ignore_ascii_case("host")
+                    let line = line.strip_suffix(b"\r").unwrap_or(line);
+                    if let Some(colon) = line.iter().position(|&byte| byte == b':')
+                        && line[..colon].eq_ignore_ascii_case(b"host")
+                        && let Ok(value) = std::str::from_utf8(line[colon + 1..].trim_ascii())
                     {
-                        return Analysis::FinalObservations(vec![Observation {
+                        hosts.push(Observation {
                             field: "http.host",
-                            value: value.trim().to_ascii_lowercase(),
-                        }]);
+                            value: value.to_ascii_lowercase(),
+                        });
                     }
                 }
-                return Analysis::Finished;
+                return if hosts.is_empty() {
+                    Analysis::Finished
+                } else {
+                    Analysis::FinalObservations(hosts)
+                };
             }
         }
         Analysis::Pending
@@ -284,6 +313,70 @@ mod tests {
             }])
         );
         assert_eq!(a.feed(b"more"), Analysis::Finished);
+    }
+    #[test]
+    fn http_reports_every_visible_authority() {
+        let mut absolute = HttpHost::default();
+        assert_eq!(
+            absolute.feed(
+                b"GET http://Blocked.Test/path HTTP/1.1\r\nHost: allowed.test\r\nHost: also-blocked.test\r\n\r\n"
+            ),
+            Analysis::FinalObservations(vec![
+                Observation {
+                    field: "http.host",
+                    value: "blocked.test".into(),
+                },
+                Observation {
+                    field: "http.host",
+                    value: "allowed.test".into(),
+                },
+                Observation {
+                    field: "http.host",
+                    value: "also-blocked.test".into(),
+                },
+            ])
+        );
+        let mut connect = HttpHost::default();
+        assert_eq!(
+            connect.feed(b"CONNECT blocked.test:443 HTTP/1.1\r\n\r\n"),
+            Analysis::FinalObservations(vec![Observation {
+                field: "http.host",
+                value: "blocked.test:443".into(),
+            }])
+        );
+    }
+    #[test]
+    fn http_policy_blocks_absolute_uri_or_second_host() {
+        for request in [
+            b"GET http://blocked.test/path HTTP/1.1\r\nHost: allowed.test\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nHost: blocked.test\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nX-Binary: \xff\r\nHost: blocked.test\r\n\r\n".as_slice(),
+        ] {
+            let mut policy = Inspect::http_hosts(
+                crate::ConstantPolicy(Verdict::Accept),
+                vec!["blocked.test".into()],
+            );
+            let syn = tcp(100, 2, b"", false);
+            assert_eq!(
+                policy.evaluate(Packet {
+                    bytes: &syn,
+                    original_len: syn.len(),
+                    checksum_ready: true,
+                    scope: FlowScope::default(),
+                }),
+                Verdict::Accept
+            );
+            let data = tcp(101, 16, request, false);
+            assert_eq!(
+                policy.evaluate(Packet {
+                    bytes: &data,
+                    original_len: data.len(),
+                    checksum_ready: true,
+                    scope: FlowScope::default(),
+                }),
+                Verdict::DropFlow
+            );
+        }
     }
     #[test]
     fn custom_analyzer_matches_its_own_field() {

@@ -29,7 +29,7 @@ HTTP/TLS/DNS TCP 通过 `AnalyzerRule` 注册，共享流表及每方向 TCP 重
 
 TCP 重组模块 `core::tcp` 已接入 `core::inspect` 的双向分析路径，支持连续字节交付、乱序缓存、重复数据裁剪和序号回绕。缓冲区冲突重叠会阻断流；已交付字节不保留副本。
 
-`rustgfw nfqueue 100 accept http-host=blocked.test` 检查首个 HTTP/1 请求的 Host（大小写不敏感，含端口时需完整匹配）。传输层规则先执行，Host 规则进一步阻断。识别前的包会放行；跨包分析不是代理式整请求缓冲。每方向乱序缓存及 HTTP 头各限 16 KiB，最多 4096 个检查流，空闲 120 秒过期。双向 FIN 或未阻断流的 RST 会释放检查状态；单向 FIN 保留反向分析。容量满时先回收已完成且未阻断的检查状态；如果该长连接之后继续发包，可能再次进入首请求分析。当前超长或无法识别的 HTTP 头结束分析并沿用传输层结果；不支持 keep-alive 多请求检查、TLS 或 HTTP/2。连接重用与配置化资源预算仍需完善。
+`rustgfw nfqueue 100 accept http-host=blocked.test` 检查首个 HTTP/1 请求的所有 Host 头、绝对 URI 的 authority，以及 CONNECT 目标（大小写不敏感，含端口时需完整匹配）。任一值命中即阻断；无关头里的非 UTF-8 字节不妨碍 Host 识别。传输层规则先执行，Host 规则进一步阻断。识别前的包会放行；跨包分析不是代理式整请求缓冲。每方向乱序缓存及 HTTP 头各限 16 KiB，最多 4096 个检查流，空闲 120 秒过期。双向 FIN 或未阻断流的 RST 会释放检查状态；单向 FIN 保留反向分析。容量满时先回收已完成且未阻断的检查状态；如果该长连接之后继续发包，可能再次进入首请求分析。当前超长或无法识别的 HTTP 头结束分析并沿用传输层结果；不支持 keep-alive 多请求检查、TLS 或 HTTP/2。连接重用与配置化资源预算仍需完善。
 
 2026-11-13/14 验证：Windows 与 Debian workspace 单元测试及 Clippy `-D warnings` 通过。Debian 使用隔离网络命名空间验证 nftables → NFQUEUE → 引擎路径的 UDP、跨包 HTTP、TLS SNI、DNS、动态 TCP 阻断、RST 撤销及 conntrack 销毁事件。双 veth 转发拓扑中 IPv4/IPv6 UDP 的放行和内核丢弃、分段 HTTP Host 的放行和阻断均通过；UDP nft 计数器分别记录 2 个入队包和 2 个内核丢弃包。两种 IP 版本各连续发送 300 个有序 UDP 包，全部到达。额外通过 prerouting `notrack` 验证无 conntrack ID 的 IPv4/IPv6 HTTP 流仍在用户态阻断，且未写入 `blocked_ct`。20,000 包突发触发 NFQUEUE `ENOBUFS`，修复后进程保持运行且后续包正常交付；这不证明突发中的 UDP 包无损。故障注入移除动态集合但保留队列规则后，`nft` 卸载写入失败仍由用户态阻断且进程保持运行。单条转发 UDP 流以约 1,750 包/秒持续 34 秒，60,000 包全部按序到达，之后 HTTP Host 阻断仍生效；尚未覆盖多流长期高负载及 conntrack 事件流溢出。未使用 sudo，未改主机防火墙。测试辅助脚本放本地忽略目录 `target/`，不提交。
 
@@ -38,6 +38,8 @@ TCP 重组模块 `core::tcp` 已接入 `core::inspect` 的双向分析路径，�
 多 zone 改造后，在隔离本机拓扑中设置 zone 7，与默认 zone 0 同时运行：两条 HTTP 阻断连接分别写入 `(7, id)` 和 `(0, id)` 集合项，后续包经内核丢弃，RST 撤销两个条目。又在隔离转发拓扑中以同一 IPv4/TCP 五元组分别建立 zone 7 与 zone 8 连接，完整握手后前者 HTTP 阻断并内核卸载，后者及后续包放行。缺少握手导致后续包无 conntrack 元数据时，按不同接口路径区分作用域，前者用户态阻断、后者放行。既有 IPv4/IPv6 FORWARD ID 模式和 `ctmark=` 模式回归通过；相同接口与 mark 下的无 conntrack 多 zone 流尚不可区分。
 
 销毁事件丢失恢复在 Debian 隔离网络命名空间中注入 `NLMSG_OVERRUN` 验证：已有内核阻断集合被清空，ID 卸载和销毁事件订阅被停用。IPv4/IPv6 转发及 HTTP 阻断回归通过；真实高负载事件溢出仍未复现。
+
+并发连接回归在隔离本机网络命名空间中以 ID 集合和 `ctmark=` 两种模式各运行 IPv4、IPv6 的 128 条 TCP 连接；每种组合均有 64 条 HTTP 命中被阻断、64 条允许并收到响应，进程保持运行。此测试没有覆盖长时间多流压力。绝对 URI、第二条 Host 和无关非 UTF-8 头的 HTTP 阻断也通过实际 NFQUEUE 路径验证。
 
 `ctmark=` 模式另在隔离 IPv4/IPv6 本机与双 veth 转发拓扑验证：HTTP 命中后当前包进入后续 hook 写入 conntrack mark，后续同方向和反向包由内核丢弃；本机被阻断流的 RST 命中清标放行规则。本机每种 IP 版本并行测试 32 条 TCP 连接，16 条命中阻断、16 条允许且可收到反向响应，未见跨连接误阻断。未测试主机与其他防火墙规则共享 mark 位的场景，部署时须预留该位。
 

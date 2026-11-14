@@ -23,6 +23,9 @@ pub struct LocalFlow {
     pub local: SocketAddr,
     pub remote: SocketAddr,
     pub protocol: Protocol,
+    /// The caller must identify the Windows network compartment. A five-tuple
+    /// alone can refer to different connections in different compartments.
+    pub compartment_id: u32,
 }
 
 pub struct FlowBlock {
@@ -199,7 +202,7 @@ impl WfpPolicy {
 
 fn conditions(
     flow: &LocalFlow,
-    items: &mut [wfp::FWPM_FILTER_CONDITION0; 5],
+    items: &mut [wfp::FWPM_FILTER_CONDITION0; 6],
     ipv6: &mut [wfp::FWP_BYTE_ARRAY16; 2],
 ) -> io::Result<[GUID; 2]> {
     let layers = match (flow.local.ip(), flow.remote.ip()) {
@@ -249,6 +252,9 @@ fn conditions(
         Protocol::Tcp => 6,
         Protocol::Udp => 17,
     };
+    items[5].fieldKey = wfp::FWPM_CONDITION_COMPARTMENT_ID;
+    items[5].conditionValue.r#type = wfp::FWP_UINT32;
+    items[5].conditionValue.Anonymous.uint32 = flow.compartment_id;
     Ok(layers)
 }
 
@@ -257,7 +263,7 @@ impl KernelPolicy for WfpPolicy {
     type Handle = FlowBlock;
 
     fn install(&mut self, flow: &LocalFlow) -> io::Result<FlowBlock> {
-        let mut items = [wfp::FWPM_FILTER_CONDITION0::default(); 5];
+        let mut items = [wfp::FWPM_FILTER_CONDITION0::default(); 6];
         let mut ipv6 = [wfp::FWP_BYTE_ARRAY16::default(); 2];
         let layers = conditions(flow, &mut items, &mut ipv6)?;
         let name = wide("rustgfw blocked flow");
@@ -384,8 +390,9 @@ mod tests {
             local: "192.0.2.1:1234".parse().unwrap(),
             remote: "198.51.100.2:443".parse().unwrap(),
             protocol: Protocol::Tcp,
+            compartment_id: 7,
         };
-        let mut items = [wfp::FWPM_FILTER_CONDITION0::default(); 5];
+        let mut items = [wfp::FWPM_FILTER_CONDITION0::default(); 6];
         let mut ipv6 = [wfp::FWP_BYTE_ARRAY16::default(); 2];
         let layers = conditions(&flow, &mut items, &mut ipv6).unwrap();
         assert!(same_guid(layers[0], wfp::FWPM_LAYER_ALE_AUTH_CONNECT_V4));
@@ -400,7 +407,13 @@ mod tests {
             assert_eq!(items[2].conditionValue.Anonymous.uint16, 1234);
             assert_eq!(items[3].conditionValue.Anonymous.uint16, 443);
             assert_eq!(items[4].conditionValue.Anonymous.uint8, 6);
+            assert_eq!(items[5].conditionValue.Anonymous.uint32, 7);
         }
+        assert!(same_guid(
+            items[5].fieldKey,
+            wfp::FWPM_CONDITION_COMPARTMENT_ID
+        ));
+        assert_eq!(items[5].conditionValue.r#type, wfp::FWP_UINT32);
     }
 
     #[test]
@@ -409,8 +422,9 @@ mod tests {
             local: "[2001:db8::1]:1234".parse().unwrap(),
             remote: "[2001:db8::2]:443".parse().unwrap(),
             protocol: Protocol::Tcp,
+            compartment_id: 9,
         };
-        let mut items = [wfp::FWPM_FILTER_CONDITION0::default(); 5];
+        let mut items = [wfp::FWPM_FILTER_CONDITION0::default(); 6];
         let mut ipv6 = [wfp::FWP_BYTE_ARRAY16::default(); 2];
         let layers = conditions(&flow, &mut items, &mut ipv6).unwrap();
         assert!(same_guid(layers[0], wfp::FWPM_LAYER_ALE_AUTH_CONNECT_V6));
@@ -432,5 +446,10 @@ mod tests {
                 .unwrap()
                 .octets()
         );
+        assert!(same_guid(
+            items[5].fieldKey,
+            wfp::FWPM_CONDITION_COMPARTMENT_ID
+        ));
+        unsafe { assert_eq!(items[5].conditionValue.Anonymous.uint32, 9) };
     }
 }

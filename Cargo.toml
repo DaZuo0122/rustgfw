@@ -1,0 +1,19 @@
+[package]
+name = "rustgfw"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rustgfw-core = { path = "crates/core" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustgfw-linux = { path = "crates/linux" }
+signal-hook = "0.3"
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+rustgfw-windows = { path = "crates/windows" }
+
+[workspace]
+members = ["crates/core", "crates/linux", "crates/windows"]
+resolver = "3"

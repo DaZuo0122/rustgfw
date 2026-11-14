@@ -1,0 +1,9 @@
+[package]
+name = "rustgfw-linux"
+version = "0.1.0"
+edition = "2024"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustgfw-core = { path = "../core" }
+nfq = { version = "0.2.6", features = ["ct"] }
+libc = "0.2"

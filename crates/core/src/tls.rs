@@ -1,5 +1,5 @@
 //! Plaintext TLS ClientHello inspection; ECH inner names are not visible.
-use crate::inspect::{Analysis, StreamAnalyzer};
+use crate::inspect::{Analysis, Observation, StreamAnalyzer};
 
 #[derive(Default)]
 pub struct TlsSni {
@@ -48,7 +48,12 @@ impl StreamAnalyzer for TlsSni {
                 continue;
             }
             self.finished = true;
-            return client_hello_name(&h[4..4 + length]).map_or(Analysis::Finished, Analysis::Host);
+            return client_hello_name(&h[4..4 + length]).map_or(Analysis::Finished, |value| {
+                Analysis::FinalObservations(vec![Observation {
+                    field: "tls.sni",
+                    value,
+                }])
+            });
         }
     }
 }
@@ -161,7 +166,13 @@ mod tests {
             for byte in wire {
                 result = analyzer.feed(&[byte]);
             }
-            assert_eq!(result, Analysis::Host("example.com".into()));
+            assert_eq!(
+                result,
+                Analysis::FinalObservations(vec![Observation {
+                    field: "tls.sni",
+                    value: "example.com".into(),
+                }])
+            );
         }
     }
     #[test]

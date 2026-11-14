@@ -210,11 +210,7 @@ impl Drop for WinDivert {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustgfw_core::{
-        ConstantPolicy,
-        inspect::{HttpHost, Inspect},
-        rules::Rules,
-    };
+    use rustgfw_core::{ConstantPolicy, inspect::Inspect, rules::Rules};
     use std::{
         collections::VecDeque,
         sync::atomic::{AtomicI16, AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -385,10 +381,9 @@ mod tests {
         reply[12..16].copy_from_slice(&[198, 51, 100, 2]);
         reply[16..20].copy_from_slice(&[192, 0, 2, 1]);
         let (mut io, state) = fixture(vec![allowed.clone(), blocked, reply]);
-        let mut policy = Inspect::new(
+        let mut policy = Inspect::http_hosts(
             Rules::new(vec![], Verdict::Accept),
             vec!["blocked.test".into()],
-            || Box::<HttpHost>::default(),
         );
         for _ in 0..3 {
             io.process_one(&mut policy).unwrap();

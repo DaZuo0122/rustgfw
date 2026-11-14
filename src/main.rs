@@ -66,23 +66,20 @@ impl Options {
 
     fn into_policy(self) -> impl rustgfw_core::Policy {
         use rustgfw_core::{dns::DnsPolicy, inspect::Inspect, rules::Rules};
-        let analyzers = vec![
-            AnalyzerRule {
-                hosts: self.http_hosts,
-                port: None,
-                factory: || Box::<rustgfw_core::inspect::HttpHost>::default(),
-            },
-            AnalyzerRule {
-                hosts: self.tls_sni,
-                port: None,
-                factory: || Box::<rustgfw_core::tls::TlsSni>::default(),
-            },
-            AnalyzerRule {
-                hosts: self.dns_names.clone(),
-                port: Some(53),
-                factory: || Box::<rustgfw_core::dns::DnsTcp>::default(),
-            },
-        ];
+        let analyzers = [
+            AnalyzerRule::exact("http.host", self.http_hosts, None, || {
+                Box::<rustgfw_core::inspect::HttpHost>::default()
+            }),
+            AnalyzerRule::exact("tls.sni", self.tls_sni, None, || {
+                Box::<rustgfw_core::tls::TlsSni>::default()
+            }),
+            AnalyzerRule::exact("dns.qname", self.dns_names.clone(), Some(53), || {
+                Box::<rustgfw_core::dns::DnsTcp>::default()
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         DnsPolicy::new(
             Inspect::with_analyzers(Rules::new(self.rules, self.default), analyzers),
             self.dns_names,

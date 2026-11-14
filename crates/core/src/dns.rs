@@ -1,7 +1,7 @@
 //! DNS question inspection. UDP decisions apply to one datagram, not its socket.
 use crate::{
     Packet, Policy, Verdict,
-    inspect::{Analysis, StreamAnalyzer},
+    inspect::{Analysis, Observation, StreamAnalyzer},
     packet::{self, Protocol},
 };
 
@@ -146,7 +146,19 @@ impl StreamAnalyzer for DnsTcp {
             consumed += len + 2;
         }
         self.pending.drain(..consumed);
-        Analysis::Names(names)
+        if names.is_empty() {
+            Analysis::Pending
+        } else {
+            Analysis::Observations(
+                names
+                    .into_iter()
+                    .map(|value| Observation {
+                        field: "dns.qname",
+                        value,
+                    })
+                    .collect(),
+            )
+        }
     }
 }
 
@@ -180,8 +192,8 @@ mod tests {
         let mut parser = DnsTcp::default();
         let mut names = Vec::new();
         for byte in wire {
-            if let Analysis::Names(found) = parser.feed(&[byte]) {
-                names.extend(found);
+            if let Analysis::Observations(found) = parser.feed(&[byte]) {
+                names.extend(found.into_iter().map(|o| o.value));
             }
         }
         assert_eq!(names, ["example.com", "example.com"]);

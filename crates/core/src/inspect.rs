@@ -13,10 +13,17 @@ use std::{
 #[derive(Debug, PartialEq, Eq)]
 pub enum Analysis {
     Pending,
-    Host(String),
-    /// Nonterminal observations, e.g. multiple DNS messages on one TCP stream.
-    Names(Vec<String>),
+    /// Nonterminal facts; a stream may report more facts on later packets.
+    Observations(Vec<Observation>),
+    /// Facts from an analyzer that has completed inspection.
+    FinalObservations(Vec<Observation>),
     Finished,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Observation {
+    pub field: &'static str,
+    pub value: String,
 }
 
 pub trait StreamAnalyzer {
@@ -55,7 +62,10 @@ impl StreamAnalyzer for HttpHost {
                     if let Some((key, value)) = line.split_once(':')
                         && key.eq_ignore_ascii_case("host")
                     {
-                        return Analysis::Host(value.trim().to_ascii_lowercase());
+                        return Analysis::FinalObservations(vec![Observation {
+                            field: "http.host",
+                            value: value.trim().to_ascii_lowercase(),
+                        }]);
                     }
                 }
                 return Analysis::Finished;
@@ -89,8 +99,34 @@ type Key = (SocketAddr, SocketAddr);
 
 pub struct AnalyzerRule {
     pub port: Option<u16>,
-    pub hosts: Vec<String>,
     pub factory: fn() -> Box<dyn StreamAnalyzer>,
+    pub matches: Box<dyn Fn(&Observation) -> bool + Send + Sync>,
+}
+impl AnalyzerRule {
+    pub fn exact(
+        field: &'static str,
+        values: Vec<String>,
+        port: Option<u16>,
+        factory: fn() -> Box<dyn StreamAnalyzer>,
+    ) -> Option<Self> {
+        if values.is_empty() {
+            return None;
+        }
+        let values: Vec<_> = values
+            .into_iter()
+            .map(|value| value.to_ascii_lowercase())
+            .collect();
+        Some(Self {
+            port,
+            factory,
+            matches: Box::new(move |observation| {
+                observation.field == field
+                    && values
+                        .iter()
+                        .any(|value| value.eq_ignore_ascii_case(&observation.value))
+            }),
+        })
+    }
 }
 
 /// Transport policy runs first; application matches can additionally block.
@@ -102,23 +138,15 @@ pub struct Inspect<P> {
     sweep: Instant,
 }
 impl<P> Inspect<P> {
-    pub fn new(transport: P, hosts: Vec<String>, factory: fn() -> Box<dyn StreamAnalyzer>) -> Self {
+    pub fn http_hosts(transport: P, hosts: Vec<String>) -> Self {
         Self::with_analyzers(
             transport,
-            vec![AnalyzerRule {
-                hosts,
-                factory,
-                port: None,
-            }],
+            AnalyzerRule::exact("http.host", hosts, None, || Box::<HttpHost>::default())
+                .into_iter()
+                .collect(),
         )
     }
-    pub fn with_analyzers(transport: P, mut analyzers: Vec<AnalyzerRule>) -> Self {
-        analyzers.retain(|a| !a.hosts.is_empty());
-        for a in &mut analyzers {
-            for host in &mut a.hosts {
-                host.make_ascii_lowercase();
-            }
-        }
+    pub fn with_analyzers(transport: P, analyzers: Vec<AnalyzerRule>) -> Self {
         Self {
             transport,
             analyzers,
@@ -209,13 +237,13 @@ impl<P: Policy> Policy for Inspect<P> {
                             continue;
                         };
                         match analyzer.feed(&bytes) {
-                            Analysis::Host(host) => {
-                                flow.blocked |= rule.hosts.iter().any(|h| h == &host);
-                                *slot = None;
-                            }
                             Analysis::Finished => *slot = None,
-                            Analysis::Names(names) => {
-                                flow.blocked |= names.iter().any(|name| rule.hosts.contains(name));
+                            Analysis::Observations(observations) => {
+                                flow.blocked |= observations.iter().any(|o| (rule.matches)(o));
+                            }
+                            Analysis::FinalObservations(observations) => {
+                                flow.blocked |= observations.iter().any(|o| (rule.matches)(o));
+                                *slot = None;
                             }
                             Analysis::Pending => {}
                         }
@@ -250,9 +278,80 @@ mod tests {
         assert_eq!(a.feed(b"GET / HTTP/1.1\r\nHo"), Analysis::Pending);
         assert_eq!(
             a.feed(b"st: EXAMPLE.COM\r\n\r\nbody"),
-            Analysis::Host("example.com".into())
+            Analysis::FinalObservations(vec![Observation {
+                field: "http.host",
+                value: "example.com".into(),
+            }])
         );
         assert_eq!(a.feed(b"more"), Analysis::Finished);
+    }
+    #[test]
+    fn custom_analyzer_matches_its_own_field() {
+        struct Token;
+        impl StreamAnalyzer for Token {
+            fn feed(&mut self, bytes: &[u8]) -> Analysis {
+                Analysis::Observations(vec![Observation {
+                    field: "custom.token",
+                    value: String::from_utf8_lossy(bytes).into_owned(),
+                }])
+            }
+        }
+        let packet = tcp(101, 16, b"BLOCK", false);
+        let evaluate = |field| {
+            let mut policy = Inspect::with_analyzers(
+                crate::ConstantPolicy(Verdict::Accept),
+                vec![
+                    AnalyzerRule::exact(field, vec!["block".into()], None, || Box::new(Token))
+                        .unwrap(),
+                ],
+            );
+            policy.evaluate(Packet {
+                bytes: &packet,
+                original_len: packet.len(),
+                checksum_ready: true,
+            })
+        };
+        assert_eq!(evaluate("custom.token"), Verdict::DropFlow);
+        assert_eq!(evaluate("http.host"), Verdict::Accept);
+    }
+    #[test]
+    fn tcp_dns_observations_continue_across_messages() {
+        fn query(host: &str) -> Vec<u8> {
+            let mut dns = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+            for label in host.split('.') {
+                dns.push(label.len() as u8);
+                dns.extend_from_slice(label.as_bytes());
+            }
+            dns.extend([0, 0, 1, 0, 1]);
+            let mut wire = (dns.len() as u16).to_be_bytes().to_vec();
+            wire.extend(dns);
+            wire
+        }
+        let mut policy = Inspect::with_analyzers(
+            crate::ConstantPolicy(Verdict::Accept),
+            vec![
+                AnalyzerRule::exact("dns.qname", vec!["blocked.test".into()], Some(53), || {
+                    Box::<crate::dns::DnsTcp>::default()
+                })
+                .unwrap(),
+            ],
+        );
+        let mut feed = |seq, flags, payload: &[u8]| {
+            let mut bytes = tcp(seq, flags, payload, false);
+            bytes[22..24].copy_from_slice(&53u16.to_be_bytes());
+            policy.evaluate(Packet {
+                bytes: &bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+            })
+        };
+        assert_eq!(feed(100, 2, b""), Verdict::Accept);
+        let first = query("allowed.test");
+        assert_eq!(feed(101, 16, &first), Verdict::Accept);
+        assert_eq!(
+            feed(101 + first.len() as u32, 16, &query("blocked.test")),
+            Verdict::DropFlow
+        );
     }
     fn tcp(seq: u32, flags: u8, payload: &[u8], reverse: bool) -> Vec<u8> {
         let mut b = vec![0; 40];
@@ -277,10 +376,9 @@ mod tests {
     }
     #[test]
     fn policy_reassembles_then_blocks_both_directions() {
-        let mut p = Inspect::new(
+        let mut p = Inspect::http_hosts(
             crate::ConstantPolicy(Verdict::Accept),
             vec!["example.com".into()],
-            || Box::<HttpHost>::default(),
         );
         let mut feed = |seq, flags, bytes: &[u8], rev| {
             let b = tcp(seq, flags, bytes, rev);
@@ -305,16 +403,14 @@ mod tests {
         let mut p = Inspect::with_analyzers(
             crate::ConstantPolicy(Verdict::Accept),
             vec![
-                AnalyzerRule {
-                    hosts: vec!["unrelated.test".into()],
-                    port: None,
-                    factory: || Box::<HttpHost>::default(),
-                },
-                AnalyzerRule {
-                    hosts: vec!["blocked.test".into()],
-                    port: None,
-                    factory: || Box::<HttpHost>::default(),
-                },
+                AnalyzerRule::exact("http.host", vec!["unrelated.test".into()], None, || {
+                    Box::<HttpHost>::default()
+                })
+                .unwrap(),
+                AnalyzerRule::exact("http.host", vec!["blocked.test".into()], None, || {
+                    Box::<HttpHost>::default()
+                })
+                .unwrap(),
             ],
         );
         let mut feed = |seq, flags, bytes: &[u8]| {
@@ -350,11 +446,12 @@ mod tests {
     fn unrelated_tcp_ports_do_not_consume_inspection_capacity() {
         let mut p = Inspect::with_analyzers(
             crate::ConstantPolicy(Verdict::Accept),
-            vec![AnalyzerRule {
-                hosts: vec!["blocked.test".into()],
-                port: Some(53),
-                factory: || Box::<HttpHost>::default(),
-            }],
+            vec![
+                AnalyzerRule::exact("http.host", vec!["blocked.test".into()], Some(53), || {
+                    Box::<HttpHost>::default()
+                })
+                .unwrap(),
+            ],
         );
         let packet = tcp(100, 2, b"", false);
         assert_eq!(
@@ -370,10 +467,9 @@ mod tests {
 
     #[test]
     fn completed_tcp_close_releases_inspection_flow() {
-        let mut p = Inspect::new(
+        let mut p = Inspect::http_hosts(
             crate::ConstantPolicy(Verdict::Accept),
             vec!["blocked.test".into()],
-            || Box::<HttpHost>::default(),
         );
         let feed = |p: &mut Inspect<crate::ConstantPolicy>, flags, reverse| {
             let bytes = tcp(100, flags, b"", reverse);
@@ -409,10 +505,9 @@ mod tests {
                 checksum_ready: true,
             })
         }
-        let mut p = Inspect::new(
+        let mut p = Inspect::http_hosts(
             crate::ConstantPolicy(Verdict::Accept),
             vec!["blocked.test".into()],
-            || Box::<HttpHost>::default(),
         );
         for port in 10000u16..14096 {
             assert_eq!(feed(&mut p, port, 100, 2, b"", false), Verdict::Accept);

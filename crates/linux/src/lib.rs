@@ -27,6 +27,7 @@ fn offload_due(block: Option<&BlockedFlow>, now: Instant) -> bool {
 pub struct NfQueue {
     queue: nfq::Queue,
     dynamic_table: Option<String>,
+    mark_offload: Option<u32>,
     destroy_events: Option<conntrack::DestroyEvents>,
     blocked_ct: HashMap<u32, BlockedFlow>,
     closing_ct: HashMap<u32, Instant>,
@@ -59,6 +60,7 @@ impl NfQueue {
         Ok(Self {
             queue,
             dynamic_table: None,
+            mark_offload: None,
             destroy_events: None,
             blocked_ct: HashMap::new(),
             closing_ct: HashMap::new(),
@@ -68,6 +70,9 @@ impl NfQueue {
         self.destroy_events = Some(conntrack::DestroyEvents::open()?);
         self.dynamic_table = Some(table.to_owned());
         Ok(())
+    }
+    pub fn set_mark_offload(&mut self, mask: u32) {
+        self.mark_offload = Some(mask);
     }
 }
 impl PacketIo for NfQueue {
@@ -90,6 +95,7 @@ impl PacketIo for NfQueue {
         }
         let mut message = self.queue.recv()?;
         let bytes = message.get_payload();
+        let has_conntrack = message.get_conntrack().is_some();
         let conntrack_id = message
             .get_conntrack()
             .map(|ct| ct.get_id())
@@ -120,11 +126,18 @@ impl PacketIo for NfQueue {
             self.blocked_ct.remove(&id);
             self.closing_ct.insert(id, Instant::now());
         }
-        message.set_verdict(if verdict == Verdict::Accept || close_blocked {
-            nfq::Verdict::Accept
-        } else {
-            nfq::Verdict::Drop
-        });
+        let mark_block =
+            verdict == Verdict::DropFlow && !rst && has_conntrack && self.mark_offload.is_some();
+        if mark_block {
+            message.set_nfmark(message.get_nfmark() | self.mark_offload.unwrap());
+        }
+        message.set_verdict(
+            if verdict == Verdict::Accept || close_blocked || mark_block {
+                nfq::Verdict::Accept
+            } else {
+                nfq::Verdict::Drop
+            },
+        );
         self.queue.verdict(message)?;
         if verdict == Verdict::DropFlow
             && !close_blocked

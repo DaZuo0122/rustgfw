@@ -26,10 +26,17 @@ impl Hook {
         }
     }
 }
+#[derive(Clone, Copy)]
+pub enum DynamicOffload {
+    IdSet,
+    /// A bit reserved by the operator in the conntrack and packet marks.
+    ConntrackMark(u32),
+}
 pub struct Plan {
     pub hook: Hook,
     pub queue: u16,
     pub rules: Vec<Rule>,
+    pub dynamic: DynamicOffload,
     /// No queue listener: bypass or drop. Independent of queue overflow policy.
     pub bypass_without_listener: bool,
 }
@@ -75,7 +82,7 @@ impl NftPolicy {
             render(&handle.table, plan)
         ))
     }
-    /// Conntrack ID identifies both directions of one connection.
+    /// Conntrack ID is a compact, almost-unique key for both directions.
     pub fn block_tcp_flow(&self, table: &str, conntrack_id: u32) -> io::Result<()> {
         self.execute(&format!(
             "add element inet {table} blocked_ct {{ {conntrack_id} timeout 120s }}\n"
@@ -111,18 +118,31 @@ fn render(table: &str, plan: &Plan) -> String {
         "create table inet {table}\nadd chain inet {table} inspect {{ type filter hook {} priority 0; policy accept; }}\n",
         plan.hook.name()
     );
-    out.push_str(&format!(
-        "add set inet {table} blocked_ct {{ typeof ct id; flags timeout; }}\n"
-    ));
-    out.push_str(&format!(
-        "add rule inet {table} inspect ct event set destroy\n"
-    ));
-    out.push_str(&format!(
-        "add rule inet {table} inspect meta l4proto tcp ct id @blocked_ct tcp flags & rst == rst counter queue num {}\n", plan.queue
-    ));
-    out.push_str(&format!(
-        "add rule inet {table} inspect meta l4proto tcp ct id @blocked_ct counter drop\n"
-    ));
+    match plan.dynamic {
+        DynamicOffload::IdSet => {
+            out.push_str(&format!(
+                "add set inet {table} blocked_ct {{ typeof ct id; flags timeout; }}\n"
+            ));
+            out.push_str(&format!(
+                "add rule inet {table} inspect ct event set destroy\n"
+            ));
+            out.push_str(&format!(
+                "add rule inet {table} inspect meta l4proto tcp ct id @blocked_ct tcp flags & rst == rst counter queue num {}\n", plan.queue
+            ));
+            out.push_str(&format!(
+                "add rule inet {table} inspect meta l4proto tcp ct id @blocked_ct counter drop\n"
+            ));
+        }
+        DynamicOffload::ConntrackMark(mask) => {
+            out.push_str(&format!(
+                "add rule inet {table} inspect meta l4proto tcp ct mark & 0x{mask:08x} != 0 tcp flags & rst == rst ct mark set ct mark & 0x{:08x} counter accept\n",
+                !mask
+            ));
+            out.push_str(&format!(
+                "add rule inet {table} inspect meta l4proto tcp ct mark & 0x{mask:08x} != 0 counter drop\n"
+            ));
+        }
+    }
     for rule in &plan.rules {
         let protocol = match rule.protocol {
             Protocol::Tcp => "tcp",
@@ -162,6 +182,15 @@ fn render(table: &str, plan: &Plan) -> String {
         "add rule inet {table} inspect counter queue num {}{bypass}\n",
         plan.queue
     ));
+    if let DynamicOffload::ConntrackMark(mask) = plan.dynamic {
+        out.push_str(&format!(
+            "add chain inet {table} finish {{ type filter hook {} priority 1; policy accept; }}\n",
+            plan.hook.name()
+        ));
+        out.push_str(&format!(
+            "add rule inet {table} finish meta l4proto tcp meta mark & 0x{mask:08x} != 0 ct mark set ct mark | 0x{mask:08x} counter drop\n"
+        ));
+    }
     out
 }
 
@@ -174,6 +203,7 @@ mod tests {
         let p = Plan {
             hook: Hook::Forward,
             queue: 12,
+            dynamic: DynamicOffload::IdSet,
             bypass_without_listener: false,
             rules: vec![Rule {
                 protocol: Protocol::Udp,
@@ -187,6 +217,21 @@ mod tests {
         assert!(text.starts_with("create table inet test\n"));
     }
     #[test]
+    fn conntrack_mark_is_set_after_queue_verdict() {
+        let plan = Plan {
+            hook: Hook::Forward,
+            queue: 12,
+            dynamic: DynamicOffload::ConntrackMark(0x8000_0000),
+            rules: vec![],
+            bypass_without_listener: false,
+        };
+        let text = render("test", &plan);
+        assert!(text.contains("inspect meta l4proto tcp ct mark & 0x80000000 != 0"));
+        assert!(text.contains("finish { type filter hook forward priority 1"));
+        assert!(text.contains("finish meta l4proto tcp meta mark & 0x80000000 != 0"));
+        assert!(!text.contains("blocked_ct"));
+    }
+    #[test]
     #[ignore = "run in an isolated network namespace with nft and loopback up"]
     fn kernel_install_replace_revoke() -> io::Result<()> {
         let receiver = UdpSocket::bind("127.0.0.1:0")?;
@@ -197,6 +242,7 @@ mod tests {
         let mut plan = Plan {
             hook: Hook::Output,
             queue: 100,
+            dynamic: DynamicOffload::IdSet,
             bypass_without_listener: true,
             rules: vec![Rule {
                 protocol: Protocol::Udp,
@@ -232,6 +278,7 @@ mod tests {
         let plan = Plan {
             hook: Hook::Output,
             queue: 100,
+            dynamic: DynamicOffload::IdSet,
             rules: vec![],
             bypass_without_listener: false,
         };

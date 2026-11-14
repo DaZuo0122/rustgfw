@@ -7,7 +7,7 @@ fn main() -> Result<(), Error> {
     match args.first().map(String::as_str) {
         Some("nfqueue") => run_nfqueue(&args[1..]),
         Some("windivert") => run_windivert(&args[1..]),
-        _ => Err("usage: rustgfw nfqueue <queue> <accept|drop> [rules...] [nft=input|output|forward] | rustgfw windivert <dll> <network|forward> <accept|drop> [rules...]".into()),
+        _ => Err("usage: rustgfw nfqueue <queue> <accept|drop> [rules...] [nft=input|output|forward] [ctmark=0x80000000] | rustgfw windivert <dll> <network|forward> <accept|drop> [rules...]".into()),
     }
 }
 
@@ -18,6 +18,7 @@ struct Options {
     tls_sni: Vec<String>,
     dns_names: Vec<String>,
     nft_hook: Option<String>,
+    ctmark: Option<u32>,
 }
 impl Options {
     fn parse(default: &str, args: &[String]) -> Result<Self, Error> {
@@ -33,6 +34,7 @@ impl Options {
             tls_sni: Vec::new(),
             dns_names: Vec::new(),
             nft_hook: None,
+            ctmark: None,
         };
         for arg in args {
             if let Some(host) = arg.strip_prefix("http-host=") {
@@ -46,6 +48,14 @@ impl Options {
             } else if let Some(hook) = arg.strip_prefix("nft=") {
                 if options.nft_hook.replace(hook.to_owned()).is_some() {
                     return Err("specify at most one nft hook".into());
+                }
+            } else if let Some(mask) = arg.strip_prefix("ctmark=") {
+                let mask = mask
+                    .strip_prefix("0x")
+                    .ok_or("ctmark must be hexadecimal, for example 0x80000000")?;
+                let mask = u32::from_str_radix(mask, 16)?;
+                if mask.count_ones() != 1 || options.ctmark.replace(mask).is_some() {
+                    return Err("specify one reserved ctmark bit".into());
                 }
             } else {
                 options.rules.push(parse_rule(arg)?);
@@ -83,7 +93,7 @@ impl Options {
 #[cfg(target_os = "linux")]
 fn run_nfqueue(args: &[String]) -> Result<(), Error> {
     use rustgfw_core::KernelPolicy;
-    use rustgfw_linux::nft::{Hook, NftPolicy, Plan};
+    use rustgfw_linux::nft::{DynamicOffload, Hook, NftPolicy, Plan};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -104,6 +114,12 @@ fn run_nfqueue(args: &[String]) -> Result<(), Error> {
             _ => Err("nft hook must be input, output or forward"),
         })
         .transpose()?;
+    if options.ctmark.is_some() && hook.is_none() {
+        return Err("ctmark requires a managed nft hook".into());
+    }
+    let dynamic = options
+        .ctmark
+        .map_or(DynamicOffload::IdSet, DynamicOffload::ConntrackMark);
     let stop = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGINT, stop.clone())?;
     signal_hook::flag::register(signal_hook::consts::SIGTERM, stop.clone())?;
@@ -115,13 +131,16 @@ fn run_nfqueue(args: &[String]) -> Result<(), Error> {
                 hook,
                 queue: number,
                 rules: rustgfw_core::offload::compile(&options.rules),
+                dynamic,
                 bypass_without_listener: false,
             })
         })
         .transpose()?;
     if let Some(handle) = &installed {
         eprintln!("installed nft table {}", handle.table_name());
-        if let Err(error) = backend.set_dynamic_table(handle.table_name()) {
+        if let Some(mask) = options.ctmark {
+            backend.set_mark_offload(mask);
+        } else if let Err(error) = backend.set_dynamic_table(handle.table_name()) {
             kernel.revoke(handle)?;
             return Err(error.into());
         }
@@ -184,6 +203,9 @@ fn run_windivert(args: &[String]) -> Result<(), Error> {
     let options = Options::parse(&args[2], &args[3..])?;
     if options.nft_hook.is_some() {
         return Err("nft= is only available with NFQUEUE".into());
+    }
+    if options.ctmark.is_some() {
+        return Err("ctmark= is only available with NFQUEUE".into());
     }
     // Valid ICMP is always accepted by the transport/DPI policy when the
     // default is Accept. Leave it on the native path: WinDivert cannot

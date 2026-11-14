@@ -158,6 +158,7 @@ mod tests {
         let handle = nft.install(&crate::nft::Plan {
             hook: crate::nft::Hook::Output,
             queue: 100,
+            dynamic: crate::nft::DynamicOffload::IdSet,
             rules: vec![],
             bypass_without_listener: true,
         })?;

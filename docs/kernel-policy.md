@@ -1,6 +1,10 @@
 # Kernel policy contract
 
-动态 TCP 阻断：HTTP/TLS/DNS over TCP 分析器确认阻断后返回 `DropFlow`，NFQUEUE 先丢当前包，再把其 conntrack ID 写入本实例表的 `blocked_ct` 超时集合。规则位于静态规则和队列规则之前，匹配同一连接的两个方向；后续 TCP 包直接内核丢弃。没有有效 conntrack ID 时保留用户态阻断。集合条目 120 秒过期；用户态保留已卸载 ID，条目过期后下一包重新入队、丢弃并续装。UDP DNS 的单数据报阻断不会写入集合。
+默认 ID 集合路径：HTTP/TLS/DNS over TCP 分析器确认阻断后返回 `DropFlow`，NFQUEUE 先丢当前包，再把其 conntrack ID 写入本实例表的 `blocked_ct` 超时集合。规则位于静态规则和队列规则之前，匹配同一连接的两个方向；后续 TCP 包直接内核丢弃。没有有效 conntrack ID 时保留用户态阻断。集合条目 120 秒过期；用户态保留已卸载 ID，条目过期后下一包重新入队、丢弃并续装。UDP DNS 的单数据报阻断不会写入集合。
+
+可选 `ctmark=0x80000000` 把动态阻断改为 conntrack mark。该参数必须与 `nft=` 一起使用，值须为单个由部署者预留的 bit；该 bit 同时占用 packet mark 和 conntrack mark。命中 `DropFlow` 时，NFQUEUE 把 bit 写到待裁决包的 packet mark 并放行到下一 nft hook；下一 hook 把 bit OR 到该包所属 conntrack mark，然后丢弃当前包。后续经过所选 hook 的 TCP 包按 conntrack mark 直接丢弃；RST 会清除 bit 并放行。没有 conntrack 信息时仍由用户态逐包阻断。此模式不依赖 32 位 conntrack ID、超时集合、销毁事件或逐流 `nft` 子进程。它只适用于本进程管理的 nft hook，并要求该 bit 在所属网络命名空间中没有被其他规则使用。隔离命名空间里的 IPv4/IPv6 HTTP 阻断及后续内核丢弃已通过实测。
+
+默认 ID 集合模式保留作无需预留 mark 的部署选项。Linux 内核把 `nf_ct_get_id` 定义为近似唯一的 32 位伪 ID，不能保证并发连接绝无碰撞；高并发或多 zone 环境应优先使用预留 mark 的模式，或另行实现具备强连接身份的卸载键。[内核 ID 实现](https://github.com/torvalds/linux/blob/master/net/netfilter/nf_conntrack_core.c)。
 
 每次首次阻断需要调用 `nft` 子进程，吞吐和延迟尚未优化；后续可改用 netlink 批量更新。已记录且尚未到续装时间的 ID 不重复调用 `nft`；集合条目 120 秒过期后，下一个入队包会触发续装。集合写入失败时，后端记录错误并保留该 ID 的用户态阻断，每秒最多重试一次，不撤销整个策略表。被阻断流的 RST 回到 NFQUEUE；已卸载的流撤销内核条目，用户态阻断的流直接清理记录，然后放行关闭包。已排队包不能重装关闭的 ID。nft 规则启用 `ct event set destroy`，后端监听销毁事件并删除本实例记录的 ID。隔离命名空间中的真实 UDP 连接约 35 秒过期后收到了事件；高负载下的事件丢失和恢复仍需测试。事件接收缓冲 `ENOBUFS`、Netlink `NLMSG_OVERRUN` 或被截断的数据报会报错退出，避免把事件丢失误当作普通队列拥塞。conntrack ID 只在所属连接存活期间具备身份意义；事件丢失并发生 ID 复用时仍可能误伤新连接。生产级方案可写 conntrack mark 或强化事件丢失后的恢复。按网络命名空间隔离；多 conntrack zone 的 ID 唯一性仍需验证。
 

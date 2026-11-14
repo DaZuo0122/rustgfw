@@ -1,4 +1,9 @@
-use rustgfw_core::{Verdict, inspect::AnalyzerRule, rules::Rule};
+use rustgfw_core::{
+    Verdict,
+    inspect::{AnalyzerRule, InspectLimits},
+    rules::{Rule, RulesLimits},
+};
+use std::time::Duration;
 
 type Error = Box<dyn std::error::Error>;
 
@@ -7,7 +12,7 @@ fn main() -> Result<(), Error> {
     match args.first().map(String::as_str) {
         Some("nfqueue") => run_nfqueue(&args[1..]),
         Some("windivert") => run_windivert(&args[1..]),
-        _ => Err("usage: rustgfw nfqueue <queue> <accept|drop> [rules...] [nft=input|output|forward] [ctmark=0x80000000] | rustgfw windivert <dll> <network|forward> <accept|drop> [rules...]".into()),
+        _ => Err("usage: rustgfw nfqueue <queue> <accept|drop> [rules...] [nft=input|output|forward] [ctmark=0x80000000] | rustgfw windivert <dll> <network|forward> <accept|drop> [rules...]; shared options: inspect-flows=N transport-flows=N flow-idle-seconds=N reorder-bytes=N http-header-bytes=N".into()),
     }
 }
 
@@ -19,6 +24,9 @@ struct Options {
     dns_names: Vec<String>,
     nft_hook: Option<String>,
     ctmark: Option<u32>,
+    inspect_limits: InspectLimits,
+    rules_limits: RulesLimits,
+    http_header_bytes: usize,
 }
 impl Options {
     fn parse(default: &str, args: &[String]) -> Result<Self, Error> {
@@ -35,6 +43,9 @@ impl Options {
             dns_names: Vec::new(),
             nft_hook: None,
             ctmark: None,
+            inspect_limits: InspectLimits::default(),
+            rules_limits: RulesLimits::default(),
+            http_header_bytes: 16384,
         };
         for arg in args {
             if let Some(host) = arg.strip_prefix("http-host=") {
@@ -57,6 +68,25 @@ impl Options {
                 if mask.count_ones() != 1 || options.ctmark.replace(mask).is_some() {
                     return Err("specify one reserved ctmark bit".into());
                 }
+            } else if let Some(value) = arg.strip_prefix("inspect-flows=") {
+                options.inspect_limits.max_flows = value.parse()?;
+            } else if let Some(value) = arg.strip_prefix("transport-flows=") {
+                options.rules_limits.max_flows = value.parse()?;
+            } else if let Some(value) = arg.strip_prefix("flow-idle-seconds=") {
+                let seconds: u64 = value.parse()?;
+                if seconds == 0 {
+                    return Err("flow-idle-seconds must be positive".into());
+                }
+                let idle = Duration::from_secs(seconds);
+                options.inspect_limits.idle = idle;
+                options.rules_limits.idle = idle;
+            } else if let Some(value) = arg.strip_prefix("reorder-bytes=") {
+                options.inspect_limits.reorder_bytes = value.parse()?;
+            } else if let Some(value) = arg.strip_prefix("http-header-bytes=") {
+                options.http_header_bytes = value.parse()?;
+                if options.http_header_bytes == 0 {
+                    return Err("http-header-bytes must be positive".into());
+                }
             } else {
                 options.rules.push(parse_rule(arg)?);
             }
@@ -66,9 +96,12 @@ impl Options {
 
     fn into_policy(self) -> impl rustgfw_core::Policy {
         use rustgfw_core::{dns::DnsPolicy, inspect::Inspect, rules::Rules};
+        let http_header_bytes = self.http_header_bytes;
         let analyzers = [
-            AnalyzerRule::exact("http.host", self.http_hosts, None, || {
-                Box::<rustgfw_core::inspect::HttpHost>::default()
+            AnalyzerRule::exact("http.host", self.http_hosts, None, move || {
+                Box::new(rustgfw_core::inspect::HttpHost::with_header_limit(
+                    http_header_bytes,
+                ))
             }),
             AnalyzerRule::exact("tls.sni", self.tls_sni, None, || {
                 Box::<rustgfw_core::tls::TlsSni>::default()
@@ -81,7 +114,11 @@ impl Options {
         .flatten()
         .collect();
         DnsPolicy::new(
-            Inspect::with_analyzers(Rules::new(self.rules, self.default), analyzers),
+            Inspect::with_limits(
+                Rules::with_limits(self.rules, self.default, self.rules_limits),
+                analyzers,
+                self.inspect_limits,
+            ),
             self.dns_names,
         )
     }
@@ -285,4 +322,46 @@ fn parse_rule(text: &str) -> Result<Rule, Error> {
         port,
         verdict,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustgfw_core::{FlowScope, Packet, Policy};
+
+    #[test]
+    fn cli_resource_limits_reach_shared_http_policy() {
+        let request = b"GET / HTTP/1.1\r\nHost: blocked.test\r\n\r\n";
+        let mut bytes = vec![0; 40 + request.len()];
+        let length = bytes.len() as u16;
+        bytes[0] = 0x45;
+        bytes[2..4].copy_from_slice(&length.to_be_bytes());
+        bytes[9] = 6;
+        bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+        bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        bytes[22..24].copy_from_slice(&80u16.to_be_bytes());
+        bytes[32] = 0x50;
+        bytes[33] = 0x18;
+        bytes[40..].copy_from_slice(request);
+        let packet = Packet {
+            bytes: &bytes,
+            original_len: bytes.len(),
+            checksum_ready: true,
+            scope: FlowScope::default(),
+        };
+        for (limit, expected) in [(16, Verdict::Accept), (64, Verdict::DropFlow)] {
+            let args = [
+                "http-host=blocked.test".to_owned(),
+                format!("http-header-bytes={limit}"),
+                "inspect-flows=1".to_owned(),
+                "transport-flows=0".to_owned(),
+                "flow-idle-seconds=60".to_owned(),
+                "reorder-bytes=1024".to_owned(),
+            ];
+            let mut policy = Options::parse("accept", &args).unwrap().into_policy();
+            assert_eq!(policy.evaluate(packet), expected);
+        }
+        assert!(Options::parse("accept", &["flow-idle-seconds=0".into()]).is_err());
+    }
 }

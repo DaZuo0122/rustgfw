@@ -32,10 +32,24 @@ pub trait StreamAnalyzer {
 
 /// HTTP/1 initial request headers. Subsequent keep-alive requests need a
 /// transaction parser and are deliberately not advertised by this analyzer.
-#[derive(Default)]
 pub struct HttpHost {
     header: Vec<u8>,
     finished: bool,
+    limit: usize,
+}
+impl Default for HttpHost {
+    fn default() -> Self {
+        Self::with_header_limit(16384)
+    }
+}
+impl HttpHost {
+    pub fn with_header_limit(limit: usize) -> Self {
+        Self {
+            header: Vec::new(),
+            finished: false,
+            limit,
+        }
+    }
 }
 impl StreamAnalyzer for HttpHost {
     fn feed(&mut self, bytes: &[u8]) -> Analysis {
@@ -43,7 +57,7 @@ impl StreamAnalyzer for HttpHost {
             return Analysis::Finished;
         }
         for &byte in bytes {
-            if self.header.len() == 16384 {
+            if self.header.len() == self.limit {
                 self.finished = true;
                 return Analysis::Finished;
             }
@@ -128,7 +142,7 @@ type Key = (FlowScope, SocketAddr, SocketAddr);
 
 pub struct AnalyzerRule {
     pub port: Option<u16>,
-    pub factory: fn() -> Box<dyn StreamAnalyzer>,
+    pub factory: Box<dyn Fn() -> Box<dyn StreamAnalyzer> + Send + Sync>,
     pub matches: Box<dyn Fn(&Observation) -> bool + Send + Sync>,
 }
 impl AnalyzerRule {
@@ -136,7 +150,7 @@ impl AnalyzerRule {
         field: &'static str,
         values: Vec<String>,
         port: Option<u16>,
-        factory: fn() -> Box<dyn StreamAnalyzer>,
+        factory: impl Fn() -> Box<dyn StreamAnalyzer> + Send + Sync + 'static,
     ) -> Option<Self> {
         if values.is_empty() {
             return None;
@@ -147,7 +161,7 @@ impl AnalyzerRule {
             .collect();
         Some(Self {
             port,
-            factory,
+            factory: Box::new(factory),
             matches: Box::new(move |observation| {
                 observation.field == field
                     && values
@@ -158,6 +172,22 @@ impl AnalyzerRule {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct InspectLimits {
+    pub max_flows: usize,
+    pub idle: Duration,
+    pub reorder_bytes: usize,
+}
+impl Default for InspectLimits {
+    fn default() -> Self {
+        Self {
+            max_flows: 4096,
+            idle: Duration::from_secs(120),
+            reorder_bytes: 16384,
+        }
+    }
+}
+
 /// Transport policy runs first; application matches can additionally block.
 /// Inspection is passive: packets before a match are accepted, as in OpenGFW.
 pub struct Inspect<P> {
@@ -165,6 +195,7 @@ pub struct Inspect<P> {
     analyzers: Vec<AnalyzerRule>,
     flows: HashMap<Key, Flow>,
     sweep: Instant,
+    limits: InspectLimits,
 }
 impl<P> Inspect<P> {
     pub fn http_hosts(transport: P, hosts: Vec<String>) -> Self {
@@ -176,11 +207,15 @@ impl<P> Inspect<P> {
         )
     }
     pub fn with_analyzers(transport: P, analyzers: Vec<AnalyzerRule>) -> Self {
+        Self::with_limits(transport, analyzers, InspectLimits::default())
+    }
+    pub fn with_limits(transport: P, analyzers: Vec<AnalyzerRule>, limits: InspectLimits) -> Self {
         Self {
             transport,
             analyzers,
             flows: HashMap::new(),
             sweep: Instant::now(),
+            limits,
         }
     }
     pub fn clear_flows(&mut self) {
@@ -208,7 +243,7 @@ impl<P: Policy> Policy for Inspect<P> {
         let now = Instant::now();
         if now >= self.sweep {
             self.flows
-                .retain(|_, f| now.duration_since(f.seen) < Duration::from_secs(120));
+                .retain(|_, f| now.duration_since(f.seen) < self.limits.idle);
             self.sweep = now + Duration::from_secs(1);
         }
         let (key, direction) = if t.source <= t.destination {
@@ -217,6 +252,13 @@ impl<P: Policy> Policy for Inspect<P> {
             ((packet.scope, t.destination, t.source), 1)
         };
         let initial_syn = (t.tcp_flags & 0x12 == 2).then_some((direction, t.tcp_sequence.unwrap()));
+        if self
+            .flows
+            .get(&key)
+            .is_some_and(|f| now.duration_since(f.seen) >= self.limits.idle)
+        {
+            self.flows.remove(&key);
+        }
         if let Some(syn) = initial_syn
             && self
                 .flows
@@ -225,16 +267,16 @@ impl<P: Policy> Policy for Inspect<P> {
         {
             self.flows.remove(&key);
         }
-        if self.flows.len() >= 4096 && !self.flows.contains_key(&key) {
+        if self.flows.len() >= self.limits.max_flows && !self.flows.contains_key(&key) {
             self.flows.retain(|_, flow| !flow.finished());
-            if self.flows.len() >= 4096 {
+            if self.flows.len() >= self.limits.max_flows {
                 // Active inspection cannot be silently bypassed at capacity.
                 return Verdict::Drop;
             }
         }
         let flow = self.flows.entry(key).or_insert_with(|| Flow {
             directions: std::array::from_fn(|_| Direction {
-                reassembly: Reassembler::new(16384),
+                reassembly: Reassembler::new(self.limits.reorder_bytes),
                 analyzers: self
                     .analyzers
                     .iter()
@@ -602,6 +644,68 @@ mod tests {
             Verdict::Accept
         );
         assert!(p.flows.is_empty());
+    }
+
+    #[test]
+    fn configured_limits_keep_active_inspection_fail_closed() {
+        let mut policy = Inspect::with_limits(
+            crate::ConstantPolicy(Verdict::Accept),
+            vec![
+                AnalyzerRule::exact("http.host", vec!["blocked.test".into()], None, || {
+                    Box::<HttpHost>::default()
+                })
+                .unwrap(),
+            ],
+            InspectLimits {
+                max_flows: 1,
+                reorder_bytes: 2,
+                ..InspectLimits::default()
+            },
+        );
+        let first = tcp(100, 2, b"", false);
+        let mut second = first.clone();
+        second[20..22].copy_from_slice(&12346u16.to_be_bytes());
+        let mut feed = |bytes: &[u8]| {
+            policy.evaluate(Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        assert_eq!(feed(&first), Verdict::Accept);
+        assert_eq!(feed(&second), Verdict::Drop);
+        assert_eq!(feed(&tcp(104, 16, b"abc", false)), Verdict::DropFlow);
+        assert_eq!(feed(&second), Verdict::Drop);
+    }
+
+    #[test]
+    fn analyzer_factory_can_capture_header_budget() {
+        let request = b"GET / HTTP/1.1\r\nHost: blocked.test\r\n\r\n";
+        for (budget, expected) in [(16, Verdict::Accept), (64, Verdict::DropFlow)] {
+            let mut policy = Inspect::with_analyzers(
+                crate::ConstantPolicy(Verdict::Accept),
+                vec![
+                    AnalyzerRule::exact(
+                        "http.host",
+                        vec!["blocked.test".into()],
+                        None,
+                        move || Box::new(HttpHost::with_header_limit(budget)),
+                    )
+                    .unwrap(),
+                ],
+            );
+            let packet = tcp(101, 16, request, false);
+            assert_eq!(
+                policy.evaluate(Packet {
+                    bytes: &packet,
+                    original_len: packet.len(),
+                    checksum_ready: true,
+                    scope: FlowScope::default(),
+                }),
+                expected
+            );
+        }
     }
 
     #[test]

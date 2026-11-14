@@ -35,7 +35,9 @@ impl ConntrackKey {
             nfq::ZoneDirection::Original => 1,
             nfq::ZoneDirection::Reply => 2,
         };
-        rustgfw_core::FlowScope(1 + u128::from(self.zone.id) + (direction << 16))
+        rustgfw_core::FlowScope(
+            1 + u128::from(self.zone.id) + (direction << 16) + (u128::from(self.id) << 32),
+        )
     }
 }
 
@@ -197,6 +199,7 @@ fn parse_destroy_keys(buffer: &[u8]) -> io::Result<Vec<ConntrackKey>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustgfw_core::{Packet, Policy, Verdict, inspect::Inspect, rules::Rules};
     use std::os::unix::net::UnixDatagram;
     fn attr(ty: u16, value: &[u8]) -> Vec<u8> {
         let len = (value.len() + 4) as u16;
@@ -277,6 +280,40 @@ mod tests {
         bytes[4..6].copy_from_slice(&(1u16 << 8 | 2).to_ne_bytes());
         assert!(parse_destroy_keys(&bytes).is_err());
         assert!(parse_destroy_keys(&bytes[..3]).is_err());
+    }
+    #[test]
+    fn equal_tuples_with_distinct_conntrack_ids_keep_separate_inspection() {
+        let mut policy = Inspect::http_hosts(
+            Rules::new(vec![], Verdict::Accept),
+            vec!["blocked.test".into()],
+        );
+        let mut bytes = vec![0; 40 + b"GET / HTTP/1.1\r\nHost: blocked.test\r\n\r\n".len()];
+        let length = bytes.len() as u16;
+        bytes[0] = 0x45;
+        bytes[2..4].copy_from_slice(&length.to_be_bytes());
+        bytes[9] = 6;
+        bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+        bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        bytes[22..24].copy_from_slice(&80u16.to_be_bytes());
+        bytes[32] = 0x50;
+        bytes[33] = 0x18;
+        bytes[40..].copy_from_slice(b"GET / HTTP/1.1\r\nHost: blocked.test\r\n\r\n");
+        let zone = nfq::ConntrackZone {
+            id: 8,
+            direction: nfq::ZoneDirection::Reply,
+        };
+        let evaluate = |policy: &mut Inspect<Rules>, bytes: &[u8], id| {
+            policy.evaluate(Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: ConntrackKey { id, zone }.scope(),
+            })
+        };
+        assert_eq!(evaluate(&mut policy, &bytes, 42), Verdict::DropFlow);
+        bytes[40..].copy_from_slice(b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n");
+        assert_eq!(evaluate(&mut policy, &bytes, 43), Verdict::Accept);
     }
     #[test]
     fn malformed_and_truncated_event_datagrams_report_lost_lifecycle() -> io::Result<()> {

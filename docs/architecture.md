@@ -9,7 +9,7 @@
 - `rustgfw-windows`：通过 WinDivert 2.2 DLL 捕获和重新注入网络层包，原样保留 WinDivert 地址；本机流量由 WFP 静态阻断开头连续的丢弃规则，转发流量由 WinDivert DROP 句柄执行同一静态前缀。已具备 FLOW 事件读取和按 compartment 限定的精确流规则接口；WinDivert 事件缺少 compartment ID，运行时关联与卸载生命周期尚未接通。
 - 根二进制：按 `nfqueue` 或 `windivert` 选择 I/O 后端，共用默认动作、有序规则和应用层分析器；Linux 的 `nft=input|output|forward` 管理本实例 nft 表。
 
-`PacketIo` 保持内核消息所有权直到裁决；错误上报调用者。`KernelPolicy` 独立描述安装和撤销，由 Linux 的 `NftPolicy` 实现。NFQUEUE 后端默认用 `(ct zone, ct id)` 集合卸载已阻断的 TCP 流；可选 `ctmark=` 用预留 bit 在下一 nft hook 写入 conntrack mark，从而避免依赖近似唯一的 32 位 ID。只写入 packet mark 并不等于连接策略生效。Linux 从 NFQUEUE 的 conntrack 属性取得 zone，把有方向的 zone 一并纳入用户态流作用域和销毁事件键；缺少 conntrack 元数据时以无序入出接口对及 packet mark 建立单独作用域，保留跨包检查。若不同 zone 共用这些接口与 mark，内核未提供 zone 元数据，用户态仍无法区分它们。Windows 本机网络层按 WinDivert 接口和子接口编号区分作用域；转发层仍使用实例默认作用域，以保留跨接口的双向流状态。规则版本与方向性 zone 的内核卸载碰撞风险仍待完善。
+`PacketIo` 保持内核消息所有权直到裁决；错误上报调用者。`KernelPolicy` 独立描述安装和撤销，由 Linux 的 `NftPolicy` 实现。NFQUEUE 后端默认用 `(ct zone, ct id)` 集合卸载已阻断的 TCP 流；可选 `ctmark=` 用预留 bit 在下一 nft hook 写入 conntrack mark，从而避免依赖近似唯一的 32 位 ID。只写入 packet mark 并不等于连接策略生效。Linux 从 NFQUEUE 的 conntrack 属性取得 zone 和 ID，把两者纳入用户态流作用域，并在销毁事件键中保留有方向的 zone；缺少 conntrack 元数据时以无序入出接口对及 packet mark 建立单独作用域，保留跨包检查。若不同 zone 共用这些接口与 mark，内核未提供 zone 元数据，用户态仍无法区分它们。Windows 本机网络层按 WinDivert 接口和子接口编号区分作用域；转发层仍使用实例默认作用域，以保留跨接口的双向流状态。规则版本与方向性 zone 的内核卸载碰撞风险仍待完善。
 
 Linux NFQUEUE 的 accept 表示恢复 netfilter 遍历，并不绕过其他链；Windows WinDivert 放行需要重新注入捕获的包，WFP 过滤规则的优先级与终止行为也不能映射成 Linux mark。用户提到的 wpf 在这里按 Windows Filtering Platform（WFP）理解。Windows 后端的当前边界见 [windows-backend.md](windows-backend.md)。
 
@@ -38,6 +38,8 @@ TCP 重组模块 `core::tcp` 已接入 `core::inspect` 的双向分析路径，�
 通用观察结果改造后，在隔离 IPv4/IPv6 本机拓扑实测 DNS TCP 同一连接先放行查询、后续查询命中后阻断整条流；HTTP 分段 Host 与 TLS 分段 ClientHello 的回归也通过。
 
 多 zone 改造后，在隔离本机拓扑中设置 zone 7，与默认 zone 0 同时运行：两条 HTTP 阻断连接分别写入 `(7, id)` 和 `(0, id)` 集合项，后续包经内核丢弃，RST 撤销两个条目。又在隔离转发拓扑中以同一 IPv4/TCP 五元组分别建立 zone 7 与 zone 8 连接，完整握手后前者 HTTP 阻断并内核卸载，后者及后续包放行。缺少握手导致后续包无 conntrack 元数据时，按不同接口路径区分作用域，前者用户态阻断、后者放行。既有 IPv4/IPv6 FORWARD ID 模式和 `ctmark=` 模式回归通过；相同接口与 mark 下的无 conntrack 多 zone 流尚不可区分。
+
+方向性 zone 另在隔离本机拓扑中以 `CT --zone-orig 7 --zone-reply 8` 验证：HTTP 命中后集合写入 `(8, id)`，原方向后续包及回复方向包都由内核丢弃，RST 随后撤销该集合项。用户态流作用域同时包含 conntrack ID，避免同五元组、同 zone 的不同连接共享分析状态；ID 仍是内核生成的近似唯一 32 位值，未证明所有碰撞场景均可隔离。
 
 销毁事件丢失恢复在 Debian 隔离网络命名空间中分别注入 `NLMSG_OVERRUN`、损坏消息和超长数据报验证：已有内核阻断集合被清空，ID 卸载和销毁事件订阅被停用。IPv4/IPv6 转发及 HTTP 阻断回归通过；真实高负载事件溢出仍未复现。
 

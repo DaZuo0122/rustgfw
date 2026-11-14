@@ -13,6 +13,7 @@ use std::{
     io,
     path::Path,
 };
+pub mod flow;
 pub mod wfp;
 
 const PACKET_CAPACITY: usize = 40 + 65535; // WINDIVERT_MTU_MAX

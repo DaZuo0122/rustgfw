@@ -3,7 +3,7 @@
 
 use libloading::Library;
 use rustgfw_core::{
-    Packet, PacketIo, Policy, Verdict,
+    FlowScope, Packet, PacketIo, Policy, Verdict,
     offload::{self, Action},
     packet::Protocol,
     rules::Rule,
@@ -69,6 +69,15 @@ impl Default for Address {
     }
 }
 const _: () = assert!(std::mem::size_of::<Address>() == 80);
+
+fn traffic_scope(layer: Layer, address: &Address) -> FlowScope {
+    if matches!(layer, Layer::Forward) {
+        return FlowScope::default();
+    }
+    let interface = u32::from_ne_bytes(address.data[..4].try_into().unwrap());
+    let subinterface = u32::from_ne_bytes(address.data[4..8].try_into().unwrap());
+    FlowScope(1 + (u128::from(interface) << 32) + u128::from(subinterface))
+}
 
 type Handle = *mut c_void;
 type Open = unsafe extern "C" fn(*const c_char, u32, i16, u64) -> Handle;
@@ -167,7 +176,7 @@ impl PacketIo for WinDivert {
             bytes,
             original_len: bytes.len(),
             checksum_ready: false,
-            scope: rustgfw_core::FlowScope::default(),
+            scope: traffic_scope(self.layer, &address),
         });
         if verdict != Verdict::Accept {
             return Ok(());
@@ -225,7 +234,9 @@ mod tests {
 
     struct FakeIo {
         received: VecDeque<Vec<u8>>,
+        interfaces: VecDeque<(u32, u32)>,
         sent: Vec<Vec<u8>>,
+        sent_interfaces: Vec<(u32, u32)>,
         address_preserved: bool,
     }
 
@@ -239,12 +250,16 @@ mod tests {
         // SAFETY: the test owns the state and receive buffers through this call.
         unsafe {
             let state = &mut *handle.cast::<FakeIo>();
+            let address = &mut *address;
             let next = state.received.pop_front().unwrap();
             assert!(next.len() <= capacity as usize);
             std::ptr::copy_nonoverlapping(next.as_ptr(), packet.cast::<u8>(), next.len());
             *length = next.len() as u32;
-            (*address).flags = 0x1234_5678;
-            (*address).data[0] = 9;
+            address.flags = 0x1234_5678;
+            let (interface, subinterface) = state.interfaces.pop_front().unwrap();
+            address.data[..4].copy_from_slice(&interface.to_ne_bytes());
+            address.data[4..8].copy_from_slice(&subinterface.to_ne_bytes());
+            address.data[63] = 0xa5;
         }
         1
     }
@@ -259,7 +274,12 @@ mod tests {
         // SAFETY: the test owns the state and captured packet through this call.
         unsafe {
             let state = &mut *handle.cast::<FakeIo>();
-            state.address_preserved &= (*address).flags == 0x1234_5678 && (*address).data[0] == 9;
+            let address = &*address;
+            state.address_preserved &= address.flags == 0x1234_5678 && address.data[63] == 0xa5;
+            state.sent_interfaces.push((
+                u32::from_ne_bytes(address.data[..4].try_into().unwrap()),
+                u32::from_ne_bytes(address.data[4..8].try_into().unwrap()),
+            ));
             state
                 .sent
                 .push(std::slice::from_raw_parts(packet.cast::<u8>(), length as usize).to_vec());
@@ -283,9 +303,12 @@ mod tests {
     }
 
     fn fixture(received: Vec<Vec<u8>>) -> (WinDivert, Box<FakeIo>) {
+        let interfaces = std::iter::repeat_n((9, 0), received.len()).collect();
         let mut state = Box::new(FakeIo {
             received: received.into(),
+            interfaces,
             sent: Vec::new(),
+            sent_interfaces: Vec::new(),
             address_preserved: true,
         });
         let io = WinDivert {
@@ -371,6 +394,7 @@ mod tests {
             .unwrap();
         io.process_one(&mut ConstantPolicy(Verdict::Drop)).unwrap();
         assert_eq!(state.sent, [packet]);
+        assert_eq!(state.sent_interfaces, [(9, 0)]);
         assert!(state.address_preserved);
         drop(io);
     }
@@ -391,7 +415,45 @@ mod tests {
             io.process_one(&mut policy).unwrap();
         }
         assert_eq!(state.sent, [allowed]);
+        assert_eq!(state.sent_interfaces, [(9, 0)]);
         assert!(state.address_preserved);
         drop(io);
+    }
+
+    #[test]
+    fn network_interface_scope_separates_identical_tcp_tuples() {
+        let blocked = tcp_packet(12346, 80, b"GET / HTTP/1.1\r\nHost: blocked.test\r\n\r\n");
+        let allowed = tcp_packet(12346, 80, b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n");
+        let (mut io, mut state) = fixture(vec![blocked, allowed.clone(), allowed.clone()]);
+        state.interfaces = [(9, 0), (10, 0), (9, 1)].into();
+        let mut policy = Inspect::http_hosts(
+            Rules::new(vec![], Verdict::Accept),
+            vec!["blocked.test".into()],
+        );
+        for _ in 0..3 {
+            io.process_one(&mut policy).unwrap();
+        }
+        assert_eq!(state.sent, [allowed.clone(), allowed]);
+        assert_eq!(state.sent_interfaces, [(10, 0), (9, 1)]);
+        assert!(state.address_preserved);
+        drop(io);
+    }
+
+    #[test]
+    fn forwarded_packets_keep_a_bidirectional_scope() {
+        let blocked = tcp_packet(12346, 80, b"GET / HTTP/1.1\r\nHost: blocked.test\r\n\r\n");
+        let mut reply = tcp_packet(80, 12346, b"HTTP/1.1 200 OK\r\n\r\n");
+        reply[12..16].copy_from_slice(&[198, 51, 100, 2]);
+        reply[16..20].copy_from_slice(&[192, 0, 2, 1]);
+        let (mut io, mut state) = fixture(vec![blocked, reply]);
+        io.layer = Layer::Forward;
+        state.interfaces = [(9, 0), (10, 0)].into();
+        let mut policy = Inspect::http_hosts(
+            Rules::new(vec![], Verdict::Accept),
+            vec!["blocked.test".into()],
+        );
+        io.process_one(&mut policy).unwrap();
+        io.process_one(&mut policy).unwrap();
+        assert!(state.sent.is_empty());
     }
 }

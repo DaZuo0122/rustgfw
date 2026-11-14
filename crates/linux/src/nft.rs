@@ -1,4 +1,5 @@
 //! Owned nftables table with an ordered static fast path and NFQUEUE fallback.
+use crate::conntrack::ConntrackKey;
 use rustgfw_core::{
     KernelPolicy,
     offload::{Action, Rule},
@@ -83,14 +84,16 @@ impl NftPolicy {
         ))
     }
     /// Conntrack ID is a compact, almost-unique key for both directions.
-    pub fn block_tcp_flow(&self, table: &str, conntrack_id: u32) -> io::Result<()> {
+    pub fn block_tcp_flow(&self, table: &str, key: ConntrackKey) -> io::Result<()> {
         self.execute(&format!(
-            "add element inet {table} blocked_ct {{ {conntrack_id} timeout 120s }}\n"
+            "add element inet {table} blocked_ct {{ {} . {} timeout 120s }}\n",
+            key.zone.id, key.id,
         ))
     }
-    pub fn unblock_tcp_flow(&self, table: &str, conntrack_id: u32) -> io::Result<()> {
+    pub fn unblock_tcp_flow(&self, table: &str, key: ConntrackKey) -> io::Result<()> {
         self.execute(&format!(
-            "destroy element inet {table} blocked_ct {{ {conntrack_id} }}\n"
+            "destroy element inet {table} blocked_ct {{ {} . {} }}\n",
+            key.zone.id, key.id,
         ))
     }
 }
@@ -121,16 +124,16 @@ fn render(table: &str, plan: &Plan) -> String {
     match plan.dynamic {
         DynamicOffload::IdSet => {
             out.push_str(&format!(
-                "add set inet {table} blocked_ct {{ typeof ct id; flags timeout; }}\n"
+                "add set inet {table} blocked_ct {{ typeof ct zone . ct id; flags timeout; }}\n"
             ));
             out.push_str(&format!(
                 "add rule inet {table} inspect ct event set destroy\n"
             ));
             out.push_str(&format!(
-                "add rule inet {table} inspect meta l4proto tcp ct id @blocked_ct tcp flags & rst == rst counter queue num {}\n", plan.queue
+                "add rule inet {table} inspect meta l4proto tcp ct zone . ct id @blocked_ct tcp flags & rst == rst counter queue num {}\n", plan.queue
             ));
             out.push_str(&format!(
-                "add rule inet {table} inspect meta l4proto tcp ct id @blocked_ct counter drop\n"
+                "add rule inet {table} inspect meta l4proto tcp ct zone . ct id @blocked_ct counter drop\n"
             ));
         }
         DynamicOffload::ConntrackMark(mask) => {
@@ -284,8 +287,12 @@ mod tests {
         };
         let handle = backend.install(&plan)?;
         let result = (|| {
-            backend.block_tcp_flow(handle.table_name(), 12345)?;
-            backend.block_tcp_flow(handle.table_name(), 12345)
+            let key = ConntrackKey {
+                id: 12345,
+                zone: nfq::ConntrackZone::default(),
+            };
+            backend.block_tcp_flow(handle.table_name(), key)?;
+            backend.block_tcp_flow(handle.table_name(), key)
         })();
         backend.revoke(&handle)?;
         result

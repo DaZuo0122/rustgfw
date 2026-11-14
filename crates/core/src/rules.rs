@@ -1,6 +1,6 @@
 //! Ordered transport rules with bidirectional flow decisions.
 use crate::{
-    Packet, Policy, Verdict,
+    FlowScope, Packet, Policy, Verdict,
     packet::{self, ParseError, Protocol},
 };
 use std::{
@@ -18,7 +18,7 @@ pub struct Rule {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct FlowKey(Protocol, SocketAddr, SocketAddr);
+struct FlowKey(FlowScope, Protocol, SocketAddr, SocketAddr);
 struct Flow {
     verdict: Verdict,
     seen: Instant,
@@ -71,7 +71,7 @@ impl Rules {
         } else {
             (transport.destination, transport.source)
         };
-        let key = FlowKey(transport.protocol, a, b);
+        let key = FlowKey(packet.scope, transport.protocol, a, b);
         if let Some(flow) = self.flows.get_mut(&key)
             && now.saturating_duration_since(flow.seen) < self.idle
         {
@@ -110,6 +110,7 @@ mod tests {
             bytes,
             original_len: bytes.len(),
             checksum_ready: true,
+            scope: FlowScope::default(),
         }
     }
     #[test]
@@ -132,6 +133,11 @@ mod tests {
             Verdict::Drop
         );
         assert_eq!(rules.flow_count(), 1);
+        let scoped_bytes = packet::udp(false);
+        let mut scoped = packet(&scoped_bytes);
+        scoped.scope = FlowScope(2);
+        assert_eq!(rules.evaluate_at(scoped, now), Verdict::Drop);
+        assert_eq!(rules.flow_count(), 2);
         rules.replace(vec![], Verdict::Accept);
         assert_eq!(rules.flow_count(), 0);
         assert_eq!(

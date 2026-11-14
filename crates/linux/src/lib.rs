@@ -1,6 +1,6 @@
 //! Linux NFQUEUE adapter. Firewall ownership remains with the operator.
 #![cfg(target_os = "linux")]
-use rustgfw_core::{Packet, PacketIo, Policy, Verdict};
+use rustgfw_core::{FlowScope, Packet, PacketIo, Policy, Verdict};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::{
@@ -29,8 +29,8 @@ pub struct NfQueue {
     dynamic_table: Option<String>,
     mark_offload: Option<u32>,
     destroy_events: Option<conntrack::DestroyEvents>,
-    blocked_ct: HashMap<u32, BlockedFlow>,
-    closing_ct: HashMap<u32, Instant>,
+    blocked_ct: HashMap<conntrack::ConntrackKey, BlockedFlow>,
+    closing_ct: HashMap<conntrack::ConntrackKey, Instant>,
 }
 impl NfQueue {
     pub fn open(number: u16) -> io::Result<Self> {
@@ -80,11 +80,11 @@ impl PacketIo for NfQueue {
         self.closing_ct
             .retain(|_, at| at.elapsed() < Duration::from_secs(120));
         if let (Some(events), Some(table)) = (&self.destroy_events, &self.dynamic_table) {
-            events.drain(|id| {
-                if let Some(block) = self.blocked_ct.remove(&id) {
-                    self.closing_ct.insert(id, Instant::now());
+            events.drain(|key| {
+                if let Some(block) = self.blocked_ct.remove(&key) {
+                    self.closing_ct.insert(key, Instant::now());
                     if block.installed.is_some() {
-                        nft::NftPolicy::new("/usr/sbin/nft").unblock_tcp_flow(table, id)
+                        nft::NftPolicy::new("/usr/sbin/nft").unblock_tcp_flow(table, key)
                     } else {
                         Ok(())
                     }
@@ -95,15 +95,27 @@ impl PacketIo for NfQueue {
         }
         let mut message = self.queue.recv()?;
         let bytes = message.get_payload();
-        let has_conntrack = message.get_conntrack().is_some();
-        let conntrack_id = message
-            .get_conntrack()
-            .map(|ct| ct.get_id())
-            .filter(|id| *id != 0);
+        let conntrack = message.get_conntrack();
+        let has_conntrack = conntrack.is_some();
+        let scope = conntrack.map_or(FlowScope::default(), |ct| {
+            conntrack::ConntrackKey {
+                id: ct.get_id(),
+                zone: ct.get_zone(),
+            }
+            .scope()
+        });
+        let conntrack_key =
+            conntrack
+                .filter(|ct| ct.get_id() != 0)
+                .map(|ct| conntrack::ConntrackKey {
+                    id: ct.get_id(),
+                    zone: ct.get_zone(),
+                });
         let rst = rustgfw_core::packet::parse(bytes).ok().is_some_and(|p| {
             p.protocol == rustgfw_core::packet::Protocol::Tcp && p.tcp_flags & 4 != 0
         });
-        let cached_block = conntrack_id.is_some_and(|id| self.blocked_ct.contains_key(&id)) && !rst;
+        let cached_block =
+            conntrack_key.is_some_and(|key| self.blocked_ct.contains_key(&key)) && !rst;
         let verdict = if cached_block {
             Verdict::DropFlow
         } else if bytes.is_empty() || bytes.len() < message.get_original_len() {
@@ -113,18 +125,19 @@ impl PacketIo for NfQueue {
                 bytes,
                 original_len: message.get_original_len(),
                 checksum_ready: message.is_checksum_ready(),
+                scope,
             })
         };
         let close_blocked = verdict == Verdict::DropFlow
             && rst
             && self.dynamic_table.is_some()
-            && conntrack_id.is_some_and(|id| self.blocked_ct.contains_key(&id));
-        if close_blocked && let (Some(table), Some(id)) = (&self.dynamic_table, conntrack_id) {
-            if self.blocked_ct[&id].installed.is_some() {
-                nft::NftPolicy::new("/usr/sbin/nft").unblock_tcp_flow(table, id)?;
+            && conntrack_key.is_some_and(|key| self.blocked_ct.contains_key(&key));
+        if close_blocked && let (Some(table), Some(key)) = (&self.dynamic_table, conntrack_key) {
+            if self.blocked_ct[&key].installed.is_some() {
+                nft::NftPolicy::new("/usr/sbin/nft").unblock_tcp_flow(table, key)?;
             }
-            self.blocked_ct.remove(&id);
-            self.closing_ct.insert(id, Instant::now());
+            self.blocked_ct.remove(&key);
+            self.closing_ct.insert(key, Instant::now());
         }
         let mark_block =
             verdict == Verdict::DropFlow && !rst && has_conntrack && self.mark_offload.is_some();
@@ -142,17 +155,17 @@ impl PacketIo for NfQueue {
         if verdict == Verdict::DropFlow
             && !close_blocked
             && let Some(table) = &self.dynamic_table
-            && let Some(conntrack_id) = conntrack_id
-            && offload_due(self.blocked_ct.get(&conntrack_id), Instant::now())
-            && !self.closing_ct.contains_key(&conntrack_id)
+            && let Some(key) = conntrack_key
+            && offload_due(self.blocked_ct.get(&key), Instant::now())
+            && !self.closing_ct.contains_key(&key)
         {
-            let previous = self.blocked_ct.get(&conntrack_id);
+            let previous = self.blocked_ct.get(&key);
             let installed = previous.and_then(|block| block.installed);
-            match nft::NftPolicy::new("/usr/sbin/nft").block_tcp_flow(table, conntrack_id) {
+            match nft::NftPolicy::new("/usr/sbin/nft").block_tcp_flow(table, key) {
                 Ok(()) => {
                     let now = Instant::now();
                     self.blocked_ct.insert(
-                        conntrack_id,
+                        key,
                         BlockedFlow {
                             installed: Some(now),
                             retry_after: now,
@@ -164,7 +177,7 @@ impl PacketIo for NfQueue {
                         eprintln!("nft flow offload failed: {error}; blocking in userspace");
                     }
                     self.blocked_ct.insert(
-                        conntrack_id,
+                        key,
                         BlockedFlow {
                             installed,
                             retry_after: Instant::now() + Duration::from_secs(1),

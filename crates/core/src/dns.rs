@@ -215,6 +215,7 @@ mod tests {
                 bytes,
                 original_len: bytes.len(),
                 checksum_ready: true,
+                scope: crate::FlowScope::default(),
             })
         };
         assert_eq!(run(&p), Verdict::Drop);

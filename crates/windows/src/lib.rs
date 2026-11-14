@@ -166,6 +166,7 @@ impl PacketIo for WinDivert {
             bytes,
             original_len: bytes.len(),
             checksum_ready: false,
+            scope: rustgfw_core::FlowScope::default(),
         });
         if verdict != Verdict::Accept {
             return Ok(());

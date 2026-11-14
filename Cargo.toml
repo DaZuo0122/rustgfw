@@ -16,4 +16,8 @@ rustgfw-windows = { path = "crates/windows" }
 
 [workspace]
 members = ["crates/core", "crates/linux", "crates/windows"]
+exclude = ["vendor/nfq"]
 resolver = "3"
+
+[patch.crates-io]
+nfq = { path = "vendor/nfq" }

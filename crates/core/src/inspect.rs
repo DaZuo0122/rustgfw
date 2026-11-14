@@ -1,6 +1,6 @@
 //! Incremental stream analysis. Each direction shares reassembly across analyzers.
 use crate::{
-    Packet, Policy, Verdict,
+    FlowScope, Packet, Policy, Verdict,
     packet::{self, Protocol},
     tcp::Reassembler,
 };
@@ -95,7 +95,7 @@ impl Flow {
                 .all(|d| d.analyzers.iter().all(Option::is_none))
     }
 }
-type Key = (SocketAddr, SocketAddr);
+type Key = (FlowScope, SocketAddr, SocketAddr);
 
 pub struct AnalyzerRule {
     pub port: Option<u16>,
@@ -183,9 +183,9 @@ impl<P: Policy> Policy for Inspect<P> {
             self.sweep = now + Duration::from_secs(1);
         }
         let (key, direction) = if t.source <= t.destination {
-            ((t.source, t.destination), 0)
+            ((packet.scope, t.source, t.destination), 0)
         } else {
-            ((t.destination, t.source), 1)
+            ((packet.scope, t.destination, t.source), 1)
         };
         let initial_syn = (t.tcp_flags & 0x12 == 2).then_some((direction, t.tcp_sequence.unwrap()));
         if let Some(syn) = initial_syn
@@ -211,7 +211,7 @@ impl<P: Policy> Policy for Inspect<P> {
                     .iter()
                     .map(|a| {
                         a.port
-                            .is_none_or(|p| key.0.port() == p || key.1.port() == p)
+                            .is_none_or(|p| key.1.port() == p || key.2.port() == p)
                             .then(|| (a.factory)())
                     })
                     .collect(),
@@ -309,6 +309,7 @@ mod tests {
                 bytes: &packet,
                 original_len: packet.len(),
                 checksum_ready: true,
+                scope: FlowScope::default(),
             })
         };
         assert_eq!(evaluate("custom.token"), Verdict::DropFlow);
@@ -343,6 +344,7 @@ mod tests {
                 bytes: &bytes,
                 original_len: bytes.len(),
                 checksum_ready: true,
+                scope: FlowScope::default(),
             })
         };
         assert_eq!(feed(100, 2, b""), Verdict::Accept);
@@ -386,6 +388,7 @@ mod tests {
                 bytes: &b,
                 original_len: b.len(),
                 checksum_ready: true,
+                scope: FlowScope::default(),
             })
         };
         assert_eq!(feed(100, 2, b"", false), Verdict::Accept);
@@ -396,6 +399,47 @@ mod tests {
         );
         assert_eq!(feed(101, 16, first, false), Verdict::DropFlow);
         assert_eq!(feed(500, 16, b"reply", true), Verdict::DropFlow);
+    }
+
+    #[test]
+    fn identical_endpoints_in_distinct_scopes_do_not_share_inspection() {
+        let mut policy = Inspect::http_hosts(
+            crate::ConstantPolicy(Verdict::Accept),
+            vec!["blocked.test".into()],
+        );
+        let mut feed = |scope, seq, flags, payload: &[u8], reverse| {
+            let bytes = tcp(seq, flags, payload, reverse);
+            policy.evaluate(Packet {
+                bytes: &bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope(scope),
+            })
+        };
+        assert_eq!(feed(1, 100, 2, b"", false), Verdict::Accept);
+        assert_eq!(feed(2, 100, 2, b"", false), Verdict::Accept);
+        assert_eq!(
+            feed(
+                1,
+                101,
+                16,
+                b"GET / HTTP/1.1\r\nHost: blocked.test\r\n\r\n",
+                false
+            ),
+            Verdict::DropFlow
+        );
+        assert_eq!(feed(1, 500, 16, b"reply", true), Verdict::DropFlow);
+        assert_eq!(
+            feed(
+                2,
+                101,
+                16,
+                b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
+                false
+            ),
+            Verdict::Accept
+        );
+        assert_eq!(feed(2, 500, 16, b"reply", true), Verdict::Accept);
     }
 
     #[test]
@@ -419,6 +463,7 @@ mod tests {
                 bytes: &b,
                 original_len: b.len(),
                 checksum_ready: true,
+                scope: FlowScope::default(),
             })
         };
         assert_eq!(feed(100, 2, b""), Verdict::Accept);
@@ -459,6 +504,7 @@ mod tests {
                 bytes: &packet,
                 original_len: packet.len(),
                 checksum_ready: true,
+                scope: FlowScope::default(),
             }),
             Verdict::Accept
         );
@@ -477,6 +523,7 @@ mod tests {
                 bytes: &bytes,
                 original_len: bytes.len(),
                 checksum_ready: true,
+                scope: FlowScope::default(),
             })
         };
         assert_eq!(feed(&mut p, 2, false), Verdict::Accept);
@@ -503,6 +550,7 @@ mod tests {
                 bytes: &bytes,
                 original_len: bytes.len(),
                 checksum_ready: true,
+                scope: FlowScope::default(),
             })
         }
         let mut p = Inspect::http_hosts(

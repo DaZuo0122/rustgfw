@@ -4,6 +4,23 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ConntrackKey {
+    pub id: u32,
+    pub zone: nfq::ConntrackZone,
+}
+
+impl ConntrackKey {
+    pub fn scope(self) -> rustgfw_core::FlowScope {
+        let direction = match self.zone.direction {
+            nfq::ZoneDirection::Both => 0,
+            nfq::ZoneDirection::Original => 1,
+            nfq::ZoneDirection::Reply => 2,
+        };
+        rustgfw_core::FlowScope(1 + u64::from(self.zone.id) + (direction << 16))
+    }
+}
+
 pub struct DestroyEvents {
     fd: OwnedFd,
 }
@@ -38,7 +55,10 @@ impl DestroyEvents {
         }
         Ok(Self { fd })
     }
-    pub fn drain(&self, mut on_destroy: impl FnMut(u32) -> io::Result<()>) -> io::Result<()> {
+    pub fn drain(
+        &self,
+        mut on_destroy: impl FnMut(ConntrackKey) -> io::Result<()>,
+    ) -> io::Result<()> {
         let mut buffer = [0u8; 65536];
         loop {
             let size = unsafe {
@@ -66,15 +86,32 @@ impl DestroyEvents {
             if size as usize > buffer.len() {
                 return Err(io::Error::other("conntrack destroy datagram truncated"));
             }
-            for id in parse_destroy_ids(&buffer[..size as usize])? {
-                on_destroy(id)?;
+            for key in parse_destroy_keys(&buffer[..size as usize])? {
+                on_destroy(key)?;
             }
         }
     }
 }
 
-fn parse_destroy_ids(buffer: &[u8]) -> io::Result<Vec<u32>> {
-    let mut ids = Vec::new();
+fn parse_attrs(
+    data: &[u8],
+    mut on_attr: impl FnMut(u16, &[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut attr = 0;
+    while attr + 4 <= data.len() {
+        let len = u16::from_ne_bytes(data[attr..attr + 2].try_into().unwrap()) as usize;
+        let ty = u16::from_ne_bytes(data[attr + 2..attr + 4].try_into().unwrap()) & 0x3fff;
+        if len < 4 || attr + len > data.len() {
+            return Err(io::Error::other("malformed conntrack netlink attribute"));
+        }
+        on_attr(ty, &data[attr + 4..attr + len])?;
+        attr += (len + 3) & !3;
+    }
+    Ok(())
+}
+
+fn parse_destroy_keys(buffer: &[u8]) -> io::Result<Vec<ConntrackKey>> {
+    let mut keys = Vec::new();
     let mut pos = 0;
     while pos + 16 <= buffer.len() {
         let len = u32::from_ne_bytes(buffer[pos..pos + 4].try_into().unwrap()) as usize;
@@ -92,43 +129,114 @@ fn parse_destroy_ids(buffer: &[u8]) -> io::Result<Vec<u32>> {
                 return Err(io::Error::other("truncated conntrack destroy message"));
             }
             // NFNL_SUBSYS_CTNETLINK / IPCTNL_MSG_CT_DELETE
-            let mut attr = pos + 20; // nlmsghdr + nfgenmsg
-            while attr + 4 <= pos + len {
-                let alen = u16::from_ne_bytes(buffer[attr..attr + 2].try_into().unwrap()) as usize;
-                let ty =
-                    u16::from_ne_bytes(buffer[attr + 2..attr + 4].try_into().unwrap()) & 0x3fff;
-                if alen < 4 || attr + alen > pos + len {
-                    return Err(io::Error::other("malformed conntrack destroy attribute"));
-                }
-                if ty == 12 && alen == 8 {
-                    // CTA_ID, network byte order
-                    let id = u32::from_be_bytes(buffer[attr + 4..attr + 8].try_into().unwrap());
-                    if id != 0 {
-                        ids.push(id);
+            let mut id = 0;
+            let mut zone = nfq::ConntrackZone::default();
+            parse_attrs(&buffer[pos + 20..pos + len], |ty, value| {
+                match ty {
+                    12 if value.len() == 4 => id = u32::from_be_bytes(value.try_into().unwrap()),
+                    18 if value.len() == 2 => {
+                        zone = nfq::ConntrackZone {
+                            id: u16::from_be_bytes(value.try_into().unwrap()),
+                            direction: nfq::ZoneDirection::Both,
+                        }
                     }
+                    1 | 2 => parse_attrs(value, |nested, value| {
+                        if nested == 3 && value.len() == 2 {
+                            zone = nfq::ConntrackZone {
+                                id: u16::from_be_bytes(value.try_into().unwrap()),
+                                direction: if ty == 1 {
+                                    nfq::ZoneDirection::Original
+                                } else {
+                                    nfq::ZoneDirection::Reply
+                                },
+                            };
+                        }
+                        Ok(())
+                    })?,
+                    _ => {}
                 }
-                attr += (alen + 3) & !3;
+                Ok(())
+            })?;
+            if id != 0 {
+                keys.push(ConntrackKey { id, zone });
             }
         }
         pos += (len + 3) & !3;
     }
-    Ok(ids)
+    Ok(keys)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn parses_destroy_id_and_ignores_other_messages() -> io::Result<()> {
-        let mut bytes = vec![0; 28];
-        bytes[0..4].copy_from_slice(&28u32.to_ne_bytes());
+    fn attr(ty: u16, value: &[u8]) -> Vec<u8> {
+        let len = (value.len() + 4) as u16;
+        let mut bytes = Vec::from(len.to_ne_bytes());
+        bytes.extend_from_slice(&ty.to_ne_bytes());
+        bytes.extend_from_slice(value);
+        bytes.resize((bytes.len() + 3) & !3, 0);
+        bytes
+    }
+    fn destroy(attrs: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0; 20];
+        bytes.extend_from_slice(attrs);
+        let len = bytes.len() as u32;
+        bytes[0..4].copy_from_slice(&len.to_ne_bytes());
         bytes[4..6].copy_from_slice(&(1u16 << 8 | 2).to_ne_bytes());
-        bytes[20..22].copy_from_slice(&8u16.to_ne_bytes());
-        bytes[22..24].copy_from_slice(&12u16.to_ne_bytes());
-        bytes[24..28].copy_from_slice(&42u32.to_be_bytes());
-        assert_eq!(parse_destroy_ids(&bytes)?, vec![42]);
+        bytes
+    }
+    #[test]
+    fn parses_destroy_id_and_zone() -> io::Result<()> {
+        let id = attr(12, &42u32.to_be_bytes());
+        let mut bytes = destroy(&id);
+        assert_eq!(
+            parse_destroy_keys(&bytes)?,
+            vec![ConntrackKey {
+                id: 42,
+                zone: nfq::ConntrackZone::default(),
+            }]
+        );
+        let zone = attr(18, &7u16.to_be_bytes());
+        bytes = destroy(&[id.clone(), zone].concat());
+        assert_eq!(
+            parse_destroy_keys(&bytes)?,
+            vec![ConntrackKey {
+                id: 42,
+                zone: nfq::ConntrackZone {
+                    id: 7,
+                    direction: nfq::ZoneDirection::Both
+                },
+            }]
+        );
+        let tuple_zone = attr(3, &8u16.to_be_bytes());
+        bytes = destroy(&[id, attr(2, &tuple_zone)].concat());
+        assert_eq!(
+            parse_destroy_keys(&bytes)?,
+            vec![ConntrackKey {
+                id: 42,
+                zone: nfq::ConntrackZone {
+                    id: 8,
+                    direction: nfq::ZoneDirection::Reply
+                },
+            }]
+        );
+        assert_ne!(
+            ConntrackKey {
+                id: 42,
+                zone: nfq::ConntrackZone::default()
+            }
+            .scope(),
+            ConntrackKey {
+                id: 42,
+                zone: nfq::ConntrackZone {
+                    id: 8,
+                    direction: nfq::ZoneDirection::Reply
+                }
+            }
+            .scope()
+        );
         bytes[4..6].copy_from_slice(&0u16.to_ne_bytes());
-        assert!(parse_destroy_ids(&bytes)?.is_empty());
+        assert!(parse_destroy_keys(&bytes)?.is_empty());
         Ok(())
     }
     #[test]
@@ -136,9 +244,9 @@ mod tests {
         let mut bytes = vec![0; 16];
         bytes[0..4].copy_from_slice(&16u32.to_ne_bytes());
         bytes[4..6].copy_from_slice(&(libc::NLMSG_OVERRUN as u16).to_ne_bytes());
-        assert!(parse_destroy_ids(&bytes).is_err());
+        assert!(parse_destroy_keys(&bytes).is_err());
         bytes[4..6].copy_from_slice(&(1u16 << 8 | 2).to_ne_bytes());
-        assert!(parse_destroy_ids(&bytes).is_err());
+        assert!(parse_destroy_keys(&bytes).is_err());
     }
     #[test]
     #[ignore = "requires netfilter permissions in an isolated network namespace"]

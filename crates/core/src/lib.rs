@@ -22,7 +22,12 @@ pub struct Packet<'a> {
     pub bytes: &'a [u8],
     pub original_len: usize,
     pub checksum_ready: bool,
+    /// Backend-defined traffic domain. Distinct domains never share flow state.
+    pub scope: FlowScope,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FlowScope(pub u64);
 
 pub trait Policy {
     fn evaluate(&mut self, packet: Packet<'_>) -> Verdict;
@@ -76,6 +81,7 @@ mod tests {
                 bytes: &[0x45],
                 original_len: 20,
                 checksum_ready: false,
+                scope: FlowScope::default(),
             }));
             if self.fail {
                 Err(io::Error::other("verdict failed"))

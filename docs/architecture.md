@@ -15,7 +15,7 @@ Linux NFQUEUE 的 accept 表示恢复 netfilter 遍历，并不绕过其他链�
 
 ## 当前 Linux 路径
 
-`cargo run --release -- nfqueue 100 accept`（或 `drop`）。外部规则模式需要已有 NFQUEUE 规则；指定 `nft=input|output|forward` 则由进程安装和撤销独占 nft 表。使用 `ctmark=0x80000000` 可启用需要预留 mark bit 的动态连接阻断路径。两种模式都需要 CAP_NET_ADMIN。默认队列拥塞不 fail-open；NFQUEUE 接收缓冲溢出时内核丢弃受影响的包，进程限频记录 `ENOBUFS` 后继续处理，避免撤销策略。ID 集合模式下 conntrack 销毁事件流的 `ENOBUFS` 或 netlink overrun 表示生命周期信息丢失；后端先清空可能含过期 ID 的内核阻断集合，再关闭 ID 卸载并继续逐包裁决。若集合清空失败，则返回错误。关闭 GSO，截断或空载荷丢弃。进程不运行 sudo。
+`cargo run --release -- nfqueue 100 accept`（或 `drop`）。外部规则模式需要已有 NFQUEUE 规则；指定 `nft=input|output|forward` 则由进程安装和撤销独占 nft 表。使用 `ctmark=0x80000000` 可启用需要预留 mark bit 的动态连接阻断路径。两种模式都需要 CAP_NET_ADMIN。默认队列拥塞不 fail-open；NFQUEUE 接收缓冲溢出时内核丢弃受影响的包，进程限频记录 `ENOBUFS` 后继续处理，避免撤销策略。ID 集合模式下 conntrack 销毁事件流的 `ENOBUFS`、netlink overrun、截断或损坏消息均表示生命周期信息丢失；后端先清空可能含过期 ID 的内核阻断集合，再关闭 ID 卸载并继续逐包裁决。若集合清空失败，则返回错误。关闭 GSO，截断或空载荷丢弃。进程不运行 sudo。
 
 规则中的 queue bypass（无监听者）与 queue fail-open（队列满）是不同配置。托管模式收到 SIGINT/SIGTERM 时撤销表；崩溃和 SIGKILL 后仍可能留下表。没有无损排空保证。
 
@@ -39,7 +39,7 @@ TCP 重组模块 `core::tcp` 已接入 `core::inspect` 的双向分析路径，�
 
 多 zone 改造后，在隔离本机拓扑中设置 zone 7，与默认 zone 0 同时运行：两条 HTTP 阻断连接分别写入 `(7, id)` 和 `(0, id)` 集合项，后续包经内核丢弃，RST 撤销两个条目。又在隔离转发拓扑中以同一 IPv4/TCP 五元组分别建立 zone 7 与 zone 8 连接，完整握手后前者 HTTP 阻断并内核卸载，后者及后续包放行。缺少握手导致后续包无 conntrack 元数据时，按不同接口路径区分作用域，前者用户态阻断、后者放行。既有 IPv4/IPv6 FORWARD ID 模式和 `ctmark=` 模式回归通过；相同接口与 mark 下的无 conntrack 多 zone 流尚不可区分。
 
-销毁事件丢失恢复在 Debian 隔离网络命名空间中注入 `NLMSG_OVERRUN` 验证：已有内核阻断集合被清空，ID 卸载和销毁事件订阅被停用。IPv4/IPv6 转发及 HTTP 阻断回归通过；真实高负载事件溢出仍未复现。
+销毁事件丢失恢复在 Debian 隔离网络命名空间中分别注入 `NLMSG_OVERRUN`、损坏消息和超长数据报验证：已有内核阻断集合被清空，ID 卸载和销毁事件订阅被停用。IPv4/IPv6 转发及 HTTP 阻断回归通过；真实高负载事件溢出仍未复现。
 
 并发连接回归在隔离本机网络命名空间中以 ID 集合和 `ctmark=` 两种模式各运行 IPv4、IPv6 的 128 条 TCP 连接；每种组合均有 64 条 HTTP 命中被阻断、64 条允许并收到响应，进程保持运行。此测试没有覆盖长时间多流压力。绝对 URI、第二条 Host 和无关非 UTF-8 头的 HTTP 阻断也通过实际 NFQUEUE 路径验证。
 

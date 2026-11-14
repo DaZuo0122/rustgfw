@@ -107,9 +107,13 @@ impl DestroyEvents {
                 return Ok(());
             }
             if size as usize > buffer.len() {
-                return Err(io::Error::other("conntrack destroy datagram truncated"));
+                return Err(io::Error::other(EventsLost));
             }
-            for key in parse_destroy_keys(&buffer[..size as usize])? {
+            // A malformed datagram can hide a destroy notification. Treat it
+            // like a receive overrun so stale kernel ID blocks are cleared.
+            for key in parse_destroy_keys(&buffer[..size as usize])
+                .map_err(|_| io::Error::other(EventsLost))?
+            {
                 on_destroy(key)?;
             }
         }
@@ -184,12 +188,16 @@ fn parse_destroy_keys(buffer: &[u8]) -> io::Result<Vec<ConntrackKey>> {
         }
         pos += (len + 3) & !3;
     }
+    if pos < buffer.len() {
+        return Err(io::Error::other("truncated conntrack netlink header"));
+    }
     Ok(keys)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixDatagram;
     fn attr(ty: u16, value: &[u8]) -> Vec<u8> {
         let len = (value.len() + 4) as u16;
         let mut bytes = Vec::from(len.to_ne_bytes());
@@ -268,6 +276,17 @@ mod tests {
         assert!(events_lost(&parse_destroy_keys(&bytes).unwrap_err()));
         bytes[4..6].copy_from_slice(&(1u16 << 8 | 2).to_ne_bytes());
         assert!(parse_destroy_keys(&bytes).is_err());
+        assert!(parse_destroy_keys(&bytes[..3]).is_err());
+    }
+    #[test]
+    fn malformed_and_truncated_event_datagrams_report_lost_lifecycle() -> io::Result<()> {
+        let (sender, receiver) = UnixDatagram::pair()?;
+        let events = DestroyEvents::from_fd(receiver.into());
+        sender.send(&[0; 16])?;
+        assert!(events_lost(&events.drain(|_| Ok(())).unwrap_err()));
+        sender.send(&vec![0; 65537])?;
+        assert!(events_lost(&events.drain(|_| Ok(())).unwrap_err()));
+        Ok(())
     }
     #[test]
     #[ignore = "requires netfilter permissions in an isolated network namespace"]

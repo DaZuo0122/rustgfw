@@ -281,40 +281,44 @@ mod tests {
         })?;
         let result = (|| {
             let mut queue = NfQueue::open(100)?;
-            queue.set_dynamic_table(handle.table_name())?;
             let key = conntrack::ConntrackKey {
                 id: 12345,
                 zone: nfq::ConntrackZone::default(),
             };
-            nft.block_tcp_flow(handle.table_name(), key)?;
-            queue.blocked_ct.insert(
-                key,
-                BlockedFlow {
-                    installed: Some(Instant::now()),
-                    retry_after: Instant::now(),
-                },
-            );
-            let (sender, receiver) = UnixDatagram::pair()?;
-            queue.destroy_events = Some(conntrack::DestroyEvents::from_fd(receiver.into()));
             let mut overrun = [0u8; 16];
             overrun[..4].copy_from_slice(&16u32.to_ne_bytes());
             overrun[4..6].copy_from_slice(&(libc::NLMSG_OVERRUN as u16).to_ne_bytes());
-            sender.send(&overrun)?;
-            let error = queue
-                .process_one(&mut rustgfw_core::ConstantPolicy(Verdict::Accept))
-                .unwrap_err();
-            assert!(matches!(
-                error.kind(),
-                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-            ));
-            assert!(queue.dynamic_table.is_none());
-            assert!(queue.destroy_events.is_none());
-            assert!(queue.blocked_ct.is_empty());
-            let output = Command::new("/usr/sbin/nft")
-                .args(["list", "set", "inet", handle.table_name(), "blocked_ct"])
-                .output()?;
-            assert!(output.status.success());
-            assert!(!String::from_utf8_lossy(&output.stdout).contains("elements ="));
+            let malformed = [0u8; 16];
+            let truncated = vec![0u8; 65537];
+            for event in [&overrun[..], &malformed[..], &truncated[..]] {
+                queue.set_dynamic_table(handle.table_name())?;
+                nft.block_tcp_flow(handle.table_name(), key)?;
+                queue.blocked_ct.insert(
+                    key,
+                    BlockedFlow {
+                        installed: Some(Instant::now()),
+                        retry_after: Instant::now(),
+                    },
+                );
+                let (sender, receiver) = UnixDatagram::pair()?;
+                queue.destroy_events = Some(conntrack::DestroyEvents::from_fd(receiver.into()));
+                sender.send(event)?;
+                let error = queue
+                    .process_one(&mut rustgfw_core::ConstantPolicy(Verdict::Accept))
+                    .unwrap_err();
+                assert!(matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ));
+                assert!(queue.dynamic_table.is_none());
+                assert!(queue.destroy_events.is_none());
+                assert!(queue.blocked_ct.is_empty());
+                let output = Command::new("/usr/sbin/nft")
+                    .args(["list", "set", "inet", handle.table_name(), "blocked_ct"])
+                    .output()?;
+                assert!(output.status.success());
+                assert!(!String::from_utf8_lossy(&output.stdout).contains("elements ="));
+            }
             Ok::<_, io::Error>(())
         })();
         nft.revoke(&handle)?;

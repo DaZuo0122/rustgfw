@@ -24,6 +24,17 @@ fn offload_due(block: Option<&BlockedFlow>, now: Instant) -> bool {
     })
 }
 
+fn untracked_scope(indev: u32, outdev: u32, mark: u32) -> FlowScope {
+    let (first, second) = if indev <= outdev {
+        (indev, outdev)
+    } else {
+        (outdev, indev)
+    };
+    FlowScope(
+        (1u128 << 96) | (u128::from(first) << 64) | (u128::from(second) << 32) | u128::from(mark),
+    )
+}
+
 pub struct NfQueue {
     queue: nfq::Queue,
     dynamic_table: Option<String>,
@@ -97,13 +108,22 @@ impl PacketIo for NfQueue {
         let bytes = message.get_payload();
         let conntrack = message.get_conntrack();
         let has_conntrack = conntrack.is_some();
-        let scope = conntrack.map_or(FlowScope::default(), |ct| {
-            conntrack::ConntrackKey {
-                id: ct.get_id(),
-                zone: ct.get_zone(),
-            }
-            .scope()
-        });
+        let scope = conntrack.map_or_else(
+            || {
+                untracked_scope(
+                    message.get_indev(),
+                    message.get_outdev(),
+                    message.get_nfmark(),
+                )
+            },
+            |ct| {
+                conntrack::ConntrackKey {
+                    id: ct.get_id(),
+                    zone: ct.get_zone(),
+                }
+                .scope()
+            },
+        );
         let conntrack_key =
             conntrack
                 .filter(|ct| ct.get_id() != 0)
@@ -193,6 +213,22 @@ impl PacketIo for NfQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untracked_flow_scope_uses_path_and_packet_mark() {
+        let a = untracked_scope(3, 9, 4);
+        assert_eq!(a, untracked_scope(9, 3, 4));
+        assert_ne!(a, untracked_scope(5, 9, 4));
+        assert_ne!(a, untracked_scope(3, 9, 8));
+        assert_ne!(
+            a,
+            conntrack::ConntrackKey {
+                id: 1,
+                zone: nfq::ConntrackZone::default(),
+            }
+            .scope()
+        );
+    }
 
     #[test]
     fn renews_expired_kernel_block_without_repeating_fresh_inserts() {

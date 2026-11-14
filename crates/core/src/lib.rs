@@ -27,7 +27,7 @@ pub struct Packet<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct FlowScope(pub u64);
+pub struct FlowScope(pub u128);
 
 pub trait Policy {
     fn evaluate(&mut self, packet: Packet<'_>) -> Verdict;

@@ -17,7 +17,7 @@ impl ConntrackKey {
             nfq::ZoneDirection::Original => 1,
             nfq::ZoneDirection::Reply => 2,
         };
-        rustgfw_core::FlowScope(1 + u64::from(self.zone.id) + (direction << 16))
+        rustgfw_core::FlowScope(1 + u128::from(self.zone.id) + (direction << 16))
     }
 }
 

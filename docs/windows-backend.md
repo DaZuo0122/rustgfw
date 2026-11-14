@@ -2,7 +2,7 @@
 
 `rustgfw windivert <WinDivert.dll 路径> <network|forward> <accept|drop> [规则...]` 使用与 Linux 相同的传输层规则、HTTP Host、TLS SNI 和 DNS 分析器。`network` 捕获本机收发，`forward` 捕获经过本机的包。WinDivert 2.2 负责抓包、裁决和原包重新注入；`DropFlow` 仍由用户态后续逐包执行。
 
-WinDivert 的 `Recv` 把包从网络路径取出；接受必须调用 `Send` 重新注入。适配器保留完整的 80 字节 `WINDIVERT_ADDRESS`，使方向、接口和校验和标志随原包返回。丢弃不调用 `Send`。在 `network` 与 `forward` 层使用同一决策接口，但转发流量没有本机 socket 的 ALE 身份；后续 WFP 策略必须区分本机连接和转发包。依据：[WinDivert 2.2 手册](https://reqrypt.org/windivert-doc.html)。
+WinDivert 的 `Recv` 把包从网络路径取出；接受必须调用 `Send` 重新注入。适配器保留完整的 80 字节 `WINDIVERT_ADDRESS`，使方向、接口和校验和标志随原包返回。丢弃不调用 `Send`。默认放行时，有效 ICMP/ICMPv6 直接走系统路径，分片仍进入引擎；这避免 WinDivert 对部分入站 ICMP 原包重注入失败而让引擎退出。默认丢弃仍捕获全部协议。在 `network` 与 `forward` 层使用同一决策接口。依据：[WinDivert 2.2 手册](https://reqrypt.org/windivert-doc.html)。
 
 `network` 模式启动时，将有序规则开头连续的 `drop` 规则下沉到 WFP 本机连接授权层；遇到第一条 `accept` 就停止，避免改变优先顺序。协议与本机/对端端口分别匹配 IPv4/IPv6 的 `ALE_AUTH_CONNECT`、`ALE_AUTH_RECV_ACCEPT`，所有过滤器在一个事务中提交，动态会话结束即清除。WFP 初始化失败时记录原因并继续由 WinDivert 执行规则。此静态下沉尚未经过真实 WFP 流量测试。[各过滤层可用条件](https://learn.microsoft.com/en-us/windows/win32/fwp/filtering-conditions-available-at-each-filtering-layer)、[过滤器仲裁](https://learn.microsoft.com/en-us/windows/win32/fwp/filter-arbitration)。
 

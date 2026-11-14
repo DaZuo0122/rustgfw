@@ -185,7 +185,16 @@ fn run_windivert(args: &[String]) -> Result<(), Error> {
     if options.nft_hook.is_some() {
         return Err("nft= is only available with NFQUEUE".into());
     }
-    let mut io = WinDivert::open(&args[0], layer, "true")?;
+    // Valid ICMP is always accepted by the transport/DPI policy when the
+    // default is Accept. Leave it on the native path: WinDivert cannot
+    // reinject some inbound ICMP/ICMPv6 packets. Fragments still reach the
+    // engine, where unsupported reassembly is handled consistently.
+    let packet_filter = if options.default == Verdict::Accept {
+        "(not icmp and not icmpv6) or fragment"
+    } else {
+        "true"
+    };
+    let mut io = WinDivert::open(&args[0], layer, packet_filter)?;
     if matches!(layer, Layer::Forward)
         && let Some(filter) = static_drop_filter(&options.rules)
     {

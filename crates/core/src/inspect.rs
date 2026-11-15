@@ -149,6 +149,8 @@ struct Direction {
 }
 struct Flow {
     directions: [Direction; 2],
+    facts: HashMap<&'static str, Vec<String>>,
+    allowed: bool,
     blocked: bool,
     seen: Instant,
     initial_syn: Option<(usize, u32)>,
@@ -157,6 +159,7 @@ struct Flow {
 impl Flow {
     fn finished(&self) -> bool {
         !self.blocked
+            && !self.allowed
             && self
                 .directions
                 .iter()
@@ -169,6 +172,60 @@ pub struct AnalyzerRule {
     pub port: Option<u16>,
     pub factory: Box<dyn Fn() -> Box<dyn StreamAnalyzer> + Send + Sync>,
     pub matches: Box<dyn Fn(&Observation) -> bool + Send + Sync>,
+}
+
+/// The latest observation batch for each field in one bidirectional TCP flow.
+/// A callback also receives the current packet's endpoint direction.
+pub struct FlowContext<'a> {
+    pub scope: FlowScope,
+    pub source: SocketAddr,
+    pub destination: SocketAddr,
+    facts: &'a HashMap<&'static str, Vec<String>>,
+}
+impl FlowContext<'_> {
+    pub fn get(&self, field: &str) -> Option<&str> {
+        self.values(field)?.last().map(String::as_str)
+    }
+
+    pub fn values(&self, field: &str) -> Option<&[String]> {
+        self.facts.get(field).map(Vec::as_slice)
+    }
+}
+
+fn store_observations(
+    facts: &mut HashMap<&'static str, Vec<String>>,
+    observations: Vec<Observation>,
+) {
+    let mut latest = HashMap::<&'static str, Vec<String>>::new();
+    for observation in observations {
+        latest
+            .entry(observation.field)
+            .or_default()
+            .push(observation.value);
+    }
+    facts.extend(latest);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlowAction {
+    /// Stop application inspection for this flow; transport policy still runs.
+    Allow,
+    Block,
+}
+
+type FlowMatch = dyn for<'a> Fn(&FlowContext<'a>) -> Option<FlowAction> + Send + Sync;
+/// Compose facts from multiple analyzers into an ordered TCP flow decision.
+pub struct FlowRule {
+    matches: Box<FlowMatch>,
+}
+impl FlowRule {
+    pub fn new(
+        matches: impl for<'a> Fn(&FlowContext<'a>) -> Option<FlowAction> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            matches: Box::new(matches),
+        }
+    }
 }
 
 pub struct DatagramRule {
@@ -203,6 +260,18 @@ impl DatagramRule {
     }
 }
 impl AnalyzerRule {
+    /// Register an analyzer whose facts are evaluated by flow-level rules.
+    pub fn observing(
+        port: Option<u16>,
+        factory: impl Fn() -> Box<dyn StreamAnalyzer> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            port,
+            factory: Box::new(factory),
+            matches: Box::new(|_| false),
+        }
+    }
+
     pub fn exact(
         field: &'static str,
         values: Vec<String>,
@@ -250,6 +319,7 @@ impl Default for InspectLimits {
 pub struct Inspect<P> {
     transport: P,
     analyzers: Vec<AnalyzerRule>,
+    flow_rules: Vec<FlowRule>,
     datagrams: Vec<DatagramRule>,
     flows: HashMap<Key, Flow>,
     completed_since_compaction: bool,
@@ -280,6 +350,7 @@ impl<P> Inspect<P> {
         Self {
             transport,
             analyzers,
+            flow_rules: Vec::new(),
             datagrams,
             flows: HashMap::new(),
             completed_since_compaction: false,
@@ -291,11 +362,21 @@ impl<P> Inspect<P> {
         self.flows.clear();
         self.completed_since_compaction = false;
     }
+
+    pub fn with_flow_rules(mut self, rules: Vec<FlowRule>) -> Self {
+        self.clear_flows();
+        self.flow_rules = rules;
+        self
+    }
 }
 impl<P: Policy> Policy for Inspect<P> {
     fn evaluate(&mut self, packet: Packet<'_>) -> Verdict {
         let verdict = self.transport.evaluate(packet);
-        if verdict != Verdict::Accept || (self.analyzers.is_empty() && self.datagrams.is_empty()) {
+        if verdict != Verdict::Accept
+            || (self.analyzers.is_empty()
+                && self.datagrams.is_empty()
+                && self.flow_rules.is_empty())
+        {
             return verdict;
         }
         let Ok(t) = packet::parse(packet.bytes) else {
@@ -321,13 +402,15 @@ impl<P: Policy> Policy for Inspect<P> {
             }
             return verdict;
         }
-        if self.analyzers.is_empty() {
+        if self.analyzers.is_empty() && self.flow_rules.is_empty() {
             return verdict;
         }
-        if !self.analyzers.iter().any(|a| {
-            a.port
-                .is_none_or(|port| t.source.port() == port || t.destination.port() == port)
-        }) {
+        if self.flow_rules.is_empty()
+            && !self.analyzers.iter().any(|a| {
+                a.port
+                    .is_none_or(|port| t.source.port() == port || t.destination.port() == port)
+            })
+        {
             return verdict;
         }
         let now = Instant::now();
@@ -380,6 +463,8 @@ impl<P: Policy> Policy for Inspect<P> {
                     })
                     .collect(),
             }),
+            facts: HashMap::new(),
+            allowed: false,
             blocked: false,
             seen: now,
             initial_syn,
@@ -389,31 +474,57 @@ impl<P: Policy> Policy for Inspect<P> {
         if flow.blocked {
             return Verdict::DropFlow;
         }
-        let d = &mut flow.directions[direction];
-        if d.analyzers.iter().any(Option::is_some) {
-            match d
-                .reassembly
-                .feed(t.tcp_sequence.unwrap(), t.tcp_flags & 2 != 0, t.payload)
-            {
-                Ok(bytes) => {
-                    for (slot, rule) in d.analyzers.iter_mut().zip(&self.analyzers) {
-                        let Some(analyzer) = slot else {
-                            continue;
-                        };
-                        match analyzer.feed(&bytes) {
-                            Analysis::Finished => *slot = None,
-                            Analysis::Observations(observations) => {
-                                flow.blocked |= observations.iter().any(|o| (rule.matches)(o));
+        if !flow.allowed {
+            let d = &mut flow.directions[direction];
+            if d.analyzers.iter().any(Option::is_some) {
+                match d
+                    .reassembly
+                    .feed(t.tcp_sequence.unwrap(), t.tcp_flags & 2 != 0, t.payload)
+                {
+                    Ok(bytes) => {
+                        for (slot, rule) in d.analyzers.iter_mut().zip(&self.analyzers) {
+                            let Some(analyzer) = slot else {
+                                continue;
+                            };
+                            match analyzer.feed(&bytes) {
+                                Analysis::Finished => *slot = None,
+                                Analysis::Observations(observations) => {
+                                    flow.blocked |= observations.iter().any(|o| (rule.matches)(o));
+                                    if !self.flow_rules.is_empty() {
+                                        store_observations(&mut flow.facts, observations);
+                                    }
+                                }
+                                Analysis::FinalObservations(observations) => {
+                                    flow.blocked |= observations.iter().any(|o| (rule.matches)(o));
+                                    if !self.flow_rules.is_empty() {
+                                        store_observations(&mut flow.facts, observations);
+                                    }
+                                    *slot = None;
+                                }
+                                Analysis::Pending => {}
                             }
-                            Analysis::FinalObservations(observations) => {
-                                flow.blocked |= observations.iter().any(|o| (rule.matches)(o));
-                                *slot = None;
-                            }
-                            Analysis::Pending => {}
                         }
                     }
+                    Err(_) => flow.blocked = true,
                 }
-                Err(_) => flow.blocked = true,
+            }
+        }
+        if !flow.blocked && !flow.allowed && !self.flow_rules.is_empty() {
+            let context = FlowContext {
+                scope: packet.scope,
+                source: t.source,
+                destination: t.destination,
+                facts: &flow.facts,
+            };
+            if let Some(action) = self
+                .flow_rules
+                .iter()
+                .find_map(|rule| (rule.matches)(&context))
+            {
+                match action {
+                    FlowAction::Allow => flow.allowed = true,
+                    FlowAction::Block => flow.blocked = true,
+                }
             }
         }
         let result = if flow.blocked {
@@ -584,6 +695,129 @@ mod tests {
         };
         assert_eq!(evaluate("custom.token"), Verdict::DropFlow);
         assert_eq!(evaluate("http.host"), Verdict::Accept);
+    }
+    #[test]
+    fn flow_rule_combines_facts_without_crossing_scopes_or_new_connections() {
+        struct Word(&'static str, &'static [u8]);
+        impl StreamAnalyzer for Word {
+            fn feed(&mut self, bytes: &[u8]) -> Analysis {
+                if bytes == self.1 {
+                    Analysis::Observations(vec![
+                        Observation {
+                            field: self.0,
+                            value: "unrelated".into(),
+                        },
+                        Observation {
+                            field: self.0,
+                            value: String::from_utf8_lossy(bytes).into_owned(),
+                        },
+                    ])
+                } else {
+                    Analysis::Pending
+                }
+            }
+        }
+        let mut policy = Inspect::with_analyzers(
+            crate::ConstantPolicy(Verdict::Accept),
+            vec![
+                AnalyzerRule::observing(None, || Box::new(Word("first", b"alpha"))),
+                AnalyzerRule::observing(None, || Box::new(Word("second", b"beta"))),
+            ],
+        )
+        .with_flow_rules(vec![FlowRule::new(|context| {
+            (context
+                .values("first")
+                .is_some_and(|values| values.iter().any(|value| value == "alpha"))
+                && context.get("second") == Some("beta"))
+            .then_some(FlowAction::Block)
+        })]);
+        let mut feed = |scope, seq, flags, payload: &[u8]| {
+            let bytes = tcp(seq, flags, payload, false);
+            policy.evaluate(Packet {
+                bytes: &bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope(scope),
+            })
+        };
+        assert_eq!(feed(1, 100, 2, b""), Verdict::Accept);
+        assert_eq!(feed(2, 100, 2, b""), Verdict::Accept);
+        assert_eq!(feed(1, 101, 16, b"alpha"), Verdict::Accept);
+        assert_eq!(feed(2, 101, 16, b"beta"), Verdict::Accept);
+        assert_eq!(feed(1, 106, 16, b"beta"), Verdict::DropFlow);
+        assert_eq!(feed(1, 1000, 2, b""), Verdict::Accept);
+        assert_eq!(feed(1, 1001, 16, b"beta"), Verdict::Accept);
+    }
+    #[test]
+    fn flow_allow_is_terminal_for_inspection_but_keeps_transport_policy() {
+        struct Transport;
+        impl Policy for Transport {
+            fn evaluate(&mut self, packet: Packet<'_>) -> Verdict {
+                if packet.bytes.ends_with(b"transport-drop") {
+                    Verdict::Drop
+                } else {
+                    Verdict::Accept
+                }
+            }
+        }
+        struct Word;
+        impl StreamAnalyzer for Word {
+            fn feed(&mut self, bytes: &[u8]) -> Analysis {
+                Analysis::Observations(vec![Observation {
+                    field: "decision",
+                    value: String::from_utf8_lossy(bytes).into_owned(),
+                }])
+            }
+        }
+        let mut policy = Inspect::with_analyzers(
+            Transport,
+            vec![AnalyzerRule::observing(None, || Box::new(Word))],
+        )
+        .with_flow_rules(vec![
+            FlowRule::new(|context| {
+                (context.get("decision") == Some("allow")).then_some(FlowAction::Allow)
+            }),
+            FlowRule::new(|context| {
+                (context.get("decision") == Some("deny")).then_some(FlowAction::Block)
+            }),
+        ]);
+        let mut feed = |seq, flags, payload: &[u8]| {
+            let bytes = tcp(seq, flags, payload, false);
+            policy.evaluate(Packet {
+                bytes: &bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        assert_eq!(feed(100, 2, b""), Verdict::Accept);
+        assert_eq!(feed(101, 16, b"allow"), Verdict::Accept);
+        assert_eq!(feed(106, 16, b"deny"), Verdict::Accept);
+        assert_eq!(feed(110, 16, b"transport-drop"), Verdict::Drop);
+        assert_eq!(feed(1000, 2, b""), Verdict::Accept);
+        assert_eq!(feed(1001, 16, b"deny"), Verdict::DropFlow);
+    }
+    #[test]
+    fn flow_rules_can_match_endpoints_without_analyzers_in_order() {
+        let packet = tcp(100, 2, b"", false);
+        let evaluate = |first| {
+            let mut policy =
+                Inspect::with_analyzers(crate::ConstantPolicy(Verdict::Accept), Vec::new())
+                    .with_flow_rules(vec![
+                        FlowRule::new(move |context| {
+                            (context.destination.port() == 80).then_some(first)
+                        }),
+                        FlowRule::new(|_| Some(FlowAction::Block)),
+                    ]);
+            policy.evaluate(Packet {
+                bytes: &packet,
+                original_len: packet.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        assert_eq!(evaluate(FlowAction::Allow), Verdict::Accept);
+        assert_eq!(evaluate(FlowAction::Block), Verdict::DropFlow);
     }
     #[test]
     fn tcp_dns_observations_continue_across_messages() {

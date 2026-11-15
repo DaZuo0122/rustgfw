@@ -54,10 +54,25 @@ impl NfQueue {
     pub fn open(number: u16) -> io::Result<Self> {
         let mut queue = nfq::Queue::open()?;
         queue.bind(number)?;
+        queue.set_queue_max_len(number, 4096)?;
         queue.set_recv_conntrack(number, true)?;
         queue.set_fail_open(number, false)?;
         queue.set_recv_gso(number, false)?;
         queue.set_recv_enobufs(true)?;
+        let receive_buffer: libc::c_int = 4 * 1024 * 1024;
+        // SAFETY: fd remains owned by queue; the buffer size is a live c_int.
+        let result = unsafe {
+            libc::setsockopt(
+                queue.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&receive_buffer as *const libc::c_int).cast(),
+                std::mem::size_of_val(&receive_buffer) as libc::socklen_t,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
         let timeout = libc::timeval {
             tv_sec: 0,
             tv_usec: 200_000,
@@ -167,6 +182,17 @@ impl NfQueue {
         self.pending_since = None;
         Ok(())
     }
+    fn forget_block(&mut self, key: conntrack::ConntrackKey) {
+        if let Some(block) = self.blocked_ct.remove(&key) {
+            self.pending_blocks.remove(&key);
+            if block.installed.is_some() || block.inflight {
+                if self.pending_blocks.is_empty() && self.pending_unblocks.is_empty() {
+                    self.pending_since = Some(Instant::now());
+                }
+                self.pending_unblocks.insert(key);
+            }
+        }
+    }
 }
 impl PacketIo for NfQueue {
     fn process_one(&mut self, policy: &mut dyn Policy) -> io::Result<()> {
@@ -234,11 +260,15 @@ impl PacketIo for NfQueue {
                     id: ct.get_id(),
                     zone: ct.get_zone(),
                 });
-        let rst = rustgfw_core::packet::parse(bytes).ok().is_some_and(|p| {
-            p.protocol == rustgfw_core::packet::Protocol::Tcp && p.tcp_flags & 4 != 0
-        });
-        let cached_block =
-            conntrack_key.is_some_and(|key| self.blocked_ct.contains_key(&key)) && !rst;
+        let tcp_flags = rustgfw_core::packet::parse(bytes)
+            .ok()
+            .filter(|p| p.protocol == rustgfw_core::packet::Protocol::Tcp)
+            .map(|p| p.tcp_flags);
+        let rst = tcp_flags.is_some_and(|flags| flags & 4 != 0);
+        let initial_syn = tcp_flags.is_some_and(|flags| flags & 0x12 == 0x02);
+        let cached_block = conntrack_key.is_some_and(|key| self.blocked_ct.contains_key(&key))
+            && !rst
+            && !initial_syn;
         let verdict = if cached_block {
             Verdict::DropFlow
         } else if bytes.is_empty() || bytes.len() < message.get_original_len() {
@@ -256,15 +286,16 @@ impl PacketIo for NfQueue {
             && self.dynamic_table.is_some()
             && conntrack_key.is_some_and(|key| self.blocked_ct.contains_key(&key));
         if close_blocked && let Some(key) = conntrack_key {
-            let block = self.blocked_ct.remove(&key).unwrap();
-            self.pending_blocks.remove(&key);
-            if block.installed.is_some() || block.inflight {
-                if self.pending_blocks.is_empty() && self.pending_unblocks.is_empty() {
-                    self.pending_since = Some(Instant::now());
-                }
-                self.pending_unblocks.insert(key);
-            }
+            self.forget_block(key);
             self.closing_ct.insert(key, Instant::now());
+        }
+        if initial_syn
+            && verdict == Verdict::Accept
+            && let Some(key) = conntrack_key
+        {
+            self.forget_block(key);
+            self.closing_ct.remove(&key);
+            self.flush_pending()?;
         }
         let mark_block =
             verdict == Verdict::DropFlow && !rst && has_conntrack && self.mark_offload.is_some();

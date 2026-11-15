@@ -156,6 +156,13 @@ fn render(table: &str, plan: &Plan) -> String {
             out.push_str(&format!(
                 "add rule inet {table} inspect ct event set destroy\n"
             ));
+            // Conntrack IDs can be reused while an old block still exists.
+            // Let handshake packets reach the engine so a new SYN can retire it.
+            out.push_str(&format!(
+                "add rule inet {table} inspect meta l4proto tcp ct zone . ct id @blocked_ct tcp flags & syn == syn counter queue num {}{}\n",
+                plan.queue,
+                if plan.bypass_without_listener { " bypass" } else { "" },
+            ));
             out.push_str(&format!(
                 "add rule inet {table} inspect meta l4proto tcp ct zone . ct id @blocked_ct tcp flags & rst == rst delete @blocked_ct {{ ct zone . ct id }} counter accept\n"
             ));
@@ -164,6 +171,10 @@ fn render(table: &str, plan: &Plan) -> String {
             ));
         }
         DynamicOffload::ConntrackMark(mask) => {
+            out.push_str(&format!(
+                "add rule inet {table} inspect meta l4proto tcp ct mark & 0x{mask:08x} != 0 tcp flags & (syn | ack) == syn ct mark set ct mark & 0x{:08x} counter\n",
+                !mask
+            ));
             out.push_str(&format!(
                 "add rule inet {table} inspect meta l4proto tcp ct mark & 0x{mask:08x} != 0 tcp flags & rst == rst ct mark set ct mark & 0x{:08x} counter accept\n",
                 !mask
@@ -245,6 +256,7 @@ mod tests {
         assert!(text.find("udp dport 53").unwrap() < text.rfind("queue num 12").unwrap());
         assert!(!text.contains("bypass"));
         assert!(text.starts_with("create table inet test\n"));
+        assert!(text.contains("tcp flags & syn == syn counter queue num 12"));
         assert!(text.contains("tcp flags & rst == rst delete @blocked_ct { ct zone . ct id }"));
     }
     #[test]
@@ -258,6 +270,7 @@ mod tests {
         };
         let text = render("test", &plan);
         assert!(text.contains("inspect meta l4proto tcp ct mark & 0x80000000 != 0"));
+        assert!(text.contains("tcp flags & (syn | ack) == syn ct mark set ct mark & 0x7fffffff"));
         assert!(text.contains("finish { type filter hook forward priority 1"));
         assert!(text.contains("finish meta l4proto tcp meta mark & 0x80000000 != 0"));
         assert!(!text.contains("blocked_ct"));

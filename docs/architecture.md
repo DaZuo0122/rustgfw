@@ -9,7 +9,7 @@
 - `rustgfw-windows`：通过 WinDivert 2.2 DLL 捕获和重新注入网络层包，原样保留 WinDivert 地址；本机流量由 WFP 静态阻断开头连续的丢弃规则，转发流量由 WinDivert DROP 句柄执行同一静态前缀。已具备 FLOW 事件读取和按 compartment 限定的精确流规则接口；WinDivert 事件缺少 compartment ID，运行时关联与卸载生命周期尚未接通。
 - 根二进制：按 `nfqueue` 或 `windivert` 选择 I/O 后端，共用默认动作、有序规则和应用层分析器；Linux 的 `nft=input|output|forward` 管理本实例 nft 表。
 
-`PacketIo` 保持内核消息所有权直到裁决；错误上报调用者。`KernelPolicy` 独立描述安装和撤销，由 Linux 的 `NftPolicy` 实现。NFQUEUE 后端默认用 `(ct zone, ct id)` 集合卸载已阻断的 TCP 流；集合项超时 120 秒，持续流量经过 115 秒后在一次 nft 事务中重建该项以续期。逐流 nft 写入和撤销由有序工作线程批量执行，用户态在写入完成前继续阻断该流；退出或销毁事件丢失时先结束当前写入并取消排队批次，再删除或清空本实例的内核策略。已卸载流的 RST 在 nft 包路径删除集合项并放行，conntrack 销毁事件清理用户态状态。可选 `ctmark=` 用预留 bit 在下一 nft hook 写入 conntrack mark，从而避免依赖近似唯一的 32 位 ID。只写入 packet mark 并不等于连接策略生效。Linux 从 NFQUEUE 的 conntrack 属性取得 zone 和 ID，把两者纳入用户态流作用域，并在销毁事件键中保留有方向的 zone；缺少 conntrack 元数据时以无序入出接口对及 packet mark 建立单独作用域，保留跨包检查。若不同 zone 共用这些接口与 mark，内核未提供 zone 元数据，用户态仍无法区分它们。Windows 本机和转发流量目前共用五元组作用域，以保留跨接口的双向流状态；WinDivert 不保证出站接口编号有效，跨网络域的重叠五元组仍需可靠身份来源才能隔离。规则版本与方向性 zone 的内核卸载碰撞风险仍待完善。
+`PacketIo` 保持内核消息所有权直到裁决；错误上报调用者。`KernelPolicy` 独立描述安装和撤销，由 Linux 的 `NftPolicy` 实现。NFQUEUE 后端默认用 `(ct zone, ct id)` 集合卸载已阻断的 TCP 流；集合项超时 120 秒，持续流量经过 115 秒后在一次 nft 事务中重建该项以续期。逐流 nft 写入和撤销由有序工作线程批量执行，用户态在写入完成前继续阻断该流；退出或销毁事件丢失时先结束当前写入并取消排队批次，再删除或清空本实例的内核策略。已卸载流的 RST 在 nft 包路径删除集合项并放行，conntrack 销毁事件清理用户态状态。可选 `ctmark=` 用预留 bit 在下一 nft hook 写入 conntrack mark，从而避免依赖近似唯一的 32 位 ID。只写入 packet mark 并不等于连接策略生效。Linux 从 NFQUEUE 的 conntrack 属性取得 zone 和 ID，把两者纳入用户态流作用域，并在销毁事件键中保留有方向的 zone；缺少 conntrack 元数据时以无序入出接口对及 packet mark 建立单独作用域，保留跨包检查。若不同 zone 共用这些接口与 mark，内核未提供 zone 元数据，用户态仍无法区分它们。Windows 本机和转发流量目前共用五元组作用域，以保留跨接口的双向流状态；WinDivert 的接口编号不能保证双向相同，跨网络域的重叠五元组仍需可靠身份来源才能隔离。规则版本与方向性 zone 的内核卸载碰撞风险仍待完善。
 
 Linux NFQUEUE 的 accept 表示恢复 netfilter 遍历，并不绕过其他链；Windows WinDivert 放行需要重新注入捕获的包，WFP 过滤规则的优先级与终止行为也不能映射成 Linux mark。用户提到的 wpf 在这里按 Windows Filtering Platform（WFP）理解。Windows 后端的当前边界见 [windows-backend.md](windows-backend.md)。
 
@@ -38,6 +38,8 @@ TCP 重组模块 `core::tcp` 已接入 `core::inspect` 的双向分析路径，�
 通用观察结果改造后，在隔离 IPv4/IPv6 本机拓扑实测 DNS TCP 同一连接先放行查询、后续查询命中后阻断整条流；HTTP 分段 Host 与 TLS 分段 ClientHello 的回归也通过。
 
 2026-11-15 多流回归：Debian 隔离本机网络命名空间中，1000 条 TCP 流、64 个客户端并发交替发送允许与阻断 HTTP 请求。原逐流同步 nft 路径有 27 个客户端未收到允许响应并出现 NFQUEUE `ENOBUFS`；批量卸载与内核 RST 清理后，连续三轮均为 500 条允许流收到响应、500 条阻断流无泄漏，连接关闭后 `blocked_ct` 无残留项，进程无溢出日志。一次紧接编译和故障注入的运行出现 40 个客户端超时，未见溢出日志；随后独立三轮及故障注入后两轮均未复现，原因尚未定位。单流回归确认内核 RST 删除规则计数器递增，方向性 zone、重复阻断与事件丢失恢复仍通过。该结果只覆盖这一隔离拓扑与负载，尚不代表长期多流压力测试完成。测试脚本仅放在忽略目录 `target/`。
+
+2026-11-15 多流故障定位与修复：在同一 1000 流、64 并发测试中复现 1～50 个客户端建连超时。诊断显示新连接的初始 SYN 可带旧连接的 `Established` conntrack ID，并命中用户态阻断缓存；内核 ID 集合和预留 mark 位也可能在连接元数据复用时拦截新 SYN。现在 ID 模式将命中阻断集合的 SYN/SYN-ACK 送回队列，用户态对初始 SYN 重新评估并撤销旧 ID；`ctmark=` 模式在新初始 SYN 上清除预留位。NFQUEUE 内核队列长度设为 4096，netlink 接收缓冲请求 4 MiB（实际值受系统 `rmem_max` 限制）。修复后 ID 模式和 `ctmark=` 模式各连续 20 轮、每轮 1000 流均有 500 条允许请求成功、500 条阻断请求无泄漏；单流动态阻断、RST 清理、销毁事件丢失恢复也通过。纯 TCP 基线 20 轮和无卸载 NFQUEUE 模式 30 轮均通过。偶见 SYN 重传，尚不能据此断言所有负载下零丢包。测试脚本仍只存放在本地忽略目录 `target/`。
 
 多 zone 改造后，在隔离本机拓扑中设置 zone 7，与默认 zone 0 同时运行：两条 HTTP 阻断连接分别写入 `(7, id)` 和 `(0, id)` 集合项，后续包经内核丢弃，RST 撤销两个条目。又在隔离转发拓扑中以同一 IPv4/TCP 五元组分别建立 zone 7 与 zone 8 连接，完整握手后前者 HTTP 阻断并内核卸载，后者及后续包放行。缺少握手导致后续包无 conntrack 元数据时，按不同接口路径区分作用域，前者用户态阻断、后者放行。既有 IPv4/IPv6 FORWARD ID 模式和 `ctmark=` 模式回归通过；相同接口与 mark 下的无 conntrack 多 zone 流尚不可区分。
 

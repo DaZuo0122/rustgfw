@@ -238,7 +238,7 @@ pub struct InspectLimits {
 impl Default for InspectLimits {
     fn default() -> Self {
         Self {
-            max_flows: 4096,
+            max_flows: 16384,
             idle: Duration::from_secs(120),
             reorder_bytes: 16384,
         }
@@ -252,6 +252,7 @@ pub struct Inspect<P> {
     analyzers: Vec<AnalyzerRule>,
     datagrams: Vec<DatagramRule>,
     flows: HashMap<Key, Flow>,
+    completed_since_compaction: bool,
     sweep: Instant,
     limits: InspectLimits,
 }
@@ -281,12 +282,14 @@ impl<P> Inspect<P> {
             analyzers,
             datagrams,
             flows: HashMap::new(),
+            completed_since_compaction: false,
             sweep: Instant::now(),
             limits,
         }
     }
     pub fn clear_flows(&mut self) {
         self.flows.clear();
+        self.completed_since_compaction = false;
     }
 }
 impl<P: Policy> Policy for Inspect<P> {
@@ -355,7 +358,10 @@ impl<P: Policy> Policy for Inspect<P> {
             self.flows.remove(&key);
         }
         if self.flows.len() >= self.limits.max_flows && !self.flows.contains_key(&key) {
-            self.flows.retain(|_, flow| !flow.finished());
+            if self.completed_since_compaction {
+                self.flows.retain(|_, flow| !flow.finished());
+                self.completed_since_compaction = false;
+            }
             if self.flows.len() >= self.limits.max_flows {
                 // Active inspection cannot be silently bypassed at capacity.
                 return Verdict::Drop;
@@ -415,6 +421,7 @@ impl<P: Policy> Policy for Inspect<P> {
         } else {
             verdict
         };
+        self.completed_since_compaction |= flow.finished();
         // A half-close leaves the other direction active. Blocked flows retain
         // their verdict until timeout or a new initial SYN replaces them.
         if t.tcp_flags & 1 != 0 {
@@ -736,6 +743,7 @@ mod tests {
         );
         // Same SYN is a retransmission, not a new connection.
         assert_eq!(feed(100, 2, b""), Verdict::DropFlow);
+        assert_eq!(feed(101, 4, b""), Verdict::DropFlow);
         assert_eq!(feed(5000, 2, b""), Verdict::Accept);
         assert_eq!(
             feed(5001, 16, b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n"),
@@ -878,9 +886,18 @@ mod tests {
                 scope: FlowScope::default(),
             })
         }
-        let mut p = Inspect::http_hosts(
+        let mut p = Inspect::with_limits(
             crate::ConstantPolicy(Verdict::Accept),
-            vec!["blocked.test".into()],
+            vec![
+                AnalyzerRule::exact("http.host", vec!["blocked.test".into()], None, || {
+                    Box::<HttpHost>::default()
+                })
+                .unwrap(),
+            ],
+            InspectLimits {
+                max_flows: 4096,
+                ..InspectLimits::default()
+            },
         );
         for port in 10000u16..14096 {
             assert_eq!(feed(&mut p, port, 100, 2, b"", false), Verdict::Accept);

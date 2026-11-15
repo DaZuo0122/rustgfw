@@ -42,10 +42,11 @@ pub struct NfQueue {
     queue: nfq::Queue,
     dynamic_table: Option<String>,
     mark_offload: Option<u32>,
-    destroy_events: Option<conntrack::DestroyEvents>,
+    destroy_events: Option<conntrack::DestroyReceiver>,
     offload_worker: Option<offload_worker::Worker>,
     blocked_ct: HashMap<conntrack::ConntrackKey, BlockedFlow>,
     closing_ct: HashMap<conntrack::ConntrackKey, Instant>,
+    last_closing_gc: Instant,
     pending_blocks: HashSet<conntrack::ConntrackKey>,
     pending_unblocks: HashSet<conntrack::ConntrackKey>,
     pending_since: Option<Instant>,
@@ -98,13 +99,14 @@ impl NfQueue {
             offload_worker: None,
             blocked_ct: HashMap::new(),
             closing_ct: HashMap::new(),
+            last_closing_gc: Instant::now(),
             pending_blocks: HashSet::new(),
             pending_unblocks: HashSet::new(),
             pending_since: None,
         })
     }
     pub fn set_dynamic_table(&mut self, table: &str) -> io::Result<()> {
-        let events = conntrack::DestroyEvents::open()?;
+        let events = conntrack::DestroyReceiver::start()?;
         let worker = offload_worker::Worker::start(table.to_owned())?;
         self.destroy_events = Some(events);
         self.offload_worker = Some(worker);
@@ -115,6 +117,9 @@ impl NfQueue {
         self.mark_offload = Some(mask);
     }
     pub fn stop_offload(&mut self) -> io::Result<()> {
+        if let Some(mut events) = self.destroy_events.take() {
+            events.stop();
+        }
         if let Some(worker) = self.offload_worker.take() {
             worker.stop()?;
         }
@@ -197,23 +202,39 @@ impl NfQueue {
 impl PacketIo for NfQueue {
     fn process_one(&mut self, policy: &mut dyn Policy) -> io::Result<()> {
         self.drain_offload_results()?;
-        self.closing_ct
-            .retain(|_, at| at.elapsed() < Duration::from_secs(120));
+        if self.last_closing_gc.elapsed() >= Duration::from_secs(1) {
+            self.closing_ct
+                .retain(|_, at| at.elapsed() < Duration::from_secs(120));
+            self.last_closing_gc = Instant::now();
+        }
         if let (Some(events), Some(table)) = (&self.destroy_events, &self.dynamic_table) {
             let table = table.clone();
-            let result = events.drain(|key| {
-                if let Some(block) = self.blocked_ct.remove(&key) {
-                    self.closing_ct.insert(key, Instant::now());
-                    self.pending_blocks.remove(&key);
-                    if block.installed.is_some() || block.inflight {
-                        if self.pending_blocks.is_empty() && self.pending_unblocks.is_empty() {
-                            self.pending_since = Some(Instant::now());
+            let mut result = Ok(());
+            for _ in 0..16 {
+                match events.try_batch() {
+                    Ok(Some(keys)) => {
+                        for key in keys {
+                            self.closing_ct.insert(key, Instant::now());
+                            if let Some(block) = self.blocked_ct.remove(&key) {
+                                self.pending_blocks.remove(&key);
+                                if block.installed.is_some() || block.inflight {
+                                    if self.pending_blocks.is_empty()
+                                        && self.pending_unblocks.is_empty()
+                                    {
+                                        self.pending_since = Some(Instant::now());
+                                    }
+                                    self.pending_unblocks.insert(key);
+                                }
+                            }
                         }
-                        self.pending_unblocks.insert(key);
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        result = Err(error);
+                        break;
                     }
                 }
-                Ok(())
-            });
+            }
             if let Err(error) = result {
                 if !conntrack::events_lost(&error) {
                     return Err(error);
@@ -226,10 +247,7 @@ impl PacketIo for NfQueue {
                 self.pending_unblocks.clear();
                 self.pending_since = None;
                 self.dynamic_table = None;
-                self.destroy_events = None;
-                eprintln!(
-                    "conntrack destroy events lost; disabled ID offload, continuing in userspace"
-                );
+                eprintln!("{error}; disabled ID offload, continuing in userspace");
             }
         }
         self.flush_pending_if_due()?;
@@ -424,15 +442,20 @@ mod tests {
                     queue.offload_worker.as_ref().unwrap().block(vec![key])?;
                 }
                 let (sender, receiver) = UnixDatagram::pair()?;
-                queue.destroy_events = Some(conntrack::DestroyEvents::from_fd(receiver.into()));
+                queue.destroy_events = Some(conntrack::DestroyReceiver::from_fd(receiver.into()));
                 sender.send(event)?;
-                let error = queue
-                    .process_one(&mut rustgfw_core::ConstantPolicy(Verdict::Accept))
-                    .unwrap_err();
-                assert!(matches!(
-                    error.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                ));
+                for _ in 0..5 {
+                    let error = queue
+                        .process_one(&mut rustgfw_core::ConstantPolicy(Verdict::Accept))
+                        .unwrap_err();
+                    assert!(matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ));
+                    if queue.dynamic_table.is_none() {
+                        break;
+                    }
+                }
                 assert!(queue.dynamic_table.is_none());
                 assert!(queue.destroy_events.is_none());
                 assert!(queue.blocked_ct.is_empty());

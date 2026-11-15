@@ -3,14 +3,20 @@ use std::{
     error::Error,
     fmt, io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, TryRecvError},
+    },
+    thread::{self, JoinHandle},
 };
 
 #[derive(Debug)]
-pub(crate) struct EventsLost;
+pub(crate) struct EventsLost(pub(crate) String);
 
 impl fmt::Display for EventsLost {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("conntrack destroy events lost")
+        write!(formatter, "conntrack destroy events lost: {}", self.0)
     }
 }
 
@@ -45,6 +51,98 @@ pub struct DestroyEvents {
     fd: OwnedFd,
 }
 
+/// Keeps draining netlink even when nft offload leaves NFQUEUE idle.
+pub struct DestroyReceiver {
+    batches: Receiver<io::Result<Vec<ConntrackKey>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl DestroyReceiver {
+    pub fn start() -> io::Result<Self> {
+        Ok(Self::from_events(DestroyEvents::open()?))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_fd(fd: OwnedFd) -> Self {
+        Self::from_events(DestroyEvents::from_fd(fd))
+    }
+
+    fn from_events(events: DestroyEvents) -> Self {
+        let (sender, batches) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            let mut poll_fd = libc::pollfd {
+                fd: events.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            while !thread_stop.load(Ordering::Relaxed) {
+                // SAFETY: poll_fd is initialized and the socket belongs to this thread.
+                let ready = unsafe { libc::poll(&mut poll_fd, 1, 100) };
+                if ready < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    let _ = sender.send(Err(error));
+                    break;
+                }
+                if ready == 0 {
+                    continue;
+                }
+                if poll_fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                    let _ = sender.send(Err(io::Error::other(EventsLost(
+                        "netlink event socket closed or failed".into(),
+                    ))));
+                    break;
+                }
+                let mut batch = Vec::new();
+                let result = events.drain(|key| {
+                    batch.push(key);
+                    Ok(())
+                });
+                if !batch.is_empty() && sender.send(Ok(batch)).is_err() {
+                    break;
+                }
+                if let Err(error) = result {
+                    let _ = sender.send(Err(error));
+                    break;
+                }
+            }
+        });
+        Self {
+            batches,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    pub fn try_batch(&self) -> io::Result<Option<Vec<ConntrackKey>>> {
+        match self.batches.try_recv() {
+            Ok(batch) => batch.map(Some),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(io::Error::other(EventsLost(
+                "destroy receiver stopped".into(),
+            ))),
+        }
+    }
+
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for DestroyReceiver {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 impl DestroyEvents {
     #[cfg(test)]
     pub(crate) fn from_fd(fd: OwnedFd) -> Self {
@@ -64,6 +162,20 @@ impl DestroyEvents {
             return Err(io::Error::last_os_error());
         }
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let receive_buffer: libc::c_int = 4 * 1024 * 1024;
+        // SAFETY: the socket owns fd and the buffer size is a live c_int.
+        if unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&receive_buffer as *const libc::c_int).cast(),
+                std::mem::size_of_val(&receive_buffer) as libc::socklen_t,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
         // SAFETY: zero is a valid sockaddr_nl baseline, including its padding.
         let mut address: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
         address.nl_family = libc::AF_NETLINK as u16;
@@ -85,8 +197,8 @@ impl DestroyEvents {
         mut on_destroy: impl FnMut(ConntrackKey) -> io::Result<()>,
     ) -> io::Result<()> {
         let mut buffer = [0u8; 65536];
-        // Leave time for NFQUEUE packets when many connections close together.
-        for _ in 0..16 {
+        // A burst of short-lived flows can outpace the NFQUEUE receive loop.
+        for _ in 0..128 {
             let size = unsafe {
                 libc::recv(
                     self.fd.as_raw_fd(),
@@ -98,7 +210,9 @@ impl DestroyEvents {
             if size < 0 {
                 let error = io::Error::last_os_error();
                 if error.raw_os_error() == Some(libc::ENOBUFS) {
-                    return Err(io::Error::other(EventsLost));
+                    return Err(io::Error::other(EventsLost(
+                        "netlink receive buffer overflow".into(),
+                    )));
                 }
                 return match error.kind() {
                     io::ErrorKind::WouldBlock => Ok(()),
@@ -110,13 +224,19 @@ impl DestroyEvents {
                 return Ok(());
             }
             if size as usize > buffer.len() {
-                return Err(io::Error::other(EventsLost));
+                return Err(io::Error::other(EventsLost(
+                    "destroy datagram exceeded receive buffer".into(),
+                )));
             }
             // A malformed datagram can hide a destroy notification. Treat it
             // like a receive overrun so stale kernel ID blocks are cleared.
-            for key in parse_destroy_keys(&buffer[..size as usize])
-                .map_err(|_| io::Error::other(EventsLost))?
-            {
+            for key in parse_destroy_keys(&buffer[..size as usize]).map_err(|error| {
+                if events_lost(&error) {
+                    error
+                } else {
+                    io::Error::other(EventsLost(format!("invalid destroy datagram: {error}")))
+                }
+            })? {
                 on_destroy(key)?;
             }
         }
@@ -154,7 +274,9 @@ fn parse_destroy_keys(buffer: &[u8]) -> io::Result<Vec<ConntrackKey>> {
             return Err(io::Error::other("malformed conntrack netlink message"));
         }
         if kind == libc::NLMSG_OVERRUN as u16 {
-            return Err(io::Error::other(EventsLost));
+            return Err(io::Error::other(EventsLost(
+                "kernel netlink overrun".into(),
+            )));
         }
         if kind == (1 << 8 | 2) {
             if len < 20 {
@@ -359,7 +481,7 @@ mod tests {
     fn drains_a_bounded_batch_of_destroy_datagrams() -> io::Result<()> {
         let (sender, receiver) = UnixDatagram::pair()?;
         let events = DestroyEvents::from_fd(receiver.into());
-        for id in 1..=18u32 {
+        for id in 1..=130u32 {
             sender.send(&destroy(&attr(12, &id.to_be_bytes())))?;
         }
         let mut ids = Vec::new();
@@ -367,12 +489,12 @@ mod tests {
             ids.push(key.id);
             Ok(())
         })?;
-        assert_eq!(ids.len(), 16);
+        assert_eq!(ids.len(), 128);
         events.drain(|key| {
             ids.push(key.id);
             Ok(())
         })?;
-        assert_eq!(ids, (1..=18).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=130).collect::<Vec<_>>());
         Ok(())
     }
     #[test]

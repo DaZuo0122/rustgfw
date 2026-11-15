@@ -40,7 +40,8 @@ pub trait PacketIo {
 }
 
 /// Kernel policy installation is distinct from packet acceptance/reinjection.
-/// Handles are backend-owned and must be revoked before replacing a ruleset.
+/// Handles and replacement semantics are backend-owned. Any offloaded flow
+/// decisions from an old policy must be cleared before a new policy runs.
 pub trait KernelPolicy {
     type Rule;
     type Handle;
@@ -58,6 +59,13 @@ impl<P: Policy> Engine<P> {
     pub fn step(&mut self, io: &mut impl PacketIo) -> io::Result<()> {
         io.process_one(&mut self.policy)
     }
+
+    /// Replace the userspace policy between packet steps. The old policy and
+    /// its flow state are returned to the caller. Kernel offloads must be
+    /// updated or cleared by the backend before packets use the new policy.
+    pub fn replace_policy(&mut self, next: P) -> P {
+        std::mem::replace(&mut self.policy, next)
+    }
 }
 
 /// Explicit bootstrap policy; not a DPI ruleset.
@@ -71,6 +79,7 @@ impl Policy for ConstantPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{packet::Protocol, rules};
     struct Fake {
         result: Option<Verdict>,
         fail: bool,
@@ -101,5 +110,42 @@ mod tests {
         assert_eq!(backend.result, Some(Verdict::Drop));
         backend.fail = true;
         assert!(engine.step(&mut backend).is_err());
+    }
+
+    #[test]
+    fn replacing_policy_discards_the_previous_flow_cache() {
+        struct DatagramIo {
+            bytes: Vec<u8>,
+            verdict: Option<Verdict>,
+        }
+        impl PacketIo for DatagramIo {
+            fn process_one(&mut self, policy: &mut dyn Policy) -> io::Result<()> {
+                self.verdict = Some(policy.evaluate(Packet {
+                    bytes: &self.bytes,
+                    original_len: self.bytes.len(),
+                    checksum_ready: true,
+                    scope: FlowScope::default(),
+                }));
+                Ok(())
+            }
+        }
+        let mut io = DatagramIo {
+            bytes: packet::udp(false),
+            verdict: None,
+        };
+        let mut engine = Engine::new(rules::Rules::new(
+            vec![rules::Rule {
+                protocol: Some(Protocol::Udp),
+                port: Some(53),
+                verdict: Verdict::Drop,
+            }],
+            Verdict::Accept,
+        ));
+        engine.step(&mut io).unwrap();
+        assert_eq!(io.verdict, Some(Verdict::Drop));
+        let old = engine.replace_policy(rules::Rules::new(Vec::new(), Verdict::Accept));
+        assert_eq!(old.flow_count(), 1);
+        engine.step(&mut io).unwrap();
+        assert_eq!(io.verdict, Some(Verdict::Accept));
     }
 }

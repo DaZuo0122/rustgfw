@@ -1204,6 +1204,48 @@ mod tests {
         assert_eq!(evaluate(FlowAction::DropPacket), Verdict::DropFlow);
     }
     #[test]
+    fn engine_policy_replacement_drops_old_inspection_decisions() {
+        struct OnePacket {
+            bytes: Vec<u8>,
+            verdict: Option<Verdict>,
+        }
+        impl crate::PacketIo for OnePacket {
+            fn process_one(&mut self, policy: &mut dyn Policy) -> std::io::Result<()> {
+                self.verdict = Some(policy.evaluate(Packet {
+                    bytes: &self.bytes,
+                    original_len: self.bytes.len(),
+                    checksum_ready: true,
+                    scope: FlowScope::default(),
+                }));
+                Ok(())
+            }
+        }
+        let mut engine = crate::Engine::new(Inspect::http_hosts(
+            crate::ConstantPolicy(Verdict::Accept),
+            vec!["old.test".into()],
+        ));
+        let mut packet = OnePacket {
+            bytes: tcp(100, 2, b"", false),
+            verdict: None,
+        };
+        engine.step(&mut packet).unwrap();
+        packet.bytes = tcp(101, 16, b"GET / HTTP/1.1\r\nHost: old.test\r\n\r\n", false);
+        engine.step(&mut packet).unwrap();
+        assert_eq!(packet.verdict, Some(Verdict::DropFlow));
+
+        engine.replace_policy(Inspect::http_hosts(
+            crate::ConstantPolicy(Verdict::Accept),
+            vec!["new.test".into()],
+        ));
+        engine.step(&mut packet).unwrap();
+        assert_eq!(packet.verdict, Some(Verdict::Accept));
+        packet.bytes = tcp(1000, 2, b"", false);
+        engine.step(&mut packet).unwrap();
+        packet.bytes = tcp(1001, 16, b"GET / HTTP/1.1\r\nHost: new.test\r\n\r\n", false);
+        engine.step(&mut packet).unwrap();
+        assert_eq!(packet.verdict, Some(Verdict::DropFlow));
+    }
+    #[test]
     fn tcp_dns_observations_continue_across_messages() {
         fn query(host: &str) -> Vec<u8> {
             let mut dns = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];

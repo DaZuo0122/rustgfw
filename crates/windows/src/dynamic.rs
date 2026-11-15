@@ -14,10 +14,13 @@ use std::{
     path::Path,
     sync::mpsc::{self, Sender},
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 type Shutdown = unsafe extern "C" fn(Handle, u32) -> c_int;
 const SHUTDOWN_RECV: u32 = 1;
+const BLOCK_LIFETIME: Duration = Duration::from_secs(300);
+const EXPIRY_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct FlowKey {
@@ -50,7 +53,7 @@ pub enum Command {
 struct Active<H> {
     endpoint_id: u64,
     attempted: bool,
-    block: Option<H>,
+    block: Option<(H, Instant)>,
 }
 
 struct State<P: KernelPolicy<Rule = LocalFlow>> {
@@ -83,7 +86,7 @@ impl<P: KernelPolicy<Rule = LocalFlow>> State<P> {
                 // The FLOW event has no network-domain identity. If a tuple
                 // overlaps, stop offloading until it becomes unambiguous.
                 for entry in entries.iter_mut() {
-                    if let Some(block) = entry.block.take() {
+                    if let Some((block, _)) = entry.block.take() {
                         self.policy.revoke(&block)?;
                     }
                     entry.attempted = false;
@@ -101,13 +104,31 @@ impl<P: KernelPolicy<Rule = LocalFlow>> State<P> {
                         .position(|entry| entry.endpoint_id == event.endpoint_id)
                     {
                         let entry = entries.remove(position);
-                        if let Some(block) = entry.block {
+                        if let Some((block, _)) = entry.block {
                             self.policy.revoke(&block)?;
                         }
                     }
                     if entries.is_empty() {
                         self.active.remove(&key);
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn expire_blocks(&mut self, now: Instant) -> io::Result<()> {
+        for entries in self.active.values_mut() {
+            for entry in entries {
+                if entry
+                    .block
+                    .as_ref()
+                    .is_some_and(|(_, expires_at)| *expires_at <= now)
+                {
+                    let (block, _) = entry.block.take().unwrap();
+                    self.policy.revoke(&block)?;
+                    // Keep `attempted` set: a missed FLOW delete could make
+                    // this endpoint ID stale, so do not offload it again.
                 }
             }
         }
@@ -164,7 +185,7 @@ impl<P: KernelPolicy<Rule = LocalFlow>> State<P> {
         entries[0].attempted = true;
         let result = self.policy.install(&flow);
         match result {
-            Ok(block) => entries[0].block = Some(block),
+            Ok(block) => entries[0].block = Some((block, Instant::now() + BLOCK_LIFETIME)),
             Err(error) => {
                 eprintln!("WFP dynamic flow offload unavailable: {error}; using WinDivert policy")
             }
@@ -208,7 +229,23 @@ impl FlowBlocker {
                 }
             };
             let mut state = State::new(policy);
-            while let Ok(command) = receiver.recv() {
+            let mut next_expiry_check = Instant::now() + EXPIRY_CHECK_INTERVAL;
+            loop {
+                let now = Instant::now();
+                if now >= next_expiry_check {
+                    if let Err(error) = state.expire_blocks(now) {
+                        eprintln!("WFP block expiry failed: {error}; closing dynamic WFP session");
+                        break;
+                    }
+                    next_expiry_check = now + EXPIRY_CHECK_INTERVAL;
+                }
+                let command = match receiver
+                    .recv_timeout(next_expiry_check.saturating_duration_since(Instant::now()))
+                {
+                    Ok(command) => command,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
                 let result = match command {
                     Command::Event(event) => state.event(event),
                     Command::Block {
@@ -383,5 +420,24 @@ mod tests {
         assert_eq!(state.policy.revoked, [1, 2]);
         state.block_resolved(request());
         assert_eq!(state.policy.installed.len(), 2);
+    }
+
+    #[test]
+    fn expired_wfp_block_reverts_to_packet_policy() {
+        let mut state = State::new(FakePolicy::default());
+        state.event(event(FlowKind::Established, 1)).unwrap();
+        state.block_resolved(request());
+        assert_eq!(state.policy.installed.len(), 1);
+        state.expire_blocks(Instant::now()).unwrap();
+        assert!(state.policy.revoked.is_empty());
+
+        state
+            .expire_blocks(Instant::now() + BLOCK_LIFETIME)
+            .unwrap();
+        assert_eq!(state.policy.revoked, [1]);
+        state.block_resolved(request());
+        assert_eq!(state.policy.installed.len(), 1);
+        state.event(event(FlowKind::Deleted, 1)).unwrap();
+        assert_eq!(state.policy.revoked, [1]);
     }
 }

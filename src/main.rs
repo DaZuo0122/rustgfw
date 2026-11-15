@@ -1,9 +1,13 @@
 use rustgfw_core::{
     Verdict,
-    inspect::{AnalyzerRule, DatagramPort, DatagramRule, InspectLimits},
+    conditions::MatchRule,
+    inspect::{AnalyzerRule, DatagramPort, DatagramRule, InspectLimits, UdpStreamRule},
+    packet::Protocol,
     rules::{Rule, RulesLimits},
 };
 use std::time::Duration;
+
+mod expr_config;
 
 type Error = Box<dyn std::error::Error>;
 
@@ -12,7 +16,7 @@ fn main() -> Result<(), Error> {
     match args.first().map(String::as_str) {
         Some("nfqueue") => run_nfqueue(&args[1..]),
         Some("windivert") => run_windivert(&args[1..]),
-        _ => Err("usage: rustgfw nfqueue <queue> <accept|drop> [rules...] [nft=input|output|forward] [ctmark=0x80000000] | rustgfw windivert <dll> <network|forward> <accept|drop> [rules...]; shared options: inspect-flows=N transport-flows=N flow-idle-seconds=N reorder-bytes=N http-header-bytes=N tls-buffer-bytes=N dns-message-bytes=N".into()),
+        _ => Err("usage: rustgfw nfqueue <queue> <accept|drop> [rules...] [nft=input|output|forward] [ctmark=0x80000000] | rustgfw windivert <dll> <network|forward> <accept|drop> [rules...]; shared options: rules-file=path inspect-flows=N transport-flows=N flow-idle-seconds=N reorder-bytes=N http-header-bytes=N tls-buffer-bytes=N dns-message-bytes=N".into()),
     }
 }
 
@@ -22,6 +26,7 @@ struct Options {
     http_hosts: Vec<String>,
     tls_sni: Vec<String>,
     dns_names: Vec<String>,
+    expr_rules: Vec<MatchRule>,
     nft_hook: Option<String>,
     ctmark: Option<u32>,
     inspect_limits: InspectLimits,
@@ -43,6 +48,7 @@ impl Options {
             http_hosts: Vec::new(),
             tls_sni: Vec::new(),
             dns_names: Vec::new(),
+            expr_rules: Vec::new(),
             nft_hook: None,
             ctmark: None,
             inspect_limits: InspectLimits::default(),
@@ -51,6 +57,7 @@ impl Options {
             tls_buffer_bytes: 131072,
             dns_message_bytes: 65535,
         };
+        let mut rule_file_seen = false;
         for arg in args {
             if let Some(host) = arg.strip_prefix("http-host=") {
                 options.http_hosts.push(host.to_owned());
@@ -60,6 +67,12 @@ impl Options {
                 options
                     .dns_names
                     .push(name.trim_end_matches('.').to_ascii_lowercase());
+            } else if let Some(path) = arg.strip_prefix("rules-file=") {
+                if rule_file_seen {
+                    return Err("specify at most one rules file".into());
+                }
+                options.expr_rules = expr_config::load(std::path::Path::new(path))?;
+                rule_file_seen = true;
             } else if let Some(hook) = arg.strip_prefix("nft=") {
                 if options.nft_hook.replace(hook.to_owned()).is_some() {
                     return Err("specify at most one nft hook".into());
@@ -109,27 +122,91 @@ impl Options {
     }
 
     fn into_policy(self) -> impl rustgfw_core::Policy {
-        use rustgfw_core::{dns::DnsDatagram, inspect::Inspect, rules::Rules};
+        use rustgfw_core::{
+            dns::{DnsDatagram, DnsUdp},
+            inspect::{FlowRule, Inspect},
+            rules::Rules,
+        };
         let http_header_bytes = self.http_header_bytes;
         let tls_buffer_bytes = self.tls_buffer_bytes;
         let dns_message_bytes = self.dns_message_bytes;
         let dns_names = self.dns_names;
+        let field_possible = |field: &str, protocol| {
+            !matches!(field, "http.host" | "tls.sni") || protocol == Protocol::Tcp
+        };
+        let eligible = |rule: &MatchRule, protocol| {
+            rule.condition.can_match_protocol(protocol, &field_possible)
+        };
+        let needs_tcp_field = |field| {
+            self.expr_rules
+                .iter()
+                .any(|rule| eligible(rule, Protocol::Tcp) && rule.condition.references_field(field))
+        };
+        let needs_http = needs_tcp_field("http.host");
+        let needs_tls = needs_tcp_field("tls.sni");
+        let needs_dns_tcp = needs_tcp_field("dns.qname");
+        let needs_dns_udp = self.expr_rules.iter().any(|rule| {
+            eligible(rule, Protocol::Udp) && rule.condition.references_field("dns.qname")
+        });
+        let tcp_rules: Vec<FlowRule> = self
+            .expr_rules
+            .iter()
+            .filter(|rule| eligible(rule, Protocol::Tcp))
+            .cloned()
+            .map(MatchRule::into_flow_rule)
+            .collect();
+        let udp_rules: Vec<FlowRule> = self
+            .expr_rules
+            .into_iter()
+            .filter(|rule| eligible(rule, Protocol::Udp))
+            .map(MatchRule::into_flow_rule)
+            .collect();
         let analyzers = [
-            AnalyzerRule::exact("http.host", self.http_hosts, None, move || {
-                Box::new(rustgfw_core::inspect::HttpHost::with_header_limit(
-                    http_header_bytes,
-                ))
-            }),
-            AnalyzerRule::exact("tls.sni", self.tls_sni, None, move || {
-                Box::new(rustgfw_core::tls::TlsSni::with_buffer_limit(
-                    tls_buffer_bytes,
-                ))
-            }),
-            AnalyzerRule::exact("dns.qname", dns_names.clone(), Some(53), move || {
-                Box::new(rustgfw_core::dns::DnsTcp::with_message_limit(
-                    dns_message_bytes,
-                ))
-            }),
+            if self.http_hosts.is_empty() {
+                needs_http.then(|| {
+                    AnalyzerRule::observing(None, move || {
+                        Box::new(rustgfw_core::inspect::HttpHost::with_header_limit(
+                            http_header_bytes,
+                        ))
+                    })
+                })
+            } else {
+                AnalyzerRule::exact("http.host", self.http_hosts, None, move || {
+                    Box::new(rustgfw_core::inspect::HttpHost::with_header_limit(
+                        http_header_bytes,
+                    ))
+                })
+            },
+            if self.tls_sni.is_empty() {
+                needs_tls.then(|| {
+                    AnalyzerRule::observing(None, move || {
+                        Box::new(rustgfw_core::tls::TlsSni::with_buffer_limit(
+                            tls_buffer_bytes,
+                        ))
+                    })
+                })
+            } else {
+                AnalyzerRule::exact("tls.sni", self.tls_sni, None, move || {
+                    Box::new(rustgfw_core::tls::TlsSni::with_buffer_limit(
+                        tls_buffer_bytes,
+                    ))
+                })
+            },
+            if dns_names.is_empty() {
+                needs_dns_tcp.then(|| {
+                    AnalyzerRule::observing(Some(53), move || {
+                        Box::new(rustgfw_core::dns::DnsTcp::with_message_limit(
+                            dns_message_bytes,
+                        ))
+                    })
+                })
+            } else {
+                AnalyzerRule::exact("dns.qname", dns_names.clone(), Some(53), move || {
+                    Box::new(rustgfw_core::dns::DnsTcp::with_message_limit(
+                        dns_message_bytes,
+                    ))
+                })
+            },
         ]
         .into_iter()
         .flatten()
@@ -142,12 +219,21 @@ impl Options {
         )
         .into_iter()
         .collect();
+        let udp_analyzers = if needs_dns_udp {
+            vec![UdpStreamRule::new(Some(DatagramPort::Either(53)), || {
+                Box::new(DnsUdp)
+            })]
+        } else {
+            Vec::new()
+        };
         Inspect::with_datagrams(
             Rules::with_limits(self.rules, self.default, self.rules_limits),
             analyzers,
             datagrams,
             self.inspect_limits,
         )
+        .with_flow_rules(tcp_rules)
+        .with_udp_streams(udp_analyzers, udp_rules)
     }
 }
 
@@ -446,5 +532,102 @@ mod tests {
         }
         assert!(Options::parse("accept", &["tls-buffer-bytes=0".into()]).is_err());
         assert!(Options::parse("accept", &["dns-message-bytes=0".into()]).is_err());
+    }
+
+    #[test]
+    fn expression_file_combines_dns_observation_and_packet_action() {
+        let path =
+            std::path::PathBuf::from(format!("target/expr-rules-{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"{"rules":[
+                {"name":"blocked DNS","expr":"proto == udp && fresh.dns.qname == blocked.test","action":"drop_packet"},
+                {"name":"rewrite","expr":"proto == udp && payload == \"old\"","action":"replace_udp_payload","replacement":"new"}
+            ]}"#,
+        )
+        .unwrap();
+        let options = Options::parse("accept", &[format!("rules-file={}", path.display())]);
+        std::fs::remove_file(&path).unwrap();
+        let mut policy = options.unwrap().into_policy();
+
+        let query = |name: &str| {
+            let mut dns = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+            for label in name.split('.') {
+                dns.push(label.len() as u8);
+                dns.extend_from_slice(label.as_bytes());
+            }
+            dns.extend_from_slice(&[0, 0, 1, 0, 1]);
+            dns
+        };
+        let udp = |payload: &[u8], destination_port: u16| {
+            let mut bytes = vec![0; 28];
+            let length = (bytes.len() + payload.len()) as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 17;
+            bytes[12] = 10;
+            bytes[16] = 20;
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&destination_port.to_be_bytes());
+            bytes[24..26].copy_from_slice(&(8 + payload.len() as u16).to_be_bytes());
+            bytes.extend_from_slice(payload);
+            bytes
+        };
+        let mut decide = |bytes: &[u8]| {
+            policy.decide(Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        let blocked = udp(&query("blocked.test"), 53);
+        assert_eq!(
+            decide(&blocked),
+            rustgfw_core::Decision::Verdict(Verdict::Drop)
+        );
+        let allowed = udp(&query("allowed.test"), 53);
+        assert_eq!(
+            decide(&allowed),
+            rustgfw_core::Decision::Verdict(Verdict::Accept)
+        );
+        let rewritten = udp(b"old", 5353);
+        let rustgfw_core::Decision::Replace(output) = decide(&rewritten) else {
+            panic!("expected a rewritten UDP packet");
+        };
+        assert_eq!(
+            rustgfw_core::packet::parse(&output).unwrap().payload,
+            b"new"
+        );
+    }
+
+    #[test]
+    fn tcp_only_expression_does_not_consume_udp_flow_capacity() {
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.inspect_limits.max_flows = 0;
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"web","expr":"proto == tcp && http.host == blocked.test","action":"block"}]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let mut bytes = vec![0; 31];
+        bytes[0] = 0x45;
+        bytes[2..4].copy_from_slice(&31u16.to_be_bytes());
+        bytes[9] = 17;
+        bytes[12] = 10;
+        bytes[16] = 20;
+        bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        bytes[22..24].copy_from_slice(&9999u16.to_be_bytes());
+        bytes[24..26].copy_from_slice(&11u16.to_be_bytes());
+        bytes[28..].copy_from_slice(b"udp");
+        assert_eq!(
+            policy.evaluate(Packet {
+                bytes: &bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            }),
+            Verdict::Accept
+        );
     }
 }

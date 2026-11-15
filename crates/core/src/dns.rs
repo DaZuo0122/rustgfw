@@ -1,5 +1,8 @@
 //! DNS question inspection. UDP decisions apply to one datagram, not its socket.
-use crate::inspect::{Analysis, DatagramAnalysis, DatagramAnalyzer, Observation, StreamAnalyzer};
+use crate::inspect::{
+    Analysis, DatagramAnalysis, DatagramAnalyzer, Observation, StreamAnalyzer, UdpStreamAnalysis,
+    UdpStreamAnalyzer,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct InvalidDns;
@@ -103,6 +106,18 @@ impl DatagramAnalyzer for DnsDatagram {
         match questions(payload) {
             Ok(names) => DatagramAnalysis::Observations(observations(names)),
             Err(_) => DatagramAnalysis::Malformed,
+        }
+    }
+}
+
+/// Stateful UDP rule adapter; each datagram replaces the previous DNS name.
+pub struct DnsUdp;
+impl UdpStreamAnalyzer for DnsUdp {
+    fn feed(&mut self, payload: &[u8], _: bool) -> UdpStreamAnalysis {
+        match questions(payload) {
+            Ok(names) if names.is_empty() => UdpStreamAnalysis::ClearFields(vec!["dns.qname"]),
+            Ok(names) => UdpStreamAnalysis::Observations(observations(names)),
+            Err(_) => UdpStreamAnalysis::Drop,
         }
     }
 }

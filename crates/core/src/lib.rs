@@ -1,5 +1,6 @@
 //! OS-independent packet policy execution. No kernel identifiers enter policy code.
 use std::io;
+pub mod conditions;
 pub mod dns;
 pub mod inspect;
 pub mod offload;

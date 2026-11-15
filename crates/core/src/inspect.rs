@@ -57,6 +57,8 @@ pub enum UdpStreamAnalysis {
     Finished,
     /// Reject only this datagram while retaining the stream state.
     Drop,
+    /// Remove facts that no longer describe the latest datagram.
+    ClearFields(Vec<&'static str>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,6 +234,7 @@ pub struct FlowContext<'a> {
     pub reverse: bool,
     pub payload: &'a [u8],
     facts: &'a HashMap<&'static str, Vec<String>>,
+    updated: &'a [&'static str],
 }
 impl FlowContext<'_> {
     pub fn get(&self, field: &str) -> Option<&str> {
@@ -241,11 +244,16 @@ impl FlowContext<'_> {
     pub fn values(&self, field: &str) -> Option<&[String]> {
         self.facts.get(field).map(Vec::as_slice)
     }
+
+    pub fn updated(&self, field: &str) -> bool {
+        self.updated.contains(&field)
+    }
 }
 
 fn store_observations(
     facts: &mut HashMap<&'static str, Vec<String>>,
     observations: Vec<Observation>,
+    updated: &mut Vec<&'static str>,
 ) {
     let mut latest = HashMap::<&'static str, Vec<String>>::new();
     for observation in observations {
@@ -254,6 +262,7 @@ fn store_observations(
             .or_default()
             .push(observation.value);
     }
+    updated.extend(latest.keys().copied());
     facts.extend(latest);
 }
 
@@ -262,10 +271,11 @@ fn match_tcp_observations(
     observations: Vec<Observation>,
     matcher: &dyn Fn(&Observation) -> bool,
     retain: bool,
+    updated: &mut Vec<&'static str>,
 ) -> bool {
     let blocked = observations.iter().any(matcher);
     if retain {
-        store_observations(facts, observations);
+        store_observations(facts, observations, updated);
     }
     blocked
 }
@@ -626,6 +636,7 @@ impl<P> Inspect<P> {
         }
         let mut drop_packet = false;
         let mut replacement = None;
+        let mut updated = Vec::new();
         if !flow.allowed {
             let reverse = transport.source != flow.origin;
             for slot in &mut flow.analyzers {
@@ -636,17 +647,22 @@ impl<P> Inspect<P> {
                     UdpStreamAnalysis::Pending => {}
                     UdpStreamAnalysis::Observations(observations) => {
                         if !self.udp_rules.is_empty() {
-                            store_observations(&mut flow.facts, observations);
+                            store_observations(&mut flow.facts, observations, &mut updated);
                         }
                     }
                     UdpStreamAnalysis::FinalObservations(observations) => {
                         if !self.udp_rules.is_empty() {
-                            store_observations(&mut flow.facts, observations);
+                            store_observations(&mut flow.facts, observations, &mut updated);
                         }
                         *slot = None;
                     }
                     UdpStreamAnalysis::Finished => *slot = None,
                     UdpStreamAnalysis::Drop => drop_packet = true,
+                    UdpStreamAnalysis::ClearFields(fields) => {
+                        for field in fields {
+                            flow.facts.remove(field);
+                        }
+                    }
                 }
             }
             if !self.udp_rules.is_empty() {
@@ -660,6 +676,7 @@ impl<P> Inspect<P> {
                     reverse: transport.source != flow.origin,
                     payload: transport.payload,
                     facts: &flow.facts,
+                    updated: &updated,
                 };
                 if let Some(action) = self
                     .udp_rules
@@ -797,6 +814,7 @@ impl<P: Policy> Policy for Inspect<P> {
         if flow.blocked {
             return Verdict::DropFlow.into();
         }
+        let mut updated = Vec::new();
         if !flow.allowed {
             let d = &mut flow.directions[direction];
             if d.analyzers.iter().any(Option::is_some)
@@ -819,6 +837,7 @@ impl<P: Policy> Policy for Inspect<P> {
                                         observations,
                                         rule.matches.as_ref(),
                                         !self.flow_rules.is_empty(),
+                                        &mut updated,
                                     );
                                 }
                                 Analysis::FinalObservations(observations) => {
@@ -827,6 +846,7 @@ impl<P: Policy> Policy for Inspect<P> {
                                         observations,
                                         rule.matches.as_ref(),
                                         !self.flow_rules.is_empty(),
+                                        &mut updated,
                                     );
                                     *slot = None;
                                 }
@@ -849,6 +869,7 @@ impl<P: Policy> Policy for Inspect<P> {
                                         observations,
                                         rule.matches.as_ref(),
                                         !self.flow_rules.is_empty(),
+                                        &mut updated,
                                     );
                                 }
                                 Analysis::FinalObservations(observations) => {
@@ -857,6 +878,7 @@ impl<P: Policy> Policy for Inspect<P> {
                                         observations,
                                         rule.matches.as_ref(),
                                         !self.flow_rules.is_empty(),
+                                        &mut updated,
                                     );
                                     *slot = None;
                                 }
@@ -879,6 +901,7 @@ impl<P: Policy> Policy for Inspect<P> {
                 reverse: t.source != flow.origin,
                 payload: t.payload,
                 facts: &flow.facts,
+                updated: &updated,
             };
             for rule in &self.flow_rules {
                 let Some(action) = (rule.matches)(&context) else {
@@ -1069,6 +1092,59 @@ mod tests {
                 scope: FlowScope::default(),
             }),
             Decision::Verdict(Verdict::Accept)
+        );
+    }
+
+    #[test]
+    fn udp_field_update_is_scoped_to_the_current_datagram() {
+        struct Marker;
+        impl UdpStreamAnalyzer for Marker {
+            fn feed(&mut self, payload: &[u8], _: bool) -> UdpStreamAnalysis {
+                if payload == b"marked" {
+                    UdpStreamAnalysis::Observations(vec![Observation {
+                        field: "marker.value",
+                        value: "yes".into(),
+                    }])
+                } else if payload == b"clear" {
+                    UdpStreamAnalysis::ClearFields(vec!["marker.value"])
+                } else {
+                    UdpStreamAnalysis::Pending
+                }
+            }
+        }
+        let mut policy =
+            Inspect::with_analyzers(crate::ConstantPolicy(Verdict::Accept), Vec::new())
+                .with_udp_streams(
+                    vec![UdpStreamRule::new(None, || Box::new(Marker))],
+                    vec![
+                        FlowRule::new(|context| {
+                            (context.updated("marker.value")
+                                && context.get("marker.value") == Some("yes"))
+                            .then_some(FlowAction::DropPacket)
+                        }),
+                        FlowRule::new(|context| {
+                            (context.payload == b"hold"
+                                && context.get("marker.value") == Some("yes"))
+                            .then_some(FlowAction::DropPacket)
+                        }),
+                    ],
+                );
+        assert_eq!(
+            evaluate_udp(&mut policy, 0, b"marked", false),
+            Verdict::Drop
+        );
+        assert_eq!(
+            evaluate_udp(&mut policy, 0, b"later", false),
+            Verdict::Accept
+        );
+        assert_eq!(evaluate_udp(&mut policy, 0, b"hold", false), Verdict::Drop);
+        assert_eq!(
+            evaluate_udp(&mut policy, 0, b"clear", false),
+            Verdict::Accept
+        );
+        assert_eq!(
+            evaluate_udp(&mut policy, 0, b"hold", false),
+            Verdict::Accept
         );
     }
 
@@ -1330,6 +1406,49 @@ mod tests {
         assert_eq!(feed(1, 106, 16, b"beta"), Verdict::DropFlow);
         assert_eq!(feed(1, 1000, 2, b""), Verdict::Accept);
         assert_eq!(feed(1, 1001, 16, b"beta"), Verdict::Accept);
+    }
+    #[test]
+    fn expression_rules_combine_protocol_endpoint_and_analyzer_fields() {
+        use crate::conditions::{MatchRule, parse_expression};
+
+        let mut policy = Inspect::with_analyzers(
+            crate::ConstantPolicy(Verdict::Accept),
+            vec![AnalyzerRule::observing(Some(80), || Box::<HttpHost>::default())],
+        )
+        .with_flow_rules(vec![
+            MatchRule {
+                condition: parse_expression(
+                    r#"proto == tcp && src.ip in 10.0.0.0/8 && (http.host == "blocked.test" || tls.sni == "blocked.test")"#,
+                )
+                .unwrap(),
+                action: FlowAction::Block,
+            }
+            .into_flow_rule(),
+            MatchRule {
+                condition: parse_expression(r#"http.host == "allowed.test""#).unwrap(),
+                action: FlowAction::Allow,
+            }
+            .into_flow_rule(),
+        ]);
+        let mut feed = |scope, seq, flags, payload: &[u8]| {
+            let bytes = tcp(seq, flags, payload, false);
+            policy.evaluate(Packet {
+                bytes: &bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope(scope),
+            })
+        };
+        assert_eq!(feed(1, 100, 2, b""), Verdict::Accept);
+        assert_eq!(
+            feed(1, 101, 16, b"GET / HTTP/1.1\r\nHost: blocked.test\r\n\r\n"),
+            Verdict::DropFlow
+        );
+        assert_eq!(feed(2, 100, 2, b""), Verdict::Accept);
+        assert_eq!(
+            feed(2, 101, 16, b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n"),
+            Verdict::Accept
+        );
     }
 
     #[test]

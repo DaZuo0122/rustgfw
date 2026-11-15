@@ -123,6 +123,10 @@ impl FlowEvents {
         })
     }
 
+    pub(crate) fn raw_handle(&self) -> usize {
+        self.handle as usize
+    }
+
     /// Block until an established or deleted event arrives.
     pub fn receive_one(&mut self) -> io::Result<FlowEvent> {
         let mut address = Address::default();

@@ -251,7 +251,9 @@ fn run_nfqueue(_: &[String]) -> Result<(), Error> {
 
 #[cfg(target_os = "windows")]
 fn run_windivert(args: &[String]) -> Result<(), Error> {
-    use rustgfw_windows::{Layer, WinDivert, static_drop_filter, wfp::WfpPolicy};
+    use rustgfw_windows::{
+        Layer, WinDivert, dynamic::FlowBlocker, static_drop_filter, wfp::WfpPolicy,
+    };
 
     if args.len() < 3 {
         return Err(
@@ -279,7 +281,25 @@ fn run_windivert(args: &[String]) -> Result<(), Error> {
     } else {
         "true"
     };
+    let dynamic = if matches!(layer, Layer::Network)
+        && (!options.http_hosts.is_empty()
+            || !options.tls_sni.is_empty()
+            || !options.dns_names.is_empty())
+    {
+        match FlowBlocker::start(&args[0]) {
+            Ok(blocker) => Some(blocker),
+            Err(error) => {
+                eprintln!("WFP dynamic offload unavailable: {error}; using WinDivert policy");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut io = WinDivert::open(&args[0], layer, packet_filter)?;
+    if let Some(blocker) = &dynamic {
+        io.set_dynamic_offload(blocker.sender());
+    }
     if matches!(layer, Layer::Forward)
         && let Some(filter) = static_drop_filter(&options.rules)
     {

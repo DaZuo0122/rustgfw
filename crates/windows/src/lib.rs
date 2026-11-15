@@ -13,11 +13,13 @@ use std::{
     io,
     path::Path,
 };
+pub mod dynamic;
 pub mod flow;
 pub mod wfp;
 
 const PACKET_CAPACITY: usize = 40 + 65535; // WINDIVERT_MTU_MAX
 const FLAG_DROP: u64 = 0x0002;
+const FLAG_OUTBOUND: u32 = 1 << 17;
 
 /// A higher-priority WinDivert DROP handle can enforce these rules without
 /// sending the matching forwarded packets through the user-space loop.
@@ -92,6 +94,7 @@ pub struct WinDivert {
     send: Send,
     close: Close,
     packet: Vec<u8>,
+    dynamic: Option<std::sync::mpsc::Sender<dynamic::Command>>,
 }
 impl WinDivert {
     /// The DLL and matching signed driver must be deployed together.
@@ -133,7 +136,12 @@ impl WinDivert {
             send,
             close,
             packet: vec![0; PACKET_CAPACITY],
+            dynamic: None,
         })
+    }
+
+    pub fn set_dynamic_offload(&mut self, sender: std::sync::mpsc::Sender<dynamic::Command>) {
+        self.dynamic = Some(sender);
     }
 
     /// Apply a static filter at priority 1, before the packet handle at 0.
@@ -175,6 +183,25 @@ impl PacketIo for WinDivert {
             checksum_ready: false,
             scope: traffic_scope(self.layer, &address),
         });
+        if verdict == Verdict::DropFlow
+            && matches!(self.layer, Layer::Network)
+            && let Some(sender) = &self.dynamic
+            && let Ok(transport) = rustgfw_core::packet::parse(bytes)
+        {
+            let outbound = address.flags & FLAG_OUTBOUND != 0;
+            let (local, remote) = if outbound {
+                (transport.source, transport.destination)
+            } else {
+                (transport.destination, transport.source)
+            };
+            let interface_index = u32::from_ne_bytes(address.data[..4].try_into().unwrap());
+            let _ = sender.send(dynamic::Command::Block {
+                local,
+                remote,
+                protocol: transport.protocol,
+                interface_index,
+            });
+        }
         if verdict != Verdict::Accept {
             return Ok(());
         }
@@ -235,6 +262,7 @@ mod tests {
         sent: Vec<Vec<u8>>,
         sent_interfaces: Vec<(u32, u32)>,
         address_preserved: bool,
+        flags: u32,
     }
 
     unsafe extern "C" fn receive(
@@ -252,7 +280,7 @@ mod tests {
             assert!(next.len() <= capacity as usize);
             std::ptr::copy_nonoverlapping(next.as_ptr(), packet.cast::<u8>(), next.len());
             *length = next.len() as u32;
-            address.flags = 0x1234_5678;
+            address.flags = state.flags;
             let (interface, subinterface) = state.interfaces.pop_front().unwrap();
             address.data[..4].copy_from_slice(&interface.to_ne_bytes());
             address.data[4..8].copy_from_slice(&subinterface.to_ne_bytes());
@@ -272,7 +300,7 @@ mod tests {
         unsafe {
             let state = &mut *handle.cast::<FakeIo>();
             let address = &*address;
-            state.address_preserved &= address.flags == 0x1234_5678 && address.data[63] == 0xa5;
+            state.address_preserved &= address.flags == state.flags && address.data[63] == 0xa5;
             state.sent_interfaces.push((
                 u32::from_ne_bytes(address.data[..4].try_into().unwrap()),
                 u32::from_ne_bytes(address.data[4..8].try_into().unwrap()),
@@ -307,6 +335,7 @@ mod tests {
             sent: Vec::new(),
             sent_interfaces: Vec::new(),
             address_preserved: true,
+            flags: 0x1234_5678,
         });
         let io = WinDivert {
             // SAFETY: kernel32 stays loaded while the fake symbols are used.
@@ -319,6 +348,7 @@ mod tests {
             send,
             close,
             packet: vec![0; PACKET_CAPACITY],
+            dynamic: None,
         };
         (io, state)
     }
@@ -416,6 +446,50 @@ mod tests {
         assert_eq!(state.sent_interfaces, [(9, 0)]);
         assert!(state.address_preserved);
         drop(io);
+    }
+
+    #[test]
+    fn drop_flow_submits_local_packet_tuple_for_dynamic_offload() {
+        let packet = tcp_packet(12345, 443, b"data");
+        let (mut io, state) = fixture(vec![packet]);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        io.set_dynamic_offload(sender);
+        io.process_one(&mut ConstantPolicy(Verdict::DropFlow))
+            .unwrap();
+        match receiver.try_recv().unwrap() {
+            dynamic::Command::Block {
+                local,
+                remote,
+                protocol,
+                interface_index,
+            } => {
+                // The fake address describes an inbound packet.
+                assert_eq!(local, "198.51.100.2:443".parse().unwrap());
+                assert_eq!(remote, "192.0.2.1:12345".parse().unwrap());
+                assert_eq!(protocol, Protocol::Tcp);
+                assert_eq!(interface_index, 9);
+            }
+            _ => panic!("expected a WFP block request"),
+        }
+        assert!(state.sent.is_empty());
+    }
+
+    #[test]
+    fn outbound_drop_flow_uses_packet_source_as_local_endpoint() {
+        let packet = tcp_packet(12345, 443, b"data");
+        let (mut io, mut state) = fixture(vec![packet]);
+        state.flags |= FLAG_OUTBOUND;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        io.set_dynamic_offload(sender);
+        io.process_one(&mut ConstantPolicy(Verdict::DropFlow))
+            .unwrap();
+        match receiver.try_recv().unwrap() {
+            dynamic::Command::Block { local, remote, .. } => {
+                assert_eq!(local, "192.0.2.1:12345".parse().unwrap());
+                assert_eq!(remote, "198.51.100.2:443".parse().unwrap());
+            }
+            _ => panic!("expected a WFP block request"),
+        }
     }
 
     #[test]

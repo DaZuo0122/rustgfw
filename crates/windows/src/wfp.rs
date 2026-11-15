@@ -19,6 +19,7 @@ use windows_sys::{
     core::GUID,
 };
 
+#[derive(Clone, Copy, Debug)]
 pub struct LocalFlow {
     pub local: SocketAddr,
     pub remote: SocketAddr,
@@ -229,7 +230,7 @@ impl WfpPolicy {
 
 fn conditions(
     flow: &LocalFlow,
-    items: &mut [wfp::FWPM_FILTER_CONDITION0; 6],
+    items: &mut [wfp::FWPM_FILTER_CONDITION0; 7],
     ipv6: &mut [wfp::FWP_BYTE_ARRAY16; 2],
     interface_luid: &mut u64,
 ) -> io::Result<[GUID; 2]> {
@@ -293,6 +294,13 @@ fn conditions(
             items[5].conditionValue.Anonymous.uint64 = interface_luid;
         }
     }
+    // A dynamic DPI decision applies to an established ALE flow. Matching
+    // only reauthorization prevents a stale filter from blocking a new
+    // connection's initial authorization when a FLOW delete event is lost.
+    items[6].fieldKey = wfp::FWPM_CONDITION_FLAGS;
+    items[6].matchType = wfp::FWP_MATCH_FLAGS_ALL_SET;
+    items[6].conditionValue.r#type = wfp::FWP_UINT32;
+    items[6].conditionValue.Anonymous.uint32 = wfp::FWP_CONDITION_FLAG_IS_REAUTHORIZE;
     Ok(layers)
 }
 
@@ -301,7 +309,7 @@ impl KernelPolicy for WfpPolicy {
     type Handle = FlowBlock;
 
     fn install(&mut self, flow: &LocalFlow) -> io::Result<FlowBlock> {
-        let mut items = [wfp::FWPM_FILTER_CONDITION0::default(); 6];
+        let mut items = [wfp::FWPM_FILTER_CONDITION0::default(); 7];
         let mut ipv6 = [wfp::FWP_BYTE_ARRAY16::default(); 2];
         let mut interface_luid = 0;
         let layers = conditions(flow, &mut items, &mut ipv6, &mut interface_luid)?;
@@ -431,7 +439,7 @@ mod tests {
             protocol: Protocol::Tcp,
             scope: LocalScope::Compartment(7),
         };
-        let mut items = [wfp::FWPM_FILTER_CONDITION0::default(); 6];
+        let mut items = [wfp::FWPM_FILTER_CONDITION0::default(); 7];
         let mut ipv6 = [wfp::FWP_BYTE_ARRAY16::default(); 2];
         let mut interface_luid = 0;
         let layers = conditions(&flow, &mut items, &mut ipv6, &mut interface_luid).unwrap();
@@ -464,7 +472,7 @@ mod tests {
             protocol: Protocol::Tcp,
             scope: LocalScope::Compartment(9),
         };
-        let mut items = [wfp::FWPM_FILTER_CONDITION0::default(); 6];
+        let mut items = [wfp::FWPM_FILTER_CONDITION0::default(); 7];
         let mut ipv6 = [wfp::FWP_BYTE_ARRAY16::default(); 2];
         let mut interface_luid = 0;
         let layers = conditions(&flow, &mut items, &mut ipv6, &mut interface_luid).unwrap();
@@ -502,7 +510,7 @@ mod tests {
             protocol: Protocol::Tcp,
             scope: LocalScope::InterfaceLuid(0x1234_5678_9abc_def0),
         };
-        let mut items = [wfp::FWPM_FILTER_CONDITION0::default(); 6];
+        let mut items = [wfp::FWPM_FILTER_CONDITION0::default(); 7];
         let mut ipv6 = [wfp::FWP_BYTE_ARRAY16::default(); 2];
         let mut interface_luid = 0;
         conditions(&flow, &mut items, &mut ipv6, &mut interface_luid).unwrap();
@@ -514,6 +522,15 @@ mod tests {
         assert_eq!(interface_luid, 0x1234_5678_9abc_def0);
         unsafe {
             assert_eq!(*items[5].conditionValue.Anonymous.uint64, interface_luid);
+        }
+        assert!(same_guid(items[6].fieldKey, wfp::FWPM_CONDITION_FLAGS));
+        assert_eq!(items[6].matchType, wfp::FWP_MATCH_FLAGS_ALL_SET);
+        assert_eq!(items[6].conditionValue.r#type, wfp::FWP_UINT32);
+        unsafe {
+            assert_eq!(
+                items[6].conditionValue.Anonymous.uint32,
+                wfp::FWP_CONDITION_FLAG_IS_REAUTHORIZE
+            );
         }
     }
 }

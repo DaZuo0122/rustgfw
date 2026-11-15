@@ -2,9 +2,15 @@
 #![cfg(target_os = "linux")]
 use rustgfw_core::{FlowScope, Packet, PacketIo, Policy, Verdict};
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::{
     collections::{HashMap, HashSet},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError},
+    },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 pub mod conntrack;
@@ -38,8 +44,84 @@ fn untracked_scope(indev: u32, outdev: u32, mark: u32) -> FlowScope {
     )
 }
 
+struct PacketReader {
+    packets: Option<Receiver<io::Result<nfq::Message>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl PacketReader {
+    fn start(mut queue: nfq::Queue) -> io::Result<Self> {
+        let (sender, packets) = mpsc::sync_channel(4096);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread = thread::Builder::new()
+            .name("rustgfw-nfqueue-recv".into())
+            .spawn(move || {
+                while !thread_stop.load(Ordering::Relaxed) {
+                    match queue.recv() {
+                        Ok(packet) => {
+                            if sender.send(Ok(packet)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock
+                                    | io::ErrorKind::TimedOut
+                                    | io::ErrorKind::Interrupted
+                            ) => {}
+                        Err(error) => {
+                            let overflow = error.raw_os_error() == Some(libc::ENOBUFS);
+                            if sender.send(Err(error)).is_err() || !overflow {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })?;
+        Ok(Self {
+            packets: Some(packets),
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    fn recv(&self) -> io::Result<nfq::Message> {
+        match self
+            .packets
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_millis(200))
+        {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(io::ErrorKind::TimedOut.into()),
+            Err(RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "NFQUEUE receive thread stopped",
+            )),
+        }
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.packets.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for PacketReader {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 pub struct NfQueue {
     queue: nfq::Queue,
+    packet_reader: PacketReader,
     dynamic_table: Option<String>,
     mark_offload: Option<u32>,
     destroy_events: Option<conntrack::DestroyReceiver>,
@@ -91,8 +173,17 @@ impl NfQueue {
         if result != 0 {
             return Err(io::Error::last_os_error());
         }
+        // Both descriptors refer to the same netlink socket and port ID.
+        // The receive thread drains it while this handle sends verdicts.
+        let verdict_fd = unsafe { libc::dup(queue.as_raw_fd()) };
+        if verdict_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let verdict_queue = nfq::Queue::from(unsafe { OwnedFd::from_raw_fd(verdict_fd) });
+        let packet_reader = PacketReader::start(queue)?;
         Ok(Self {
-            queue,
+            queue: verdict_queue,
+            packet_reader,
             dynamic_table: None,
             mark_offload: None,
             destroy_events: None,
@@ -251,7 +342,7 @@ impl PacketIo for NfQueue {
             }
         }
         self.flush_pending_if_due()?;
-        let mut message = self.queue.recv()?;
+        let mut message = self.packet_reader.recv()?;
         let bytes = message.get_payload();
         let conntrack = message.get_conntrack();
         let has_conntrack = conntrack.is_some();

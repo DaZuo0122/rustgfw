@@ -84,10 +84,12 @@ impl NftPolicy {
         ))
     }
     /// Conntrack ID is a compact, almost-unique key for both directions.
+    /// Recreate the element in one nft batch: adding an existing element does
+    /// not refresh its timeout.
     pub fn block_tcp_flow(&self, table: &str, key: ConntrackKey) -> io::Result<()> {
         self.execute(&format!(
-            "add element inet {table} blocked_ct {{ {} . {} timeout 120s }}\n",
-            key.zone.id, key.id,
+            "destroy element inet {table} blocked_ct {{ {} . {} }}\nadd element inet {table} blocked_ct {{ {} . {} timeout 120s }}\n",
+            key.zone.id, key.id, key.zone.id, key.id,
         ))
     }
     pub fn unblock_tcp_flow(&self, table: &str, key: ConntrackKey) -> io::Result<()> {

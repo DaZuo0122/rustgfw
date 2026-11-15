@@ -16,6 +16,27 @@ pub enum Verdict {
     DropFlow,
 }
 
+/// An accepted replacement is a complete IP packet, including headers and
+/// checksums. The I/O backend submits it using its own reinjection semantics.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Decision {
+    Verdict(Verdict),
+    Replace(Vec<u8>),
+}
+impl Decision {
+    pub fn verdict(&self) -> Verdict {
+        match self {
+            Self::Verdict(verdict) => *verdict,
+            Self::Replace(_) => Verdict::Accept,
+        }
+    }
+}
+impl From<Verdict> for Decision {
+    fn from(verdict: Verdict) -> Self {
+        Self::Verdict(verdict)
+    }
+}
+
 /// Capture conditions matter: a truncated packet must not be parsed as complete.
 #[derive(Clone, Copy)]
 pub struct Packet<'a> {
@@ -31,6 +52,11 @@ pub struct FlowScope(pub u128);
 
 pub trait Policy {
     fn evaluate(&mut self, packet: Packet<'_>) -> Verdict;
+
+    /// Backends use this entry point so a policy can return a modified packet.
+    fn decide(&mut self, packet: Packet<'_>) -> Decision {
+        self.evaluate(packet).into()
+    }
 }
 
 /// A backend owns the pending kernel packet until its decision is submitted.

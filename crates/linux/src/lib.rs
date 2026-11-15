@@ -1,6 +1,6 @@
 //! Linux NFQUEUE adapter. Firewall ownership remains with the operator.
 #![cfg(target_os = "linux")]
-use rustgfw_core::{FlowScope, Packet, PacketIo, Policy, Verdict};
+use rustgfw_core::{Decision, FlowScope, Packet, PacketIo, Policy, Verdict};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::{
@@ -380,18 +380,19 @@ impl PacketIo for NfQueue {
             && conntrack_key.is_some_and(|key| self.blocked_ct.contains_key(&key))
             && !rst
             && !initial_syn;
-        let verdict = if cached_block {
-            Verdict::DropFlow
+        let decision = if cached_block {
+            Verdict::DropFlow.into()
         } else if bytes.is_empty() || bytes.len() < message.get_original_len() {
-            Verdict::Drop
+            Verdict::Drop.into()
         } else {
-            policy.evaluate(Packet {
+            policy.decide(Packet {
                 bytes,
                 original_len: message.get_original_len(),
                 checksum_ready: message.is_checksum_ready(),
                 scope,
             })
         };
+        let verdict = decision.verdict();
         let close_blocked = verdict == Verdict::DropFlow
             && rst
             && self.dynamic_table.is_some()
@@ -415,6 +416,9 @@ impl PacketIo for NfQueue {
             && self.mark_offload.is_some();
         if mark_block {
             message.set_nfmark(message.get_nfmark() | self.mark_offload.unwrap());
+        }
+        if let Decision::Replace(packet) = decision {
+            message.set_payload(packet);
         }
         message.set_verdict(
             if verdict == Verdict::Accept || close_blocked || mark_block {
@@ -451,6 +455,8 @@ impl PacketIo for NfQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use rustgfw_core::inspect::{FlowAction, FlowRule, Inspect};
 
     #[test]
     fn untracked_flow_scope_uses_path_and_packet_mark() {
@@ -497,6 +503,46 @@ mod tests {
             inflight: true,
         };
         assert!(!offload_due(Some(&inflight), now));
+    }
+
+    #[test]
+    #[ignore = "requires nft and NFQUEUE in an isolated network namespace"]
+    fn udp_replacement_is_delivered_through_nfqueue() -> io::Result<()> {
+        use rustgfw_core::{ConstantPolicy, KernelPolicy};
+        use std::net::UdpSocket;
+
+        let mut nft = nft::NftPolicy::new("/usr/sbin/nft");
+        let handle = nft.install(&nft::Plan {
+            hook: nft::Hook::Output,
+            queue: 101,
+            rules: vec![],
+            dynamic: nft::DynamicOffload::IdSet,
+            bypass_without_listener: false,
+        })?;
+        let result = (|| {
+            let mut queue = NfQueue::open(101)?;
+            let mut policy = Inspect::with_analyzers(ConstantPolicy(Verdict::Accept), Vec::new())
+                .with_udp_streams(
+                    Vec::new(),
+                    vec![FlowRule::new(|context| {
+                        (context.payload == b"old")
+                            .then(|| FlowAction::ReplaceUdpPayload(b"replacement".to_vec()))
+                    })],
+                );
+            for address in ["127.0.0.1:0", "[::1]:0"] {
+                let receiver = UdpSocket::bind(address)?;
+                receiver.set_read_timeout(Some(Duration::from_secs(2)))?;
+                let sender = UdpSocket::bind(address)?;
+                sender.send_to(b"old", receiver.local_addr()?)?;
+                queue.process_one(&mut policy)?;
+                let mut received = [0; 64];
+                let (length, _) = receiver.recv_from(&mut received)?;
+                assert_eq!(&received[..length], b"replacement");
+            }
+            Ok::<_, io::Error>(())
+        })();
+        nft.revoke(&handle)?;
+        result
     }
 
     #[test]

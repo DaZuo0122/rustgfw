@@ -13,6 +13,8 @@
 
 `Engine::replace_policy` 可在两次逐包处理之间替换整个用户态策略；新实例不会继承旧实例的流缓存。它没有自动修改内核规则。完整热更新需要先停止旧的异步卸载写入，再按后端语义切换内核静态规则并清理旧的动态裁决，最后替换用户态策略。Linux ID 集合可随 nft 表替换而清空；`ctmark=` 写在既存 conntrack 条目中，单个预留 bit 无法区分新旧规则版本，目前不能安全地沿用该位做无中断热更新。Windows WFP 和 WinDivert 的规则生命周期也需要单独编排。当前命令行没有热更新入口。
 
+`Policy::decide` 可返回完整 IP 包替换裁决；Linux NFQUEUE 将替换包与 ACCEPT verdict 一起提交，Windows WinDivert 使用捕获时的地址重新注入替换包。`FlowAction::ReplaceUdpPayload` 让 UDP 流规则基于当前载荷生成新载荷，核心重建 IP/UDP 长度及校验和；过长或无法解析的替换结果丢弃当前包。TCP 流规则忽略此动作。直接调用 `Policy::evaluate` 只得到放行或丢弃结果，包修改需要通过 `decide`/`PacketIo` 路径。当前命令行尚未提供修改规则的配置语法，可通过库 API 注册。
+
 Linux NFQUEUE 的 accept 表示恢复 netfilter 遍历，并不绕过其他链；Windows WinDivert 放行需要重新注入捕获的包，WFP 过滤规则的优先级与终止行为也不能映射成 Linux mark。用户提到的 wpf 在这里按 Windows Filtering Platform（WFP）理解。Windows 后端的当前边界见 [windows-backend.md](windows-backend.md)。
 
 ## 当前 Linux 路径
@@ -29,7 +31,7 @@ TLS：`rustgfw nfqueue 100 accept tls-sni=blocked.test` 检查明文 ClientHello
 
 HTTP/TLS/DNS TCP 通过 `AnalyzerRule` 注册，共享流表及每方向 TCP 重组。UDP DNS 通过 `DatagramRule` 注册，逐个数据报分析，不占用 TCP 流表；数据报规则可限制源端口、目的端口或任一端口，畸形结果可要求丢弃该包。两类分析器都报告带字段名的观察值，由规则回调匹配；新增同类分析器无需修改引擎中的协议匹配分支。TCP 观察结果区分完成与可继续分析，HTTP/TLS 报告后释放分析器，DNS TCP 可在同一流中报告后续查询。带端口限制的 TCP 分析器只为匹配端口的连接建立检查状态，其他 TCP 连接不占用检查流表。任一分析器匹配即阻断，其他分析器不能撤销这一决定。相同初始 SYN 重传保持状态，新的初始序号触发端点复用重建；这是被动流识别，不是内核 TCP 状态机的等价实现。
 
-核心还支持 `AnalyzerRule::observing` 与 `FlowRule`：分析器只产出观察值，流级回调通过 `FlowContext` 读取同一双向 TCP 流的多个字段并组合判断，也可直接根据端点与作用域判断。`BidirectionalAnalyzerRule` 为整条 TCP 流创建一个分析器实例，两方向共用内部状态，但输入仍分别经过 TCP 重组；原有 `AnalyzerRule` 继续按方向创建实例。`FlowContext` 同时提供当前包的 `source`/`destination` 和建流时固定的 `origin`/`target`，`reverse` 标示当前包相对建流方向是否反向。规则按注册顺序取第一个命中的 `Allow` 或 `Block`；`Allow` 结束该流的应用层检查，传输层规则仍逐包执行。`UdpStreamRule` 为双向 UDP 流创建独立分析器实例，保留跨数据报观察值并复用流级规则；`DropPacket` 只丢当前 UDP 数据报，对 TCP 则阻断整条流。原有 `DatagramRule` 继续按单个数据报执行，当前命令行的 UDP DNS 使用这一路径。每个字段保留最近一次观察批次的所有值；TCP 的新初始 SYN、空闲过期或显式清空会丢弃相关属性。平台后端提供的 `FlowScope` 参与流键，防止不同流量域复用属性。Linux 的动态内核卸载只处理 TCP `DropFlow`，UDP 阻断留在用户态逐包执行。
+核心还支持 `AnalyzerRule::observing` 与 `FlowRule`：分析器只产出观察值，流级回调通过 `FlowContext` 读取同一双向 TCP 流的多个字段并组合判断，也可直接根据端点与作用域判断。`BidirectionalAnalyzerRule` 为整条 TCP 流创建一个分析器实例，两方向共用内部状态，但输入仍分别经过 TCP 重组；原有 `AnalyzerRule` 继续按方向创建实例。`FlowContext` 同时提供当前包的 `source`/`destination`、载荷 `payload` 和建流时固定的 `origin`/`target`，`reverse` 标示当前包相对建流方向是否反向。规则按注册顺序取第一个命中的 `Allow` 或 `Block`；`Allow` 结束该流的应用层检查，传输层规则仍逐包执行。`UdpStreamRule` 为双向 UDP 流创建独立分析器实例，保留跨数据报观察值并复用流级规则；`DropPacket` 只丢当前 UDP 数据报，对 TCP 则阻断整条流。原有 `DatagramRule` 继续按单个数据报执行，当前命令行的 UDP DNS 使用这一路径。每个字段保留最近一次观察批次的所有值；TCP 的新初始 SYN、空闲过期或显式清空会丢弃相关属性。平台后端提供的 `FlowScope` 参与流键，防止不同流量域复用属性。Linux 的动态内核卸载只处理 TCP `DropFlow`，UDP 阻断留在用户态逐包执行。
 
 TCP 重组模块 `core::tcp` 已接入 `core::inspect` 的双向分析路径，支持连续字节交付、乱序缓存、重复数据裁剪和序号回绕。缓冲区冲突重叠会阻断流；已交付字节不保留副本。
 

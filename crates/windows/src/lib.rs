@@ -3,7 +3,7 @@
 
 use libloading::Library;
 use rustgfw_core::{
-    FlowScope, Packet, PacketIo, Policy, Verdict,
+    Decision, FlowScope, Packet, PacketIo, Policy, Verdict,
     offload::{self, Action},
     packet::Protocol,
     rules::Rule,
@@ -177,12 +177,13 @@ impl PacketIo for WinDivert {
             return Err(io::Error::last_os_error());
         }
         let bytes = &self.packet[..length as usize];
-        let verdict = policy.evaluate(Packet {
+        let decision = policy.decide(Packet {
             bytes,
             original_len: bytes.len(),
             checksum_ready: false,
             scope: traffic_scope(self.layer, &address),
         });
+        let verdict = decision.verdict();
         if verdict == Verdict::DropFlow
             && matches!(self.layer, Layer::Network)
             && let Some(sender) = &self.dynamic
@@ -205,14 +206,20 @@ impl PacketIo for WinDivert {
         if verdict != Verdict::Accept {
             return Ok(());
         }
+        let replacement = match decision {
+            Decision::Replace(packet) => Some(packet),
+            Decision::Verdict(_) => None,
+        };
+        let send_bytes = replacement.as_deref().unwrap_or(bytes);
+        let send_length = u32::try_from(send_bytes.len()).map_err(io::Error::other)?;
         let mut sent = 0u32;
-        // SAFETY: the captured packet and address remain unchanged and live
-        // through Send; WinDivert uses the address to preserve direction.
+        // SAFETY: the selected packet and captured address remain live through
+        // Send; WinDivert uses the address to preserve direction.
         let result = unsafe {
             (self.send)(
                 self.handle,
-                bytes.as_ptr().cast(),
-                length,
+                send_bytes.as_ptr().cast(),
+                send_length,
                 &mut sent,
                 &address,
             )
@@ -220,7 +227,7 @@ impl PacketIo for WinDivert {
         if result == 0 {
             return Err(io::Error::last_os_error());
         }
-        if sent != length {
+        if sent != send_length {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
                 "WinDivertSend reinjected only part of the packet",
@@ -422,6 +429,26 @@ mod tests {
         io.process_one(&mut ConstantPolicy(Verdict::Drop)).unwrap();
         assert_eq!(state.sent, [packet]);
         assert_eq!(state.sent_interfaces, [(9, 0)]);
+        assert!(state.address_preserved);
+        drop(io);
+    }
+
+    #[test]
+    fn reinjects_replacement_packet_with_captured_address() {
+        struct Replace(Vec<u8>);
+        impl Policy for Replace {
+            fn evaluate(&mut self, _: Packet<'_>) -> Verdict {
+                Verdict::Accept
+            }
+
+            fn decide(&mut self, _: Packet<'_>) -> Decision {
+                Decision::Replace(self.0.clone())
+            }
+        }
+        let (mut io, state) = fixture(vec![vec![0x45, 1, 2, 3]]);
+        io.process_one(&mut Replace(vec![0x45, 5, 6, 7, 8]))
+            .unwrap();
+        assert_eq!(state.sent, [vec![0x45, 5, 6, 7, 8]]);
         assert!(state.address_preserved);
         drop(io);
     }

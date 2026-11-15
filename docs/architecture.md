@@ -21,9 +21,9 @@ Linux NFQUEUE 的 accept 表示恢复 netfilter 遍历，并不绕过其他链�
 
 ## 协议与当前限制
 
-DNS：`rustgfw nfqueue 100 accept dns-name=blocked.test` 匹配标准查询的 IN 类问题，域名大小写不敏感且配置可带尾点。UDP 目的端口 53 按数据报分析，不缓存域名裁决，因此同一 socket 的后续允许查询不受先前阻断影响。TCP 任一端口 53 启用长度前缀解析，支持连续消息、TCP 分段和压缩域名；命中后阻断整个 TCP 流。UDP 畸形查询丢弃，TCP 畸形消息当前结束分析并沿用传输层结果。尚不支持 DNS 修改、DoH/DoT、非 53 端口 DNS 自动识别。
+DNS：`rustgfw nfqueue 100 accept dns-name=blocked.test` 匹配标准查询的 IN 类问题，域名大小写不敏感且配置可带尾点。UDP 目的端口 53 按数据报分析，不缓存域名裁决，因此同一 socket 的后续允许查询不受先前阻断影响。TCP 任一端口 53 启用长度前缀解析，支持连续消息、TCP 分段和压缩域名；命中后阻断整个 TCP 流。UDP 畸形查询丢弃，TCP 畸形消息或超出 `dns-message-bytes` 的消息结束分析并沿用传输层结果。尚不支持 DNS 修改、DoH/DoT、非 53 端口 DNS 自动识别。
 
-TLS：`rustgfw nfqueue 100 accept tls-sni=blocked.test` 检查明文 ClientHello SNI，支持 TCP 分段和 TLS handshake record 分段。可同时指定 `http-host=`。SNI 精确匹配且忽略 ASCII 大小写；不解密 ECH 内层域名，不涵盖 QUIC。ClientHello 正文预算 64 KiB；超预算、无 SNI 或无法识别时结束该分析器并沿用传输层裁决。
+TLS：`rustgfw nfqueue 100 accept tls-sni=blocked.test` 检查明文 ClientHello SNI，支持 TCP 分段和 TLS handshake record 分段。可同时指定 `http-host=`。SNI 精确匹配且忽略 ASCII 大小写；不解密 ECH 内层域名，不涵盖 QUIC。ClientHello 声明的正文长度上限 64 KiB，暂存字节预算由 `tls-buffer-bytes` 控制；超预算、无 SNI 或无法识别时结束该分析器并沿用传输层裁决。
 
 HTTP/TLS/DNS TCP 通过 `AnalyzerRule` 注册，共享流表及每方向 TCP 重组。UDP DNS 通过 `DatagramRule` 注册，逐个数据报分析，不占用 TCP 流表；数据报规则可限制源端口、目的端口或任一端口，畸形结果可要求丢弃该包。两类分析器都报告带字段名的观察值，由规则回调匹配；新增同类分析器无需修改引擎中的协议匹配分支。TCP 观察结果区分完成与可继续分析，HTTP/TLS 报告后释放分析器，DNS TCP 可在同一流中报告后续查询。带端口限制的 TCP 分析器只为匹配端口的连接建立检查状态，其他 TCP 连接不占用检查流表。任一分析器匹配即阻断，其他分析器不能撤销这一决定。相同初始 SYN 重传保持状态，新的初始序号触发端点复用重建；这是被动流识别，不是内核 TCP 状态机的等价实现。
 
@@ -31,7 +31,7 @@ TCP 重组模块 `core::tcp` 已接入 `core::inspect` 的双向分析路径，�
 
 `rustgfw nfqueue 100 accept http-host=blocked.test` 检查首个 HTTP/1 请求的所有 Host 头、绝对 URI 的 authority，以及 CONNECT 目标（大小写不敏感，含端口时需完整匹配）。任一值命中即阻断；无关头里的非 UTF-8 字节不妨碍 Host 识别。传输层规则先执行，Host 规则进一步阻断。识别前的包会放行；跨包分析不是代理式整请求缓冲。每方向乱序缓存及 HTTP 头默认各限 16 KiB，检查流表默认最多 4096 条，空闲 120 秒过期。双向 FIN 或未阻断流的 RST 会释放检查状态；单向 FIN 保留反向分析。容量满时先回收已完成且未阻断的检查状态；如果该长连接之后继续发包，可能再次进入首请求分析。超长或无法识别的 HTTP 头结束该分析器并沿用传输层结果；减小头预算可能让更长的阻断目标头无法被识别。不支持 keep-alive 多请求检查和 HTTP/2。
 
-共享资源预算可由 `inspect-flows=N`、`transport-flows=N`、`flow-idle-seconds=N`、`reorder-bytes=N`、`http-header-bytes=N` 设置，Linux 和 Windows 命令使用同一组参数。例如 `rustgfw nfqueue 100 accept nft=forward inspect-flows=8192 transport-flows=131072 flow-idle-seconds=300 reorder-bytes=32768 http-header-bytes=32768 http-host=blocked.test`。`flow-idle-seconds` 同时作用于检查流表和传输层规则缓存；乱序预算按每方向计算。TLS ClientHello 与 DNS 消息预算仍由分析器固定。
+资源预算可由 `inspect-flows=N`、`transport-flows=N`、`flow-idle-seconds=N`、`reorder-bytes=N`、`http-header-bytes=N`、`tls-buffer-bytes=N`、`dns-message-bytes=N` 设置，Linux 和 Windows 命令使用同一组参数。例如 `rustgfw nfqueue 100 accept nft=forward inspect-flows=8192 transport-flows=131072 flow-idle-seconds=300 reorder-bytes=32768 http-header-bytes=32768 tls-buffer-bytes=131072 dns-message-bytes=65535 http-host=blocked.test`。`flow-idle-seconds` 同时作用于检查流表和传输层规则缓存；乱序预算按每方向计算。TLS 暂存预算默认 128 KiB，DNS TCP 单消息预算默认 65535 字节，UDP DNS 不受该预算影响。预算过低会使较大的匹配目标无法识别，此时使用传输层裁决。
 
 2026-11-13/14 验证：Windows 与 Debian workspace 单元测试及 Clippy `-D warnings` 通过。Debian 使用隔离网络命名空间验证 nftables → NFQUEUE → 引擎路径的 UDP、跨包 HTTP、TLS SNI、DNS、动态 TCP 阻断、RST 撤销及 conntrack 销毁事件。双 veth 转发拓扑中 IPv4/IPv6 UDP 的放行和内核丢弃、分段 HTTP Host 的放行和阻断均通过；UDP nft 计数器分别记录 2 个入队包和 2 个内核丢弃包。两种 IP 版本各连续发送 300 个有序 UDP 包，全部到达。额外通过 prerouting `notrack` 验证无 conntrack ID 的 IPv4/IPv6 HTTP 流仍在用户态阻断，且未写入 `blocked_ct`。20,000 包突发触发 NFQUEUE `ENOBUFS`，修复后进程保持运行且后续包正常交付；这不证明突发中的 UDP 包无损。故障注入移除动态集合但保留队列规则后，`nft` 卸载写入失败仍由用户态阻断且进程保持运行。单条转发 UDP 流以约 1,750 包/秒持续 34 秒，60,000 包全部按序到达，之后 HTTP Host 阻断仍生效；尚未覆盖多流长期高负载及 conntrack 事件流溢出。未使用 sudo，未改主机防火墙。测试辅助脚本放本地忽略目录 `target/`，不提交。
 
@@ -54,7 +54,7 @@ IPv6 扩展头会跳过；原子分片可解析，其他 IP 分片暂时丢弃�
 
 1. Linux 长时间压力与故障测试：裁决错误、真实 conntrack 事件丢失和 ID 复用；量化队列拥塞时的丢包率，并验证卸载故障后的恢复。
 2. 方向性 zone 的卸载碰撞风险、同接口同 mark 的无 conntrack 多 zone 流隔离、规则版本与配置热更新；解析 IPv4 非首片及更复杂的 IPv6 扩展头组合。
-3. TLS/DNS 等分析器的内存和时间预算配置、HTTP keep-alive 多请求检查，以及未识别协议的处理策略。
+3. TLS/DNS 等分析器的累计输入和时间预算、HTTP keep-alive 多请求检查，以及未识别协议的处理策略。
 4. 验证 Windows WFP 静态规则和真实 WinDivert 收发；再设计精确流阻断的生命周期与转发流量卸载。
 
 参照本地 `references/opengfw` 的 io、engine、ruleset 和 analyzer 接口，以及 `references/gfw-rs` 的 NFQUEUE 尝试。未修改或复制参考项目代码。API 核对：[nfq Queue](https://docs.rs/nfq/0.2.6/nfq/struct.Queue.html)、[nfq Message](https://docs.rs/nfq/0.2.6/nfq/struct.Message.html)。

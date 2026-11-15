@@ -107,9 +107,22 @@ impl DatagramAnalyzer for DnsDatagram {
     }
 }
 
-#[derive(Default)]
 pub struct DnsTcp {
     pending: Vec<u8>,
+    message_limit: usize,
+}
+impl Default for DnsTcp {
+    fn default() -> Self {
+        Self::with_message_limit(65535)
+    }
+}
+impl DnsTcp {
+    pub fn with_message_limit(message_limit: usize) -> Self {
+        Self {
+            pending: Vec::new(),
+            message_limit,
+        }
+    }
 }
 impl StreamAnalyzer for DnsTcp {
     fn feed(&mut self, bytes: &[u8]) -> Analysis {
@@ -118,6 +131,9 @@ impl StreamAnalyzer for DnsTcp {
         let mut consumed = 0;
         while self.pending.len() - consumed >= 2 {
             let len = usize::from(word(&self.pending, consumed).unwrap());
+            if len > self.message_limit {
+                return Analysis::Finished;
+            }
             if self.pending.len() - consumed < len + 2 {
                 break;
             }
@@ -175,6 +191,19 @@ mod tests {
             }
         }
         assert_eq!(names, ["example.com", "example.com"]);
+    }
+    #[test]
+    fn configured_message_limit_rejects_declared_length() {
+        let q = query();
+        let mut wire = (q.len() as u16).to_be_bytes().to_vec();
+        wire.extend(q);
+        let mut limited = DnsTcp::with_message_limit(wire.len() - 3);
+        assert_eq!(limited.feed(&wire[..1]), Analysis::Pending);
+        assert_eq!(limited.feed(&wire[1..2]), Analysis::Finished);
+        assert!(matches!(
+            DnsTcp::with_message_limit(wire.len() - 2).feed(&wire),
+            Analysis::Observations(_)
+        ));
     }
     #[test]
     fn udp_does_not_cache_query_verdict() {

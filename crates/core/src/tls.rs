@@ -1,18 +1,33 @@
 //! Plaintext TLS ClientHello inspection; ECH inner names are not visible.
 use crate::inspect::{Analysis, Observation, StreamAnalyzer};
 
-#[derive(Default)]
 pub struct TlsSni {
     records: Vec<u8>,
     handshake: Vec<u8>,
     finished: bool,
+    buffer_limit: usize,
+}
+impl Default for TlsSni {
+    fn default() -> Self {
+        Self::with_buffer_limit(131072)
+    }
+}
+impl TlsSni {
+    pub fn with_buffer_limit(buffer_limit: usize) -> Self {
+        Self {
+            records: Vec::new(),
+            handshake: Vec::new(),
+            finished: false,
+            buffer_limit,
+        }
+    }
 }
 impl StreamAnalyzer for TlsSni {
     fn feed(&mut self, bytes: &[u8]) -> Analysis {
         if self.finished {
             return Analysis::Finished;
         }
-        if self.records.len() + self.handshake.len() + bytes.len() > 131072 {
+        if self.records.len() + self.handshake.len() + bytes.len() > self.buffer_limit {
             self.finished = true;
             return Analysis::Finished;
         }
@@ -188,5 +203,17 @@ mod tests {
         h[38] = 255;
         assert_eq!(TlsSni::default().feed(&record(&h)), Analysis::Finished);
         assert_eq!(TlsSni::default().feed(b"GET /"), Analysis::Finished);
+    }
+    #[test]
+    fn configured_buffer_limit_ends_large_client_hello() {
+        let wire = record(&hello());
+        assert_eq!(
+            TlsSni::with_buffer_limit(32).feed(&wire),
+            Analysis::Finished
+        );
+        assert!(matches!(
+            TlsSni::with_buffer_limit(wire.len()).feed(&wire),
+            Analysis::FinalObservations(_)
+        ));
     }
 }

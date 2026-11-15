@@ -12,7 +12,7 @@ fn main() -> Result<(), Error> {
     match args.first().map(String::as_str) {
         Some("nfqueue") => run_nfqueue(&args[1..]),
         Some("windivert") => run_windivert(&args[1..]),
-        _ => Err("usage: rustgfw nfqueue <queue> <accept|drop> [rules...] [nft=input|output|forward] [ctmark=0x80000000] | rustgfw windivert <dll> <network|forward> <accept|drop> [rules...]; shared options: inspect-flows=N transport-flows=N flow-idle-seconds=N reorder-bytes=N http-header-bytes=N".into()),
+        _ => Err("usage: rustgfw nfqueue <queue> <accept|drop> [rules...] [nft=input|output|forward] [ctmark=0x80000000] | rustgfw windivert <dll> <network|forward> <accept|drop> [rules...]; shared options: inspect-flows=N transport-flows=N flow-idle-seconds=N reorder-bytes=N http-header-bytes=N tls-buffer-bytes=N dns-message-bytes=N".into()),
     }
 }
 
@@ -27,6 +27,8 @@ struct Options {
     inspect_limits: InspectLimits,
     rules_limits: RulesLimits,
     http_header_bytes: usize,
+    tls_buffer_bytes: usize,
+    dns_message_bytes: usize,
 }
 impl Options {
     fn parse(default: &str, args: &[String]) -> Result<Self, Error> {
@@ -46,6 +48,8 @@ impl Options {
             inspect_limits: InspectLimits::default(),
             rules_limits: RulesLimits::default(),
             http_header_bytes: 16384,
+            tls_buffer_bytes: 131072,
+            dns_message_bytes: 65535,
         };
         for arg in args {
             if let Some(host) = arg.strip_prefix("http-host=") {
@@ -87,6 +91,16 @@ impl Options {
                 if options.http_header_bytes == 0 {
                     return Err("http-header-bytes must be positive".into());
                 }
+            } else if let Some(value) = arg.strip_prefix("tls-buffer-bytes=") {
+                options.tls_buffer_bytes = value.parse()?;
+                if options.tls_buffer_bytes == 0 {
+                    return Err("tls-buffer-bytes must be positive".into());
+                }
+            } else if let Some(value) = arg.strip_prefix("dns-message-bytes=") {
+                options.dns_message_bytes = value.parse()?;
+                if options.dns_message_bytes == 0 {
+                    return Err("dns-message-bytes must be positive".into());
+                }
             } else {
                 options.rules.push(parse_rule(arg)?);
             }
@@ -97,6 +111,8 @@ impl Options {
     fn into_policy(self) -> impl rustgfw_core::Policy {
         use rustgfw_core::{dns::DnsDatagram, inspect::Inspect, rules::Rules};
         let http_header_bytes = self.http_header_bytes;
+        let tls_buffer_bytes = self.tls_buffer_bytes;
+        let dns_message_bytes = self.dns_message_bytes;
         let dns_names = self.dns_names;
         let analyzers = [
             AnalyzerRule::exact("http.host", self.http_hosts, None, move || {
@@ -104,11 +120,15 @@ impl Options {
                     http_header_bytes,
                 ))
             }),
-            AnalyzerRule::exact("tls.sni", self.tls_sni, None, || {
-                Box::<rustgfw_core::tls::TlsSni>::default()
+            AnalyzerRule::exact("tls.sni", self.tls_sni, None, move || {
+                Box::new(rustgfw_core::tls::TlsSni::with_buffer_limit(
+                    tls_buffer_bytes,
+                ))
             }),
-            AnalyzerRule::exact("dns.qname", dns_names.clone(), Some(53), || {
-                Box::<rustgfw_core::dns::DnsTcp>::default()
+            AnalyzerRule::exact("dns.qname", dns_names.clone(), Some(53), move || {
+                Box::new(rustgfw_core::dns::DnsTcp::with_message_limit(
+                    dns_message_bytes,
+                ))
             }),
         ]
         .into_iter()
@@ -370,5 +390,39 @@ mod tests {
             assert_eq!(policy.evaluate(packet), expected);
         }
         assert!(Options::parse("accept", &["flow-idle-seconds=0".into()]).is_err());
+    }
+    #[test]
+    fn cli_dns_message_budget_reaches_tcp_analyzer() {
+        let mut query = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        query.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+        let mut bytes = vec![0; 42 + query.len()];
+        let length = bytes.len() as u16;
+        bytes[0] = 0x45;
+        bytes[2..4].copy_from_slice(&length.to_be_bytes());
+        bytes[9] = 6;
+        bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+        bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        bytes[22..24].copy_from_slice(&53u16.to_be_bytes());
+        bytes[32] = 0x50;
+        bytes[33] = 0x18;
+        bytes[40..42].copy_from_slice(&(query.len() as u16).to_be_bytes());
+        bytes[42..].copy_from_slice(&query);
+        let packet = Packet {
+            bytes: &bytes,
+            original_len: bytes.len(),
+            checksum_ready: true,
+            scope: FlowScope::default(),
+        };
+        for (limit, expected) in [(16, Verdict::Accept), (64, Verdict::DropFlow)] {
+            let args = [
+                "dns-name=example.com".to_owned(),
+                format!("dns-message-bytes={limit}"),
+            ];
+            let mut policy = Options::parse("accept", &args).unwrap().into_policy();
+            assert_eq!(policy.evaluate(packet), expected);
+        }
+        assert!(Options::parse("accept", &["tls-buffer-bytes=0".into()]).is_err());
+        assert!(Options::parse("accept", &["dns-message-bytes=0".into()]).is_err());
     }
 }

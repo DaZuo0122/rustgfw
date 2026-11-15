@@ -87,16 +87,38 @@ impl NftPolicy {
     /// Recreate the element in one nft batch: adding an existing element does
     /// not refresh its timeout.
     pub fn block_tcp_flow(&self, table: &str, key: ConntrackKey) -> io::Result<()> {
-        self.execute(&format!(
-            "destroy element inet {table} blocked_ct {{ {} . {} }}\nadd element inet {table} blocked_ct {{ {} . {} timeout 120s }}\n",
-            key.zone.id, key.id, key.zone.id, key.id,
-        ))
+        self.block_tcp_flows(table, &[key])
     }
     pub fn unblock_tcp_flow(&self, table: &str, key: ConntrackKey) -> io::Result<()> {
-        self.execute(&format!(
-            "destroy element inet {table} blocked_ct {{ {} . {} }}\n",
-            key.zone.id, key.id,
-        ))
+        self.unblock_tcp_flows(table, &[key])
+    }
+    pub fn block_tcp_flows(&self, table: &str, keys: &[ConntrackKey]) -> io::Result<()> {
+        let mut script = String::new();
+        for key in keys {
+            script.push_str(&format!(
+                "destroy element inet {table} blocked_ct {{ {} . {} }}\nadd element inet {table} blocked_ct {{ {} . {} timeout 120s }}\n",
+                key.zone.id, key.id, key.zone.id, key.id,
+            ));
+        }
+        if script.is_empty() {
+            Ok(())
+        } else {
+            self.execute(&script)
+        }
+    }
+    pub fn unblock_tcp_flows(&self, table: &str, keys: &[ConntrackKey]) -> io::Result<()> {
+        let mut script = String::new();
+        for key in keys {
+            script.push_str(&format!(
+                "destroy element inet {table} blocked_ct {{ {} . {} }}\n",
+                key.zone.id, key.id,
+            ));
+        }
+        if script.is_empty() {
+            Ok(())
+        } else {
+            self.execute(&script)
+        }
     }
     pub fn flush_blocked_flows(&self, table: &str) -> io::Result<()> {
         self.execute(&format!("flush set inet {table} blocked_ct\n"))
@@ -129,13 +151,13 @@ fn render(table: &str, plan: &Plan) -> String {
     match plan.dynamic {
         DynamicOffload::IdSet => {
             out.push_str(&format!(
-                "add set inet {table} blocked_ct {{ typeof ct zone . ct id; flags timeout; }}\n"
+                "add set inet {table} blocked_ct {{ typeof ct zone . ct id; flags dynamic,timeout; timeout 120s; }}\n"
             ));
             out.push_str(&format!(
                 "add rule inet {table} inspect ct event set destroy\n"
             ));
             out.push_str(&format!(
-                "add rule inet {table} inspect meta l4proto tcp ct zone . ct id @blocked_ct tcp flags & rst == rst counter queue num {}\n", plan.queue
+                "add rule inet {table} inspect meta l4proto tcp ct zone . ct id @blocked_ct tcp flags & rst == rst delete @blocked_ct {{ ct zone . ct id }} counter accept\n"
             ));
             out.push_str(&format!(
                 "add rule inet {table} inspect meta l4proto tcp ct zone . ct id @blocked_ct counter drop\n"
@@ -223,6 +245,7 @@ mod tests {
         assert!(text.find("udp dport 53").unwrap() < text.rfind("queue num 12").unwrap());
         assert!(!text.contains("bypass"));
         assert!(text.starts_with("create table inet test\n"));
+        assert!(text.contains("tcp flags & rst == rst delete @blocked_ct { ct zone . ct id }"));
     }
     #[test]
     fn conntrack_mark_is_set_after_queue_verdict() {

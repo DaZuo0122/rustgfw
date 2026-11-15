@@ -4,20 +4,23 @@ use rustgfw_core::{FlowScope, Packet, PacketIo, Policy, Verdict};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 pub mod conntrack;
 pub mod nft;
+mod offload_worker;
 
 struct BlockedFlow {
     installed: Option<Instant>,
     retry_after: Instant,
+    inflight: bool,
 }
 
 fn offload_due(block: Option<&BlockedFlow>, now: Instant) -> bool {
     block.is_none_or(|block| {
         now >= block.retry_after
+            && !block.inflight
             && block
                 .installed
                 .is_none_or(|at| now.duration_since(at) >= Duration::from_secs(115))
@@ -40,8 +43,12 @@ pub struct NfQueue {
     dynamic_table: Option<String>,
     mark_offload: Option<u32>,
     destroy_events: Option<conntrack::DestroyEvents>,
+    offload_worker: Option<offload_worker::Worker>,
     blocked_ct: HashMap<conntrack::ConntrackKey, BlockedFlow>,
     closing_ct: HashMap<conntrack::ConntrackKey, Instant>,
+    pending_blocks: HashSet<conntrack::ConntrackKey>,
+    pending_unblocks: HashSet<conntrack::ConntrackKey>,
+    pending_since: Option<Instant>,
 }
 impl NfQueue {
     pub fn open(number: u16) -> io::Result<Self> {
@@ -73,43 +80,125 @@ impl NfQueue {
             dynamic_table: None,
             mark_offload: None,
             destroy_events: None,
+            offload_worker: None,
             blocked_ct: HashMap::new(),
             closing_ct: HashMap::new(),
+            pending_blocks: HashSet::new(),
+            pending_unblocks: HashSet::new(),
+            pending_since: None,
         })
     }
     pub fn set_dynamic_table(&mut self, table: &str) -> io::Result<()> {
-        self.destroy_events = Some(conntrack::DestroyEvents::open()?);
+        let events = conntrack::DestroyEvents::open()?;
+        let worker = offload_worker::Worker::start(table.to_owned())?;
+        self.destroy_events = Some(events);
+        self.offload_worker = Some(worker);
         self.dynamic_table = Some(table.to_owned());
         Ok(())
     }
     pub fn set_mark_offload(&mut self, mask: u32) {
         self.mark_offload = Some(mask);
     }
+    pub fn stop_offload(&mut self) -> io::Result<()> {
+        if let Some(worker) = self.offload_worker.take() {
+            worker.stop()?;
+        }
+        Ok(())
+    }
+    fn drain_offload_results(&mut self) -> io::Result<()> {
+        let Some(worker) = &self.offload_worker else {
+            return Ok(());
+        };
+        while let Some(completion) = worker.try_completion()? {
+            match completion {
+                offload_worker::Completion::Block(keys, result) => {
+                    let now = Instant::now();
+                    for key in keys {
+                        if let Some(block) = self.blocked_ct.get_mut(&key) {
+                            block.inflight = false;
+                            if result.is_ok() {
+                                block.installed = Some(now);
+                                block.retry_after = now;
+                            } else {
+                                block.retry_after = now + Duration::from_secs(1);
+                            }
+                        }
+                    }
+                    if let Err(error) = result {
+                        eprintln!("nft flow offload failed: {error}; blocking in userspace");
+                    }
+                }
+                offload_worker::Completion::Unblock(result) => result?,
+            }
+        }
+        Ok(())
+    }
+    fn flush_pending_if_due(&mut self) -> io::Result<()> {
+        let count = self.pending_blocks.len() + self.pending_unblocks.len();
+        if count >= 16
+            || (count > 0
+                && self
+                    .pending_since
+                    .is_some_and(|at| at.elapsed() >= Duration::from_millis(10)))
+        {
+            self.flush_pending()?;
+        }
+        Ok(())
+    }
+    fn flush_pending(&mut self) -> io::Result<()> {
+        let Some(worker) = &self.offload_worker else {
+            return Ok(());
+        };
+        if !self.pending_unblocks.is_empty() {
+            let keys: Vec<_> = self.pending_unblocks.iter().copied().collect();
+            worker.unblock(keys)?;
+            self.pending_unblocks.clear();
+        }
+        if !self.pending_blocks.is_empty() {
+            let keys: Vec<_> = self.pending_blocks.iter().copied().collect();
+            worker.block(keys.clone())?;
+            for key in &keys {
+                if let Some(block) = self.blocked_ct.get_mut(key) {
+                    block.inflight = true;
+                }
+            }
+            self.pending_blocks.clear();
+        }
+        self.pending_since = None;
+        Ok(())
+    }
 }
 impl PacketIo for NfQueue {
     fn process_one(&mut self, policy: &mut dyn Policy) -> io::Result<()> {
+        self.drain_offload_results()?;
         self.closing_ct
             .retain(|_, at| at.elapsed() < Duration::from_secs(120));
         if let (Some(events), Some(table)) = (&self.destroy_events, &self.dynamic_table) {
+            let table = table.clone();
             let result = events.drain(|key| {
                 if let Some(block) = self.blocked_ct.remove(&key) {
                     self.closing_ct.insert(key, Instant::now());
-                    if block.installed.is_some() {
-                        nft::NftPolicy::new("/usr/sbin/nft").unblock_tcp_flow(table, key)
-                    } else {
-                        Ok(())
+                    self.pending_blocks.remove(&key);
+                    if block.installed.is_some() || block.inflight {
+                        if self.pending_blocks.is_empty() && self.pending_unblocks.is_empty() {
+                            self.pending_since = Some(Instant::now());
+                        }
+                        self.pending_unblocks.insert(key);
                     }
-                } else {
-                    Ok(())
                 }
+                Ok(())
             });
             if let Err(error) = result {
                 if !conntrack::events_lost(&error) {
                     return Err(error);
                 }
-                nft::NftPolicy::new("/usr/sbin/nft").flush_blocked_flows(table)?;
+                self.stop_offload()?;
+                nft::NftPolicy::new("/usr/sbin/nft").flush_blocked_flows(&table)?;
                 self.blocked_ct.clear();
                 self.closing_ct.clear();
+                self.pending_blocks.clear();
+                self.pending_unblocks.clear();
+                self.pending_since = None;
                 self.dynamic_table = None;
                 self.destroy_events = None;
                 eprintln!(
@@ -117,6 +206,7 @@ impl PacketIo for NfQueue {
                 );
             }
         }
+        self.flush_pending_if_due()?;
         let mut message = self.queue.recv()?;
         let bytes = message.get_payload();
         let conntrack = message.get_conntrack();
@@ -165,11 +255,15 @@ impl PacketIo for NfQueue {
             && rst
             && self.dynamic_table.is_some()
             && conntrack_key.is_some_and(|key| self.blocked_ct.contains_key(&key));
-        if close_blocked && let (Some(table), Some(key)) = (&self.dynamic_table, conntrack_key) {
-            if self.blocked_ct[&key].installed.is_some() {
-                nft::NftPolicy::new("/usr/sbin/nft").unblock_tcp_flow(table, key)?;
+        if close_blocked && let Some(key) = conntrack_key {
+            let block = self.blocked_ct.remove(&key).unwrap();
+            self.pending_blocks.remove(&key);
+            if block.installed.is_some() || block.inflight {
+                if self.pending_blocks.is_empty() && self.pending_unblocks.is_empty() {
+                    self.pending_since = Some(Instant::now());
+                }
+                self.pending_unblocks.insert(key);
             }
-            self.blocked_ct.remove(&key);
             self.closing_ct.insert(key, Instant::now());
         }
         let mark_block =
@@ -187,38 +281,23 @@ impl PacketIo for NfQueue {
         self.queue.verdict(message)?;
         if verdict == Verdict::DropFlow
             && !close_blocked
-            && let Some(table) = &self.dynamic_table
+            && self.dynamic_table.is_some()
             && let Some(key) = conntrack_key
             && offload_due(self.blocked_ct.get(&key), Instant::now())
             && !self.closing_ct.contains_key(&key)
         {
-            let previous = self.blocked_ct.get(&key);
-            let installed = previous.and_then(|block| block.installed);
-            match nft::NftPolicy::new("/usr/sbin/nft").block_tcp_flow(table, key) {
-                Ok(()) => {
-                    let now = Instant::now();
-                    self.blocked_ct.insert(
-                        key,
-                        BlockedFlow {
-                            installed: Some(now),
-                            retry_after: now,
-                        },
-                    );
-                }
-                Err(error) => {
-                    if previous.is_none_or(|block| block.installed.is_some()) {
-                        eprintln!("nft flow offload failed: {error}; blocking in userspace");
-                    }
-                    self.blocked_ct.insert(
-                        key,
-                        BlockedFlow {
-                            installed,
-                            retry_after: Instant::now() + Duration::from_secs(1),
-                        },
-                    );
-                }
+            let now = Instant::now();
+            self.blocked_ct.entry(key).or_insert(BlockedFlow {
+                installed: None,
+                retry_after: now,
+                inflight: false,
+            });
+            if self.pending_blocks.is_empty() && self.pending_unblocks.is_empty() {
+                self.pending_since = Some(now);
             }
+            self.pending_blocks.insert(key);
         }
+        self.flush_pending_if_due()?;
         Ok(())
     }
 }
@@ -250,19 +329,28 @@ mod tests {
         let fresh = BlockedFlow {
             installed: Some(now - Duration::from_secs(114)),
             retry_after: now,
+            inflight: false,
         };
         assert!(!offload_due(Some(&fresh), now));
         let expired = BlockedFlow {
             installed: Some(now - Duration::from_secs(115)),
             retry_after: now,
+            inflight: false,
         };
         assert!(offload_due(Some(&expired), now));
         let failed = BlockedFlow {
             installed: None,
             retry_after: now + Duration::from_secs(1),
+            inflight: false,
         };
         assert!(!offload_due(Some(&failed), now));
         assert!(offload_due(Some(&failed), now + Duration::from_secs(1)));
+        let inflight = BlockedFlow {
+            installed: None,
+            retry_after: now,
+            inflight: true,
+        };
+        assert!(!offload_due(Some(&inflight), now));
     }
 
     #[test]
@@ -298,6 +386,7 @@ mod tests {
                     BlockedFlow {
                         installed: Some(Instant::now()),
                         retry_after: Instant::now(),
+                        inflight: false,
                     },
                 );
                 let (sender, receiver) = UnixDatagram::pair()?;

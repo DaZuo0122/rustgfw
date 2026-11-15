@@ -85,7 +85,8 @@ impl DestroyEvents {
         mut on_destroy: impl FnMut(ConntrackKey) -> io::Result<()>,
     ) -> io::Result<()> {
         let mut buffer = [0u8; 65536];
-        loop {
+        // Leave time for NFQUEUE packets when many connections close together.
+        for _ in 0..16 {
             let size = unsafe {
                 libc::recv(
                     self.fd.as_raw_fd(),
@@ -119,6 +120,7 @@ impl DestroyEvents {
                 on_destroy(key)?;
             }
         }
+        Ok(())
     }
 }
 
@@ -351,6 +353,26 @@ mod tests {
         assert!(events_lost(&events.drain(|_| Ok(())).unwrap_err()));
         sender.send(&vec![0; 65537])?;
         assert!(events_lost(&events.drain(|_| Ok(())).unwrap_err()));
+        Ok(())
+    }
+    #[test]
+    fn drains_a_bounded_batch_of_destroy_datagrams() -> io::Result<()> {
+        let (sender, receiver) = UnixDatagram::pair()?;
+        let events = DestroyEvents::from_fd(receiver.into());
+        for id in 1..=18u32 {
+            sender.send(&destroy(&attr(12, &id.to_be_bytes())))?;
+        }
+        let mut ids = Vec::new();
+        events.drain(|key| {
+            ids.push(key.id);
+            Ok(())
+        })?;
+        assert_eq!(ids.len(), 16);
+        events.drain(|key| {
+            ids.push(key.id);
+            Ok(())
+        })?;
+        assert_eq!(ids, (1..=18).collect::<Vec<_>>());
         Ok(())
     }
     #[test]

@@ -229,15 +229,17 @@ fn run_nfqueue(args: &[String]) -> Result<(), Error> {
         }
         Ok(())
     })();
+    let worker_result = backend.stop_offload();
     if let Some(handle) = &installed
         && let Err(error) = kernel.revoke(handle)
     {
         return Err(format!(
-            "failed to remove nft table {}: {error}; engine result: {result:?}",
+            "failed to remove nft table {}: {error}; engine result: {result:?}; offload worker result: {worker_result:?}",
             handle.table_name()
         )
         .into());
     }
+    worker_result?;
     result?;
     Ok(())
 }

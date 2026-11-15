@@ -136,6 +136,9 @@ fn parse_attrs(
         on_attr(ty, &data[attr + 4..attr + len])?;
         attr += (len + 3) & !3;
     }
+    if attr < data.len() {
+        return Err(io::Error::other("truncated conntrack netlink attribute"));
+    }
     Ok(())
 }
 
@@ -160,17 +163,28 @@ fn parse_destroy_keys(buffer: &[u8]) -> io::Result<Vec<ConntrackKey>> {
             let mut zone = nfq::ConntrackZone::default();
             parse_attrs(&buffer[pos + 20..pos + len], |ty, value| {
                 match ty {
-                    12 if value.len() == 4 => id = u32::from_be_bytes(value.try_into().unwrap()),
-                    18 if value.len() == 2 => {
+                    12 => {
+                        let value: [u8; 4] = value
+                            .try_into()
+                            .map_err(|_| io::Error::other("invalid conntrack ID length"))?;
+                        id = u32::from_be_bytes(value);
+                    }
+                    18 => {
+                        let value: [u8; 2] = value
+                            .try_into()
+                            .map_err(|_| io::Error::other("invalid conntrack zone length"))?;
                         zone = nfq::ConntrackZone {
-                            id: u16::from_be_bytes(value.try_into().unwrap()),
+                            id: u16::from_be_bytes(value),
                             direction: nfq::ZoneDirection::Both,
                         }
                     }
                     1 | 2 => parse_attrs(value, |nested, value| {
-                        if nested == 3 && value.len() == 2 {
+                        if nested == 3 {
+                            let value: [u8; 2] = value.try_into().map_err(|_| {
+                                io::Error::other("invalid directional conntrack zone length")
+                            })?;
                             zone = nfq::ConntrackZone {
-                                id: u16::from_be_bytes(value.try_into().unwrap()),
+                                id: u16::from_be_bytes(value),
                                 direction: if ty == 1 {
                                     nfq::ZoneDirection::Original
                                 } else {
@@ -280,6 +294,16 @@ mod tests {
         bytes[4..6].copy_from_slice(&(1u16 << 8 | 2).to_ne_bytes());
         assert!(parse_destroy_keys(&bytes).is_err());
         assert!(parse_destroy_keys(&bytes[..3]).is_err());
+    }
+    #[test]
+    fn rejects_corrupt_destroy_identity_instead_of_missing_a_block() {
+        let id = attr(12, &42u32.to_be_bytes());
+        assert!(parse_destroy_keys(&destroy(&attr(12, &[0, 42]))).is_err());
+        assert!(parse_destroy_keys(&destroy(&[id.clone(), attr(18, &[7])].concat())).is_err());
+        assert!(
+            parse_destroy_keys(&destroy(&[id.clone(), attr(2, &attr(3, &[8]))].concat())).is_err()
+        );
+        assert!(parse_destroy_keys(&destroy(&[id, vec![1]].concat())).is_err());
     }
     #[test]
     fn equal_tuples_with_distinct_conntrack_ids_keep_separate_inspection() {

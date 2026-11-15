@@ -159,7 +159,7 @@ fn parse_destroy_keys(buffer: &[u8]) -> io::Result<Vec<ConntrackKey>> {
                 return Err(io::Error::other("truncated conntrack destroy message"));
             }
             // NFNL_SUBSYS_CTNETLINK / IPCTNL_MSG_CT_DELETE
-            let mut id = 0;
+            let mut id = None;
             let mut zone = nfq::ConntrackZone::default();
             parse_attrs(&buffer[pos + 20..pos + len], |ty, value| {
                 match ty {
@@ -167,7 +167,7 @@ fn parse_destroy_keys(buffer: &[u8]) -> io::Result<Vec<ConntrackKey>> {
                         let value: [u8; 4] = value
                             .try_into()
                             .map_err(|_| io::Error::other("invalid conntrack ID length"))?;
-                        id = u32::from_be_bytes(value);
+                        id = Some(u32::from_be_bytes(value));
                     }
                     18 => {
                         let value: [u8; 2] = value
@@ -198,6 +198,9 @@ fn parse_destroy_keys(buffer: &[u8]) -> io::Result<Vec<ConntrackKey>> {
                 }
                 Ok(())
             })?;
+            // The kernel emits CTA_ID for every destroy event. Without it we
+            // cannot know which installed block to remove.
+            let id = id.ok_or_else(|| io::Error::other("conntrack destroy missing ID"))?;
             if id != 0 {
                 keys.push(ConntrackKey { id, zone });
             }
@@ -298,6 +301,7 @@ mod tests {
     #[test]
     fn rejects_corrupt_destroy_identity_instead_of_missing_a_block() {
         let id = attr(12, &42u32.to_be_bytes());
+        assert!(parse_destroy_keys(&destroy(&[])).is_err());
         assert!(parse_destroy_keys(&destroy(&attr(12, &[0, 42]))).is_err());
         assert!(parse_destroy_keys(&destroy(&[id.clone(), attr(18, &[7])].concat())).is_err());
         assert!(

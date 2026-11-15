@@ -70,13 +70,10 @@ impl Default for Address {
 }
 const _: () = assert!(std::mem::size_of::<Address>() == 80);
 
-fn traffic_scope(layer: Layer, address: &Address) -> FlowScope {
-    if matches!(layer, Layer::Forward) {
-        return FlowScope::default();
-    }
-    let interface = u32::from_ne_bytes(address.data[..4].try_into().unwrap());
-    let subinterface = u32::from_ne_bytes(address.data[4..8].try_into().unwrap());
-    FlowScope(1 + (u128::from(interface) << 32) + u128::from(subinterface))
+fn traffic_scope(_layer: Layer, _address: &Address) -> FlowScope {
+    // WinDivert does not guarantee an interface index for outbound packets.
+    // Keying on it would split the two directions of one local connection.
+    FlowScope::default()
 }
 
 type Handle = *mut c_void;
@@ -406,7 +403,8 @@ mod tests {
         let mut reply = tcp_packet(80, 12346, b"HTTP/1.1 200 OK\r\n\r\n");
         reply[12..16].copy_from_slice(&[198, 51, 100, 2]);
         reply[16..20].copy_from_slice(&[192, 0, 2, 1]);
-        let (mut io, state) = fixture(vec![allowed.clone(), blocked, reply]);
+        let (mut io, mut state) = fixture(vec![allowed.clone(), blocked, reply]);
+        state.interfaces = [(9, 0), (10, 1), (11, 2)].into();
         let mut policy = Inspect::http_hosts(
             Rules::new(vec![], Verdict::Accept),
             vec!["blocked.test".into()],
@@ -416,25 +414,6 @@ mod tests {
         }
         assert_eq!(state.sent, [allowed]);
         assert_eq!(state.sent_interfaces, [(9, 0)]);
-        assert!(state.address_preserved);
-        drop(io);
-    }
-
-    #[test]
-    fn network_interface_scope_separates_identical_tcp_tuples() {
-        let blocked = tcp_packet(12346, 80, b"GET / HTTP/1.1\r\nHost: blocked.test\r\n\r\n");
-        let allowed = tcp_packet(12346, 80, b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n");
-        let (mut io, mut state) = fixture(vec![blocked, allowed.clone(), allowed.clone()]);
-        state.interfaces = [(9, 0), (10, 0), (9, 1)].into();
-        let mut policy = Inspect::http_hosts(
-            Rules::new(vec![], Verdict::Accept),
-            vec!["blocked.test".into()],
-        );
-        for _ in 0..3 {
-            io.process_one(&mut policy).unwrap();
-        }
-        assert_eq!(state.sent, [allowed.clone(), allowed]);
-        assert_eq!(state.sent_interfaces, [(10, 0), (9, 1)]);
         assert!(state.address_preserved);
         drop(io);
     }

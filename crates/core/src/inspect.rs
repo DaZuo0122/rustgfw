@@ -30,6 +30,12 @@ pub trait StreamAnalyzer {
     fn feed(&mut self, bytes: &[u8]) -> Analysis;
 }
 
+/// One instance observes both directions of a reassembled TCP flow.
+/// `reverse` is relative to the first packet that created the flow.
+pub trait BidirectionalStreamAnalyzer {
+    fn feed(&mut self, bytes: &[u8], reverse: bool) -> Analysis;
+}
+
 pub enum DatagramAnalysis {
     Observations(Vec<Observation>),
     Malformed,
@@ -163,6 +169,9 @@ struct Direction {
 }
 struct Flow {
     directions: [Direction; 2],
+    origin: SocketAddr,
+    target: SocketAddr,
+    bidirectional: Vec<Option<Box<dyn BidirectionalStreamAnalyzer>>>,
     facts: HashMap<&'static str, Vec<String>>,
     allowed: bool,
     blocked: bool,
@@ -173,6 +182,7 @@ struct Flow {
 
 struct UdpFlow {
     origin: SocketAddr,
+    target: SocketAddr,
     analyzers: Vec<Option<Box<dyn UdpStreamAnalyzer>>>,
     facts: HashMap<&'static str, Vec<String>>,
     allowed: bool,
@@ -188,6 +198,7 @@ impl Flow {
     fn finished(&self) -> bool {
         !self.blocked
             && !self.allowed
+            && self.bidirectional.iter().all(Option::is_none)
             && self
                 .directions
                 .iter()
@@ -202,13 +213,23 @@ pub struct AnalyzerRule {
     pub matches: Box<dyn Fn(&Observation) -> bool + Send + Sync>,
 }
 
+pub struct BidirectionalAnalyzerRule {
+    pub port: Option<u16>,
+    pub factory: Box<dyn Fn() -> Box<dyn BidirectionalStreamAnalyzer> + Send + Sync>,
+    pub matches: Box<dyn Fn(&Observation) -> bool + Send + Sync>,
+}
+
 /// The latest observation batch for each field in one bidirectional flow.
-/// A callback also receives the current packet's endpoint direction.
+/// `source` and `destination` belong to the current packet; `origin` and
+/// `target` remain fixed from the first packet that created the flow.
 pub struct FlowContext<'a> {
     pub protocol: Protocol,
     pub scope: FlowScope,
     pub source: SocketAddr,
     pub destination: SocketAddr,
+    pub origin: SocketAddr,
+    pub target: SocketAddr,
+    pub reverse: bool,
     facts: &'a HashMap<&'static str, Vec<String>>,
 }
 impl FlowContext<'_> {
@@ -233,6 +254,19 @@ fn store_observations(
             .push(observation.value);
     }
     facts.extend(latest);
+}
+
+fn match_tcp_observations(
+    facts: &mut HashMap<&'static str, Vec<String>>,
+    observations: Vec<Observation>,
+    matcher: &dyn Fn(&Observation) -> bool,
+    retain: bool,
+) -> bool {
+    let blocked = observations.iter().any(matcher);
+    if retain {
+        store_observations(facts, observations);
+    }
+    blocked
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -345,6 +379,44 @@ impl AnalyzerRule {
     }
 }
 
+impl BidirectionalAnalyzerRule {
+    pub fn observing(
+        port: Option<u16>,
+        factory: impl Fn() -> Box<dyn BidirectionalStreamAnalyzer> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            port,
+            factory: Box::new(factory),
+            matches: Box::new(|_| false),
+        }
+    }
+
+    pub fn exact(
+        field: &'static str,
+        values: Vec<String>,
+        port: Option<u16>,
+        factory: impl Fn() -> Box<dyn BidirectionalStreamAnalyzer> + Send + Sync + 'static,
+    ) -> Option<Self> {
+        if values.is_empty() {
+            return None;
+        }
+        let values: Vec<_> = values
+            .into_iter()
+            .map(|value| value.to_ascii_lowercase())
+            .collect();
+        Some(Self {
+            port,
+            factory: Box::new(factory),
+            matches: Box::new(move |observation| {
+                observation.field == field
+                    && values
+                        .iter()
+                        .any(|value| value.eq_ignore_ascii_case(&observation.value))
+            }),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct InspectLimits {
     pub max_flows: usize,
@@ -366,6 +438,7 @@ impl Default for InspectLimits {
 pub struct Inspect<P> {
     transport: P,
     analyzers: Vec<AnalyzerRule>,
+    bidirectional_analyzers: Vec<BidirectionalAnalyzerRule>,
     flow_rules: Vec<FlowRule>,
     datagrams: Vec<DatagramRule>,
     udp_analyzers: Vec<UdpStreamRule>,
@@ -400,6 +473,7 @@ impl<P> Inspect<P> {
         Self {
             transport,
             analyzers,
+            bidirectional_analyzers: Vec::new(),
             flow_rules: Vec::new(),
             datagrams,
             udp_analyzers: Vec::new(),
@@ -420,6 +494,15 @@ impl<P> Inspect<P> {
     pub fn with_flow_rules(mut self, rules: Vec<FlowRule>) -> Self {
         self.clear_flows();
         self.flow_rules = rules;
+        self
+    }
+
+    pub fn with_bidirectional_analyzers(
+        mut self,
+        analyzers: Vec<BidirectionalAnalyzerRule>,
+    ) -> Self {
+        self.clear_flows();
+        self.bidirectional_analyzers = analyzers;
         self
     }
 
@@ -517,6 +600,7 @@ impl<P> Inspect<P> {
         }
         let flow = self.udp_flows.entry(key).or_insert_with(|| UdpFlow {
             origin: transport.source,
+            target: transport.destination,
             analyzers: self
                 .udp_analyzers
                 .iter()
@@ -567,6 +651,9 @@ impl<P> Inspect<P> {
                     scope: packet.scope,
                     source: transport.source,
                     destination: transport.destination,
+                    origin: flow.origin,
+                    target: flow.target,
+                    reverse: transport.source != flow.origin,
                     facts: &flow.facts,
                 };
                 if let Some(action) = self
@@ -597,6 +684,7 @@ impl<P: Policy> Policy for Inspect<P> {
         let verdict = self.transport.evaluate(packet);
         if verdict != Verdict::Accept
             || (self.analyzers.is_empty()
+                && self.bidirectional_analyzers.is_empty()
                 && self.datagrams.is_empty()
                 && self.flow_rules.is_empty()
                 && self.udp_analyzers.is_empty()
@@ -610,11 +698,18 @@ impl<P: Policy> Policy for Inspect<P> {
         if t.protocol == Protocol::Udp {
             return self.inspect_udp(packet, &t);
         }
-        if self.analyzers.is_empty() && self.flow_rules.is_empty() {
+        if self.analyzers.is_empty()
+            && self.bidirectional_analyzers.is_empty()
+            && self.flow_rules.is_empty()
+        {
             return verdict;
         }
         if self.flow_rules.is_empty()
             && !self.analyzers.iter().any(|a| {
+                a.port
+                    .is_none_or(|port| t.source.port() == port || t.destination.port() == port)
+            })
+            && !self.bidirectional_analyzers.iter().any(|a| {
                 a.port
                     .is_none_or(|port| t.source.port() == port || t.destination.port() == port)
             })
@@ -666,6 +761,17 @@ impl<P: Policy> Policy for Inspect<P> {
                     })
                     .collect(),
             }),
+            origin: t.source,
+            target: t.destination,
+            bidirectional: self
+                .bidirectional_analyzers
+                .iter()
+                .map(|a| {
+                    a.port
+                        .is_none_or(|p| key.1.port() == p || key.2.port() == p)
+                        .then(|| (a.factory)())
+                })
+                .collect(),
             facts: HashMap::new(),
             allowed: false,
             blocked: false,
@@ -679,7 +785,9 @@ impl<P: Policy> Policy for Inspect<P> {
         }
         if !flow.allowed {
             let d = &mut flow.directions[direction];
-            if d.analyzers.iter().any(Option::is_some) {
+            if d.analyzers.iter().any(Option::is_some)
+                || flow.bidirectional.iter().any(Option::is_some)
+            {
                 match d
                     .reassembly
                     .feed(t.tcp_sequence.unwrap(), t.tcp_flags & 2 != 0, t.payload)
@@ -692,16 +800,50 @@ impl<P: Policy> Policy for Inspect<P> {
                             match analyzer.feed(&bytes) {
                                 Analysis::Finished => *slot = None,
                                 Analysis::Observations(observations) => {
-                                    flow.blocked |= observations.iter().any(|o| (rule.matches)(o));
-                                    if !self.flow_rules.is_empty() {
-                                        store_observations(&mut flow.facts, observations);
-                                    }
+                                    flow.blocked |= match_tcp_observations(
+                                        &mut flow.facts,
+                                        observations,
+                                        rule.matches.as_ref(),
+                                        !self.flow_rules.is_empty(),
+                                    );
                                 }
                                 Analysis::FinalObservations(observations) => {
-                                    flow.blocked |= observations.iter().any(|o| (rule.matches)(o));
-                                    if !self.flow_rules.is_empty() {
-                                        store_observations(&mut flow.facts, observations);
-                                    }
+                                    flow.blocked |= match_tcp_observations(
+                                        &mut flow.facts,
+                                        observations,
+                                        rule.matches.as_ref(),
+                                        !self.flow_rules.is_empty(),
+                                    );
+                                    *slot = None;
+                                }
+                                Analysis::Pending => {}
+                            }
+                        }
+                        for (slot, rule) in flow
+                            .bidirectional
+                            .iter_mut()
+                            .zip(&self.bidirectional_analyzers)
+                        {
+                            let Some(analyzer) = slot else {
+                                continue;
+                            };
+                            match analyzer.feed(&bytes, t.source != flow.origin) {
+                                Analysis::Finished => *slot = None,
+                                Analysis::Observations(observations) => {
+                                    flow.blocked |= match_tcp_observations(
+                                        &mut flow.facts,
+                                        observations,
+                                        rule.matches.as_ref(),
+                                        !self.flow_rules.is_empty(),
+                                    );
+                                }
+                                Analysis::FinalObservations(observations) => {
+                                    flow.blocked |= match_tcp_observations(
+                                        &mut flow.facts,
+                                        observations,
+                                        rule.matches.as_ref(),
+                                        !self.flow_rules.is_empty(),
+                                    );
                                     *slot = None;
                                 }
                                 Analysis::Pending => {}
@@ -718,6 +860,9 @@ impl<P: Policy> Policy for Inspect<P> {
                 scope: packet.scope,
                 source: t.source,
                 destination: t.destination,
+                origin: flow.origin,
+                target: flow.target,
+                reverse: t.source != flow.origin,
                 facts: &flow.facts,
             };
             if let Some(action) = self
@@ -809,6 +954,11 @@ mod tests {
                     )],
                     vec![FlowRule::new(|context| {
                         (context.protocol == Protocol::Udp
+                            && context.reverse
+                            && context.origin.port() == 12345
+                            && context.target.port() == 53
+                            && context.source.port() == 53
+                            && context.destination.port() == 12345
                             && context.get("udp.request") == Some("request")
                             && context.get("udp.reply") == Some("deny"))
                         .then_some(FlowAction::Block)
@@ -1131,6 +1281,118 @@ mod tests {
         assert_eq!(feed(1, 1000, 2, b""), Verdict::Accept);
         assert_eq!(feed(1, 1001, 16, b"beta"), Verdict::Accept);
     }
+
+    #[test]
+    fn one_bidirectional_tcp_analyzer_combines_reassembled_request_and_reply() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct Exchange {
+            requested: bool,
+        }
+        impl BidirectionalStreamAnalyzer for Exchange {
+            fn feed(&mut self, bytes: &[u8], reverse: bool) -> Analysis {
+                if !reverse && bytes == b"request" {
+                    self.requested = true;
+                    Analysis::Observations(vec![Observation {
+                        field: "exchange.request",
+                        value: "seen".into(),
+                    }])
+                } else if reverse && self.requested && bytes == b"reject" {
+                    Analysis::Observations(vec![Observation {
+                        field: "exchange.reply",
+                        value: "reject".into(),
+                    }])
+                } else {
+                    Analysis::Pending
+                }
+            }
+        }
+
+        let created = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&created);
+        let mut policy =
+            Inspect::with_analyzers(crate::ConstantPolicy(Verdict::Accept), Vec::new())
+                .with_bidirectional_analyzers(vec![BidirectionalAnalyzerRule::observing(
+                    Some(80),
+                    move || {
+                        count.fetch_add(1, Ordering::Relaxed);
+                        Box::new(Exchange { requested: false })
+                    },
+                )])
+                .with_flow_rules(vec![FlowRule::new(|context| {
+                    (context.protocol == Protocol::Tcp
+                        && context.reverse
+                        && context.source.port() == 80
+                        && context.destination.port() == 12345
+                        && context.origin.port() == 12345
+                        && context.target.port() == 80
+                        && context.get("exchange.request") == Some("seen")
+                        && context.get("exchange.reply") == Some("reject"))
+                    .then_some(FlowAction::Block)
+                })]);
+        let mut feed = |seq, flags, payload: &[u8], reverse| {
+            let bytes = tcp(seq, flags, payload, reverse);
+            policy.evaluate(Packet {
+                bytes: &bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        assert_eq!(feed(100, 2, b"", false), Verdict::Accept);
+        assert_eq!(feed(500, 18, b"", true), Verdict::Accept);
+        assert_eq!(feed(101, 16, b"request", false), Verdict::Accept);
+        assert_eq!(feed(504, 16, b"ect", true), Verdict::Accept);
+        assert_eq!(feed(501, 16, b"rej", true), Verdict::DropFlow);
+        assert_eq!(created.load(Ordering::Relaxed), 1);
+        assert_eq!(feed(108, 16, b"later", false), Verdict::DropFlow);
+        assert_eq!(feed(1000, 2, b"", false), Verdict::Accept);
+        assert_eq!(created.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn bidirectional_analyzer_can_match_directly_without_flow_rules() {
+        struct Reply;
+        impl BidirectionalStreamAnalyzer for Reply {
+            fn feed(&mut self, bytes: &[u8], reverse: bool) -> Analysis {
+                if reverse && bytes == b"deny" {
+                    Analysis::FinalObservations(vec![Observation {
+                        field: "reply.word",
+                        value: "deny".into(),
+                    }])
+                } else {
+                    Analysis::Pending
+                }
+            }
+        }
+        let mut policy =
+            Inspect::with_analyzers(crate::ConstantPolicy(Verdict::Accept), Vec::new())
+                .with_bidirectional_analyzers(vec![
+                    BidirectionalAnalyzerRule::exact(
+                        "reply.word",
+                        vec!["deny".into()],
+                        Some(80),
+                        || Box::new(Reply),
+                    )
+                    .unwrap(),
+                ]);
+        let mut feed = |seq, flags, payload: &[u8], reverse| {
+            let bytes = tcp(seq, flags, payload, reverse);
+            policy.evaluate(Packet {
+                bytes: &bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        assert_eq!(feed(100, 2, b"", false), Verdict::Accept);
+        assert_eq!(feed(500, 18, b"", true), Verdict::Accept);
+        assert_eq!(feed(501, 16, b"deny", true), Verdict::DropFlow);
+    }
+
     #[test]
     fn flow_allow_is_terminal_for_inspection_but_keeps_transport_policy() {
         struct Transport;

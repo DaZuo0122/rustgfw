@@ -389,6 +389,9 @@ mod tests {
                         inflight: false,
                     },
                 );
+                for _ in 0..8 {
+                    queue.offload_worker.as_ref().unwrap().block(vec![key])?;
+                }
                 let (sender, receiver) = UnixDatagram::pair()?;
                 queue.destroy_events = Some(conntrack::DestroyEvents::from_fd(receiver.into()));
                 sender.send(event)?;

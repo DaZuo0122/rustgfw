@@ -39,6 +39,20 @@ pub trait DatagramAnalyzer: Send + Sync {
     fn inspect(&self, payload: &[u8]) -> DatagramAnalysis;
 }
 
+/// A stateful UDP analyzer receives both directions of one endpoint pair.
+pub trait UdpStreamAnalyzer {
+    fn feed(&mut self, payload: &[u8], reverse: bool) -> UdpStreamAnalysis;
+}
+
+pub enum UdpStreamAnalysis {
+    Pending,
+    Observations(Vec<Observation>),
+    FinalObservations(Vec<Observation>),
+    Finished,
+    /// Reject only this datagram while retaining the stream state.
+    Drop,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DatagramPort {
     Source(u16),
@@ -156,6 +170,20 @@ struct Flow {
     initial_syn: Option<(usize, u32)>,
     fin_seen: [bool; 2],
 }
+
+struct UdpFlow {
+    origin: SocketAddr,
+    analyzers: Vec<Option<Box<dyn UdpStreamAnalyzer>>>,
+    facts: HashMap<&'static str, Vec<String>>,
+    allowed: bool,
+    blocked: bool,
+    seen: Instant,
+}
+impl UdpFlow {
+    fn finished(&self) -> bool {
+        !self.allowed && !self.blocked && self.analyzers.iter().all(Option::is_none)
+    }
+}
 impl Flow {
     fn finished(&self) -> bool {
         !self.blocked
@@ -174,9 +202,10 @@ pub struct AnalyzerRule {
     pub matches: Box<dyn Fn(&Observation) -> bool + Send + Sync>,
 }
 
-/// The latest observation batch for each field in one bidirectional TCP flow.
+/// The latest observation batch for each field in one bidirectional flow.
 /// A callback also receives the current packet's endpoint direction.
 pub struct FlowContext<'a> {
+    pub protocol: Protocol,
     pub scope: FlowScope,
     pub source: SocketAddr,
     pub destination: SocketAddr,
@@ -211,10 +240,12 @@ pub enum FlowAction {
     /// Stop application inspection for this flow; transport policy still runs.
     Allow,
     Block,
+    /// Drop only the current UDP datagram; for TCP, block the stream.
+    DropPacket,
 }
 
 type FlowMatch = dyn for<'a> Fn(&FlowContext<'a>) -> Option<FlowAction> + Send + Sync;
-/// Compose facts from multiple analyzers into an ordered TCP flow decision.
+/// Compose facts from multiple analyzers into an ordered flow decision.
 pub struct FlowRule {
     matches: Box<FlowMatch>,
 }
@@ -224,6 +255,22 @@ impl FlowRule {
     ) -> Self {
         Self {
             matches: Box::new(matches),
+        }
+    }
+}
+
+pub struct UdpStreamRule {
+    pub port: Option<DatagramPort>,
+    pub factory: Box<dyn Fn() -> Box<dyn UdpStreamAnalyzer> + Send + Sync>,
+}
+impl UdpStreamRule {
+    pub fn new(
+        port: Option<DatagramPort>,
+        factory: impl Fn() -> Box<dyn UdpStreamAnalyzer> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            port,
+            factory: Box::new(factory),
         }
     }
 }
@@ -314,14 +361,17 @@ impl Default for InspectLimits {
     }
 }
 
-/// Transport policy runs first; application matches can additionally block.
+/// Transport policy runs first; application rules then decide per flow or packet.
 /// Inspection is passive: packets before a match are accepted, as in OpenGFW.
 pub struct Inspect<P> {
     transport: P,
     analyzers: Vec<AnalyzerRule>,
     flow_rules: Vec<FlowRule>,
     datagrams: Vec<DatagramRule>,
+    udp_analyzers: Vec<UdpStreamRule>,
+    udp_rules: Vec<FlowRule>,
     flows: HashMap<Key, Flow>,
+    udp_flows: HashMap<Key, UdpFlow>,
     completed_since_compaction: bool,
     sweep: Instant,
     limits: InspectLimits,
@@ -352,7 +402,10 @@ impl<P> Inspect<P> {
             analyzers,
             flow_rules: Vec::new(),
             datagrams,
+            udp_analyzers: Vec::new(),
+            udp_rules: Vec::new(),
             flows: HashMap::new(),
+            udp_flows: HashMap::new(),
             completed_since_compaction: false,
             sweep: Instant::now(),
             limits,
@@ -360,6 +413,7 @@ impl<P> Inspect<P> {
     }
     pub fn clear_flows(&mut self) {
         self.flows.clear();
+        self.udp_flows.clear();
         self.completed_since_compaction = false;
     }
 
@@ -368,6 +422,175 @@ impl<P> Inspect<P> {
         self.flow_rules = rules;
         self
     }
+
+    pub fn with_udp_streams(mut self, analyzers: Vec<UdpStreamRule>, rules: Vec<FlowRule>) -> Self {
+        self.clear_flows();
+        self.udp_analyzers = analyzers;
+        self.udp_rules = rules;
+        self
+    }
+
+    fn expire_idle_flows(&mut self, now: Instant) {
+        if now >= self.sweep {
+            self.flows
+                .retain(|_, flow| now.duration_since(flow.seen) < self.limits.idle);
+            self.udp_flows
+                .retain(|_, flow| now.duration_since(flow.seen) < self.limits.idle);
+            self.sweep = now + Duration::from_secs(1);
+        }
+    }
+
+    fn compact_completed_flows(&mut self) {
+        if self.completed_since_compaction {
+            self.flows.retain(|_, flow| !flow.finished());
+            self.udp_flows.retain(|_, flow| !flow.finished());
+            self.completed_since_compaction = false;
+        }
+    }
+
+    fn inspect_udp(&mut self, packet: Packet<'_>, transport: &packet::Transport<'_>) -> Verdict {
+        let has_stream = !self.udp_analyzers.is_empty() || !self.udp_rules.is_empty();
+        let state = has_stream.then(|| {
+            let now = Instant::now();
+            self.expire_idle_flows(now);
+            let key = if transport.source <= transport.destination {
+                (packet.scope, transport.source, transport.destination)
+            } else {
+                (packet.scope, transport.destination, transport.source)
+            };
+            (now, key)
+        });
+        if let Some((now, key)) = state
+            && let Some(flow) = self.udp_flows.get(&key)
+            && now.duration_since(flow.seen) < self.limits.idle
+        {
+            if flow.allowed {
+                return Verdict::Accept;
+            }
+            if flow.blocked {
+                return Verdict::DropFlow;
+            }
+        }
+        for rule in &self.datagrams {
+            if rule.port.is_some_and(|port| {
+                !port.matches(transport.source.port(), transport.destination.port())
+            }) {
+                continue;
+            }
+            match rule.analyzer.inspect(transport.payload) {
+                DatagramAnalysis::Malformed => return Verdict::Drop,
+                DatagramAnalysis::Observations(observations)
+                    if observations.iter().any(|value| (rule.matches)(value)) =>
+                {
+                    return Verdict::Drop;
+                }
+                DatagramAnalysis::Observations(_) => {}
+            }
+        }
+        let Some((now, key)) = state else {
+            return Verdict::Accept;
+        };
+        if self
+            .udp_flows
+            .get(&key)
+            .is_some_and(|flow| now.duration_since(flow.seen) >= self.limits.idle)
+        {
+            self.udp_flows.remove(&key);
+        }
+        if self.udp_rules.is_empty()
+            && !self.udp_flows.contains_key(&key)
+            && !self.udp_analyzers.iter().any(|rule| {
+                rule.port.is_none_or(|port| {
+                    port.matches(transport.source.port(), transport.destination.port())
+                })
+            })
+        {
+            return Verdict::Accept;
+        }
+        if !self.udp_flows.contains_key(&key)
+            && self.flows.len() + self.udp_flows.len() >= self.limits.max_flows
+        {
+            self.compact_completed_flows();
+            if self.flows.len() + self.udp_flows.len() >= self.limits.max_flows {
+                return Verdict::Drop;
+            }
+        }
+        let flow = self.udp_flows.entry(key).or_insert_with(|| UdpFlow {
+            origin: transport.source,
+            analyzers: self
+                .udp_analyzers
+                .iter()
+                .map(|rule| {
+                    rule.port
+                        .is_none_or(|port| {
+                            port.matches(transport.source.port(), transport.destination.port())
+                        })
+                        .then(|| (rule.factory)())
+                })
+                .collect(),
+            facts: HashMap::new(),
+            allowed: false,
+            blocked: false,
+            seen: now,
+        });
+        flow.seen = now;
+        if flow.blocked {
+            return Verdict::DropFlow;
+        }
+        let mut drop_packet = false;
+        if !flow.allowed {
+            let reverse = transport.source != flow.origin;
+            for slot in &mut flow.analyzers {
+                let Some(analyzer) = slot else {
+                    continue;
+                };
+                match analyzer.feed(transport.payload, reverse) {
+                    UdpStreamAnalysis::Pending => {}
+                    UdpStreamAnalysis::Observations(observations) => {
+                        if !self.udp_rules.is_empty() {
+                            store_observations(&mut flow.facts, observations);
+                        }
+                    }
+                    UdpStreamAnalysis::FinalObservations(observations) => {
+                        if !self.udp_rules.is_empty() {
+                            store_observations(&mut flow.facts, observations);
+                        }
+                        *slot = None;
+                    }
+                    UdpStreamAnalysis::Finished => *slot = None,
+                    UdpStreamAnalysis::Drop => drop_packet = true,
+                }
+            }
+            if !self.udp_rules.is_empty() {
+                let context = FlowContext {
+                    protocol: Protocol::Udp,
+                    scope: packet.scope,
+                    source: transport.source,
+                    destination: transport.destination,
+                    facts: &flow.facts,
+                };
+                if let Some(action) = self
+                    .udp_rules
+                    .iter()
+                    .find_map(|rule| (rule.matches)(&context))
+                {
+                    match action {
+                        FlowAction::Allow => flow.allowed = true,
+                        FlowAction::Block => flow.blocked = true,
+                        FlowAction::DropPacket => drop_packet = true,
+                    }
+                }
+            }
+        }
+        self.completed_since_compaction |= flow.finished();
+        if flow.blocked {
+            Verdict::DropFlow
+        } else if drop_packet {
+            Verdict::Drop
+        } else {
+            Verdict::Accept
+        }
+    }
 }
 impl<P: Policy> Policy for Inspect<P> {
     fn evaluate(&mut self, packet: Packet<'_>) -> Verdict {
@@ -375,7 +598,9 @@ impl<P: Policy> Policy for Inspect<P> {
         if verdict != Verdict::Accept
             || (self.analyzers.is_empty()
                 && self.datagrams.is_empty()
-                && self.flow_rules.is_empty())
+                && self.flow_rules.is_empty()
+                && self.udp_analyzers.is_empty()
+                && self.udp_rules.is_empty())
         {
             return verdict;
         }
@@ -383,24 +608,7 @@ impl<P: Policy> Policy for Inspect<P> {
             return verdict;
         };
         if t.protocol == Protocol::Udp {
-            for rule in &self.datagrams {
-                if rule
-                    .port
-                    .is_some_and(|port| !port.matches(t.source.port(), t.destination.port()))
-                {
-                    continue;
-                }
-                match rule.analyzer.inspect(t.payload) {
-                    DatagramAnalysis::Malformed => return Verdict::Drop,
-                    DatagramAnalysis::Observations(observations)
-                        if observations.iter().any(|value| (rule.matches)(value)) =>
-                    {
-                        return Verdict::Drop;
-                    }
-                    DatagramAnalysis::Observations(_) => {}
-                }
-            }
-            return verdict;
+            return self.inspect_udp(packet, &t);
         }
         if self.analyzers.is_empty() && self.flow_rules.is_empty() {
             return verdict;
@@ -414,11 +622,7 @@ impl<P: Policy> Policy for Inspect<P> {
             return verdict;
         }
         let now = Instant::now();
-        if now >= self.sweep {
-            self.flows
-                .retain(|_, f| now.duration_since(f.seen) < self.limits.idle);
-            self.sweep = now + Duration::from_secs(1);
-        }
+        self.expire_idle_flows(now);
         let (key, direction) = if t.source <= t.destination {
             ((packet.scope, t.source, t.destination), 0)
         } else {
@@ -440,12 +644,11 @@ impl<P: Policy> Policy for Inspect<P> {
         {
             self.flows.remove(&key);
         }
-        if self.flows.len() >= self.limits.max_flows && !self.flows.contains_key(&key) {
-            if self.completed_since_compaction {
-                self.flows.retain(|_, flow| !flow.finished());
-                self.completed_since_compaction = false;
-            }
-            if self.flows.len() >= self.limits.max_flows {
+        if self.flows.len() + self.udp_flows.len() >= self.limits.max_flows
+            && !self.flows.contains_key(&key)
+        {
+            self.compact_completed_flows();
+            if self.flows.len() + self.udp_flows.len() >= self.limits.max_flows {
                 // Active inspection cannot be silently bypassed at capacity.
                 return Verdict::Drop;
             }
@@ -511,6 +714,7 @@ impl<P: Policy> Policy for Inspect<P> {
         }
         if !flow.blocked && !flow.allowed && !self.flow_rules.is_empty() {
             let context = FlowContext {
+                protocol: Protocol::Tcp,
                 scope: packet.scope,
                 source: t.source,
                 destination: t.destination,
@@ -523,7 +727,7 @@ impl<P: Policy> Policy for Inspect<P> {
             {
                 match action {
                     FlowAction::Allow => flow.allowed = true,
-                    FlowAction::Block => flow.blocked = true,
+                    FlowAction::Block | FlowAction::DropPacket => flow.blocked = true,
                 }
             }
         }
@@ -548,6 +752,185 @@ impl<P: Policy> Policy for Inspect<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn udp(payload: &[u8], reverse: bool) -> Vec<u8> {
+        let mut packet = crate::packet::udp(reverse);
+        packet.truncate(28);
+        packet.extend_from_slice(payload);
+        let length = packet.len() as u16;
+        packet[2..4].copy_from_slice(&length.to_be_bytes());
+        packet[24..26].copy_from_slice(&((payload.len() + 8) as u16).to_be_bytes());
+        packet
+    }
+
+    fn evaluate_udp(
+        policy: &mut impl Policy,
+        scope: u128,
+        payload: &[u8],
+        reverse: bool,
+    ) -> Verdict {
+        let bytes = udp(payload, reverse);
+        policy.evaluate(Packet {
+            bytes: &bytes,
+            original_len: bytes.len(),
+            checksum_ready: true,
+            scope: FlowScope(scope),
+        })
+    }
+
+    #[test]
+    fn udp_stream_analyzer_combines_request_and_reverse_reply_per_scope() {
+        struct Exchange {
+            requested: bool,
+        }
+        impl UdpStreamAnalyzer for Exchange {
+            fn feed(&mut self, payload: &[u8], reverse: bool) -> UdpStreamAnalysis {
+                if !reverse && payload == b"request" {
+                    self.requested = true;
+                    UdpStreamAnalysis::Observations(vec![Observation {
+                        field: "udp.request",
+                        value: "request".into(),
+                    }])
+                } else if reverse && self.requested && payload == b"deny" {
+                    UdpStreamAnalysis::Observations(vec![Observation {
+                        field: "udp.reply",
+                        value: "deny".into(),
+                    }])
+                } else {
+                    UdpStreamAnalysis::Pending
+                }
+            }
+        }
+        let mut policy =
+            Inspect::with_analyzers(crate::ConstantPolicy(Verdict::Accept), Vec::new())
+                .with_udp_streams(
+                    vec![UdpStreamRule::new(
+                        Some(DatagramPort::Destination(53)),
+                        || Box::new(Exchange { requested: false }),
+                    )],
+                    vec![FlowRule::new(|context| {
+                        (context.protocol == Protocol::Udp
+                            && context.get("udp.request") == Some("request")
+                            && context.get("udp.reply") == Some("deny"))
+                        .then_some(FlowAction::Block)
+                    })],
+                );
+        assert_eq!(
+            evaluate_udp(&mut policy, 1, b"request", false),
+            Verdict::Accept
+        );
+        assert_eq!(evaluate_udp(&mut policy, 2, b"deny", true), Verdict::Accept);
+        assert_eq!(
+            evaluate_udp(&mut policy, 1, b"deny", true),
+            Verdict::DropFlow
+        );
+        assert_eq!(
+            evaluate_udp(&mut policy, 1, b"later", false),
+            Verdict::DropFlow
+        );
+        assert_eq!(
+            evaluate_udp(&mut policy, 2, b"request", false),
+            Verdict::Accept
+        );
+        policy.clear_flows();
+        assert_eq!(evaluate_udp(&mut policy, 1, b"deny", true), Verdict::Accept);
+    }
+
+    #[test]
+    fn udp_stream_rule_drops_one_datagram_then_allows_later_traffic() {
+        struct Word;
+        impl UdpStreamAnalyzer for Word {
+            fn feed(&mut self, payload: &[u8], _: bool) -> UdpStreamAnalysis {
+                UdpStreamAnalysis::Observations(vec![Observation {
+                    field: "udp.word",
+                    value: String::from_utf8_lossy(payload).into_owned(),
+                }])
+            }
+        }
+        let mut policy =
+            Inspect::with_analyzers(crate::ConstantPolicy(Verdict::Accept), Vec::new())
+                .with_udp_streams(
+                    vec![UdpStreamRule::new(None, || Box::new(Word))],
+                    vec![
+                        FlowRule::new(|context| {
+                            (context.get("udp.word") == Some("allow")).then_some(FlowAction::Allow)
+                        }),
+                        FlowRule::new(|context| {
+                            (context.get("udp.word") == Some("bad"))
+                                .then_some(FlowAction::DropPacket)
+                        }),
+                    ],
+                );
+        assert_eq!(evaluate_udp(&mut policy, 0, b"bad", false), Verdict::Drop);
+        assert_eq!(
+            evaluate_udp(&mut policy, 0, b"good", false),
+            Verdict::Accept
+        );
+        assert_eq!(
+            evaluate_udp(&mut policy, 0, b"allow", false),
+            Verdict::Accept
+        );
+        assert_eq!(evaluate_udp(&mut policy, 0, b"bad", false), Verdict::Accept);
+    }
+
+    #[test]
+    fn udp_stream_port_selection_keeps_reverse_packets() {
+        struct Reply;
+        impl UdpStreamAnalyzer for Reply {
+            fn feed(&mut self, _: &[u8], reverse: bool) -> UdpStreamAnalysis {
+                if reverse {
+                    UdpStreamAnalysis::Drop
+                } else {
+                    UdpStreamAnalysis::Pending
+                }
+            }
+        }
+        let mut policy =
+            Inspect::with_analyzers(crate::ConstantPolicy(Verdict::Accept), Vec::new())
+                .with_udp_streams(
+                    vec![UdpStreamRule::new(
+                        Some(DatagramPort::Destination(53)),
+                        || Box::new(Reply),
+                    )],
+                    Vec::new(),
+                );
+        assert_eq!(
+            evaluate_udp(&mut policy, 0, b"request", false),
+            Verdict::Accept
+        );
+        assert_eq!(evaluate_udp(&mut policy, 0, b"reply", true), Verdict::Drop);
+    }
+
+    #[test]
+    fn udp_terminal_allow_skips_later_datagram_rules() {
+        struct Word;
+        impl DatagramAnalyzer for Word {
+            fn inspect(&self, payload: &[u8]) -> DatagramAnalysis {
+                DatagramAnalysis::Observations(vec![Observation {
+                    field: "udp.word",
+                    value: String::from_utf8_lossy(payload).into_owned(),
+                }])
+            }
+        }
+        let mut policy = Inspect::with_datagrams(
+            crate::ConstantPolicy(Verdict::Accept),
+            Vec::new(),
+            vec![DatagramRule::exact("udp.word", vec!["bad".into()], None, Word).unwrap()],
+            InspectLimits::default(),
+        )
+        .with_udp_streams(
+            Vec::new(),
+            vec![FlowRule::new(|context| {
+                (context.source.port() == 12345).then_some(FlowAction::Allow)
+            })],
+        );
+        assert_eq!(evaluate_udp(&mut policy, 1, b"bad", false), Verdict::Drop);
+        assert_eq!(
+            evaluate_udp(&mut policy, 0, b"allow", false),
+            Verdict::Accept
+        );
+        assert_eq!(evaluate_udp(&mut policy, 0, b"bad", false), Verdict::Accept);
+    }
+
     #[test]
     fn custom_udp_analyzer_respects_destination_port_and_each_datagram() {
         struct PayloadWord;
@@ -818,6 +1201,7 @@ mod tests {
         };
         assert_eq!(evaluate(FlowAction::Allow), Verdict::Accept);
         assert_eq!(evaluate(FlowAction::Block), Verdict::DropFlow);
+        assert_eq!(evaluate(FlowAction::DropPacket), Verdict::DropFlow);
     }
     #[test]
     fn tcp_dns_observations_continue_across_messages() {

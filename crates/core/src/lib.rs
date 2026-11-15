@@ -12,7 +12,7 @@ pub mod tls;
 pub enum Verdict {
     Accept,
     Drop,
-    /// Drop this TCP packet and ask the backend to block both flow directions.
+    /// Drop this packet and block both directions of its transport flow.
     DropFlow,
 }
 

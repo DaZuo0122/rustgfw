@@ -373,9 +373,11 @@ impl PacketIo for NfQueue {
             .ok()
             .filter(|p| p.protocol == rustgfw_core::packet::Protocol::Tcp)
             .map(|p| p.tcp_flags);
+        let is_tcp = tcp_flags.is_some();
         let rst = tcp_flags.is_some_and(|flags| flags & 4 != 0);
         let initial_syn = tcp_flags.is_some_and(|flags| flags & 0x12 == 0x02);
-        let cached_block = conntrack_key.is_some_and(|key| self.blocked_ct.contains_key(&key))
+        let cached_block = is_tcp
+            && conntrack_key.is_some_and(|key| self.blocked_ct.contains_key(&key))
             && !rst
             && !initial_syn;
         let verdict = if cached_block {
@@ -406,8 +408,11 @@ impl PacketIo for NfQueue {
             self.closing_ct.remove(&key);
             self.flush_pending()?;
         }
-        let mark_block =
-            verdict == Verdict::DropFlow && !rst && has_conntrack && self.mark_offload.is_some();
+        let mark_block = is_tcp
+            && verdict == Verdict::DropFlow
+            && !rst
+            && has_conntrack
+            && self.mark_offload.is_some();
         if mark_block {
             message.set_nfmark(message.get_nfmark() | self.mark_offload.unwrap());
         }
@@ -420,6 +425,7 @@ impl PacketIo for NfQueue {
         );
         self.queue.verdict(message)?;
         if verdict == Verdict::DropFlow
+            && is_tcp
             && !close_blocked
             && self.dynamic_table.is_some()
             && let Some(key) = conntrack_key

@@ -1,9 +1,5 @@
 //! DNS question inspection. UDP decisions apply to one datagram, not its socket.
-use crate::{
-    Packet, Policy, Verdict,
-    inspect::{Analysis, Observation, StreamAnalyzer},
-    packet::{self, Protocol},
-};
+use crate::inspect::{Analysis, DatagramAnalysis, DatagramAnalyzer, Observation, StreamAnalyzer};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct InvalidDns;
@@ -90,37 +86,23 @@ pub fn questions(message: &[u8]) -> Result<Vec<String>, InvalidDns> {
     Ok(names)
 }
 
-pub struct DnsPolicy<P> {
-    inner: P,
-    names: Vec<String>,
+fn observations(names: Vec<String>) -> Vec<Observation> {
+    names
+        .into_iter()
+        .map(|value| Observation {
+            field: "dns.qname",
+            value,
+        })
+        .collect()
 }
-impl<P> DnsPolicy<P> {
-    pub fn new(inner: P, names: Vec<String>) -> Self {
-        Self {
-            inner,
-            names: names
-                .into_iter()
-                .map(|n| n.trim_end_matches('.').to_ascii_lowercase())
-                .collect(),
-        }
-    }
-}
-impl<P: Policy> Policy for DnsPolicy<P> {
-    fn evaluate(&mut self, packet: Packet<'_>) -> Verdict {
-        let verdict = self.inner.evaluate(packet);
-        if verdict != Verdict::Accept || self.names.is_empty() {
-            return verdict;
-        }
-        let Ok(t) = packet::parse(packet.bytes) else {
-            return verdict;
-        };
-        if t.protocol != Protocol::Udp || t.destination.port() != 53 {
-            return verdict;
-        }
-        match questions(t.payload) {
-            Ok(names) if names.iter().any(|n| self.names.contains(n)) => Verdict::Drop,
-            Err(_) => Verdict::Drop,
-            _ => verdict,
+
+#[derive(Default)]
+pub struct DnsDatagram;
+impl DatagramAnalyzer for DnsDatagram {
+    fn inspect(&self, payload: &[u8]) -> DatagramAnalysis {
+        match questions(payload) {
+            Ok(names) => DatagramAnalysis::Observations(observations(names)),
+            Err(_) => DatagramAnalysis::Malformed,
         }
     }
 }
@@ -149,15 +131,7 @@ impl StreamAnalyzer for DnsTcp {
         if names.is_empty() {
             Analysis::Pending
         } else {
-            Analysis::Observations(
-                names
-                    .into_iter()
-                    .map(|value| Observation {
-                        field: "dns.qname",
-                        value,
-                    })
-                    .collect(),
-            )
+            Analysis::Observations(observations(names))
         }
     }
 }
@@ -165,6 +139,10 @@ impl StreamAnalyzer for DnsTcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        FlowScope, Packet, Policy, Verdict,
+        inspect::{DatagramPort, DatagramRule, Inspect, InspectLimits},
+    };
     fn query() -> Vec<u8> {
         let mut q = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
         q.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
@@ -200,9 +178,19 @@ mod tests {
     }
     #[test]
     fn udp_does_not_cache_query_verdict() {
-        let mut policy = DnsPolicy::new(
+        let mut policy = Inspect::with_datagrams(
             crate::ConstantPolicy(Verdict::Accept),
-            vec!["example.com".into()],
+            Vec::new(),
+            vec![
+                DatagramRule::exact(
+                    "dns.qname",
+                    vec!["example.com".into()],
+                    Some(DatagramPort::Destination(53)),
+                    DnsDatagram,
+                )
+                .unwrap(),
+            ],
+            InspectLimits::default(),
         );
         let mut p = crate::packet::udp(false);
         p.truncate(28);
@@ -215,11 +203,13 @@ mod tests {
                 bytes,
                 original_len: bytes.len(),
                 checksum_ready: true,
-                scope: crate::FlowScope::default(),
+                scope: FlowScope::default(),
             })
         };
         assert_eq!(run(&p), Verdict::Drop);
         p[41] = b'z';
         assert_eq!(run(&p), Verdict::Accept);
+        p[40] = 0xff;
+        assert_eq!(run(&p), Verdict::Drop);
     }
 }

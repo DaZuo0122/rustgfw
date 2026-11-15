@@ -1,6 +1,6 @@
 use rustgfw_core::{
     Verdict,
-    inspect::{AnalyzerRule, InspectLimits},
+    inspect::{AnalyzerRule, DatagramPort, DatagramRule, InspectLimits},
     rules::{Rule, RulesLimits},
 };
 use std::time::Duration;
@@ -95,8 +95,9 @@ impl Options {
     }
 
     fn into_policy(self) -> impl rustgfw_core::Policy {
-        use rustgfw_core::{dns::DnsPolicy, inspect::Inspect, rules::Rules};
+        use rustgfw_core::{dns::DnsDatagram, inspect::Inspect, rules::Rules};
         let http_header_bytes = self.http_header_bytes;
+        let dns_names = self.dns_names;
         let analyzers = [
             AnalyzerRule::exact("http.host", self.http_hosts, None, move || {
                 Box::new(rustgfw_core::inspect::HttpHost::with_header_limit(
@@ -106,20 +107,26 @@ impl Options {
             AnalyzerRule::exact("tls.sni", self.tls_sni, None, || {
                 Box::<rustgfw_core::tls::TlsSni>::default()
             }),
-            AnalyzerRule::exact("dns.qname", self.dns_names.clone(), Some(53), || {
+            AnalyzerRule::exact("dns.qname", dns_names.clone(), Some(53), || {
                 Box::<rustgfw_core::dns::DnsTcp>::default()
             }),
         ]
         .into_iter()
         .flatten()
         .collect();
-        DnsPolicy::new(
-            Inspect::with_limits(
-                Rules::with_limits(self.rules, self.default, self.rules_limits),
-                analyzers,
-                self.inspect_limits,
-            ),
-            self.dns_names,
+        let datagrams = DatagramRule::exact(
+            "dns.qname",
+            dns_names,
+            Some(DatagramPort::Destination(53)),
+            DnsDatagram,
+        )
+        .into_iter()
+        .collect();
+        Inspect::with_datagrams(
+            Rules::with_limits(self.rules, self.default, self.rules_limits),
+            analyzers,
+            datagrams,
+            self.inspect_limits,
         )
     }
 }

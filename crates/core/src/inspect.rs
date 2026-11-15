@@ -30,6 +30,31 @@ pub trait StreamAnalyzer {
     fn feed(&mut self, bytes: &[u8]) -> Analysis;
 }
 
+pub enum DatagramAnalysis {
+    Observations(Vec<Observation>),
+    Malformed,
+}
+
+pub trait DatagramAnalyzer: Send + Sync {
+    fn inspect(&self, payload: &[u8]) -> DatagramAnalysis;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DatagramPort {
+    Source(u16),
+    Destination(u16),
+    Either(u16),
+}
+impl DatagramPort {
+    fn matches(self, source: u16, destination: u16) -> bool {
+        match self {
+            Self::Source(port) => source == port,
+            Self::Destination(port) => destination == port,
+            Self::Either(port) => source == port || destination == port,
+        }
+    }
+}
+
 /// HTTP/1 initial request headers. Subsequent keep-alive requests need a
 /// transaction parser and are deliberately not advertised by this analyzer.
 pub struct HttpHost {
@@ -145,6 +170,38 @@ pub struct AnalyzerRule {
     pub factory: Box<dyn Fn() -> Box<dyn StreamAnalyzer> + Send + Sync>,
     pub matches: Box<dyn Fn(&Observation) -> bool + Send + Sync>,
 }
+
+pub struct DatagramRule {
+    pub port: Option<DatagramPort>,
+    pub analyzer: Box<dyn DatagramAnalyzer>,
+    pub matches: Box<dyn Fn(&Observation) -> bool + Send + Sync>,
+}
+impl DatagramRule {
+    pub fn exact(
+        field: &'static str,
+        values: Vec<String>,
+        port: Option<DatagramPort>,
+        analyzer: impl DatagramAnalyzer + 'static,
+    ) -> Option<Self> {
+        if values.is_empty() {
+            return None;
+        }
+        let values: Vec<_> = values
+            .into_iter()
+            .map(|value| value.to_ascii_lowercase())
+            .collect();
+        Some(Self {
+            port,
+            analyzer: Box::new(analyzer),
+            matches: Box::new(move |observation| {
+                observation.field == field
+                    && values
+                        .iter()
+                        .any(|value| value.eq_ignore_ascii_case(&observation.value))
+            }),
+        })
+    }
+}
 impl AnalyzerRule {
     pub fn exact(
         field: &'static str,
@@ -193,6 +250,7 @@ impl Default for InspectLimits {
 pub struct Inspect<P> {
     transport: P,
     analyzers: Vec<AnalyzerRule>,
+    datagrams: Vec<DatagramRule>,
     flows: HashMap<Key, Flow>,
     sweep: Instant,
     limits: InspectLimits,
@@ -210,9 +268,18 @@ impl<P> Inspect<P> {
         Self::with_limits(transport, analyzers, InspectLimits::default())
     }
     pub fn with_limits(transport: P, analyzers: Vec<AnalyzerRule>, limits: InspectLimits) -> Self {
+        Self::with_datagrams(transport, analyzers, Vec::new(), limits)
+    }
+    pub fn with_datagrams(
+        transport: P,
+        analyzers: Vec<AnalyzerRule>,
+        datagrams: Vec<DatagramRule>,
+        limits: InspectLimits,
+    ) -> Self {
         Self {
             transport,
             analyzers,
+            datagrams,
             flows: HashMap::new(),
             sweep: Instant::now(),
             limits,
@@ -225,13 +292,33 @@ impl<P> Inspect<P> {
 impl<P: Policy> Policy for Inspect<P> {
     fn evaluate(&mut self, packet: Packet<'_>) -> Verdict {
         let verdict = self.transport.evaluate(packet);
-        if verdict != Verdict::Accept || self.analyzers.is_empty() {
+        if verdict != Verdict::Accept || (self.analyzers.is_empty() && self.datagrams.is_empty()) {
             return verdict;
         }
         let Ok(t) = packet::parse(packet.bytes) else {
             return verdict;
         };
-        if t.protocol != Protocol::Tcp {
+        if t.protocol == Protocol::Udp {
+            for rule in &self.datagrams {
+                if rule
+                    .port
+                    .is_some_and(|port| !port.matches(t.source.port(), t.destination.port()))
+                {
+                    continue;
+                }
+                match rule.analyzer.inspect(t.payload) {
+                    DatagramAnalysis::Malformed => return Verdict::Drop,
+                    DatagramAnalysis::Observations(observations)
+                        if observations.iter().any(|value| (rule.matches)(value)) =>
+                    {
+                        return Verdict::Drop;
+                    }
+                    DatagramAnalysis::Observations(_) => {}
+                }
+            }
+            return verdict;
+        }
+        if self.analyzers.is_empty() {
             return verdict;
         }
         if !self.analyzers.iter().any(|a| {
@@ -343,6 +430,47 @@ impl<P: Policy> Policy for Inspect<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn custom_udp_analyzer_respects_destination_port_and_each_datagram() {
+        struct PayloadWord;
+        impl DatagramAnalyzer for PayloadWord {
+            fn inspect(&self, payload: &[u8]) -> DatagramAnalysis {
+                DatagramAnalysis::Observations(vec![Observation {
+                    field: "custom.udp",
+                    value: String::from_utf8_lossy(payload).into_owned(),
+                }])
+            }
+        }
+        let mut policy = Inspect::with_datagrams(
+            crate::ConstantPolicy(Verdict::Accept),
+            Vec::new(),
+            vec![
+                DatagramRule::exact(
+                    "custom.udp",
+                    vec!["dns".into()],
+                    Some(DatagramPort::Destination(53)),
+                    PayloadWord,
+                )
+                .unwrap(),
+            ],
+            InspectLimits::default(),
+        );
+        let mut bytes = crate::packet::udp(false);
+        let mut evaluate = |bytes: &[u8]| {
+            policy.evaluate(Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        assert_eq!(evaluate(&bytes), Verdict::Drop);
+        bytes[22..24].copy_from_slice(&54u16.to_be_bytes());
+        assert_eq!(evaluate(&bytes), Verdict::Accept);
+        bytes[22..24].copy_from_slice(&53u16.to_be_bytes());
+        bytes[28..].copy_from_slice(b"ok!");
+        assert_eq!(evaluate(&bytes), Verdict::Accept);
+    }
     #[test]
     fn fragmented_header_and_case() {
         let mut a = HttpHost::default();

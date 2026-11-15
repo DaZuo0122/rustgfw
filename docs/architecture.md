@@ -6,7 +6,7 @@
 
 - `rustgfw-core`：平台无关策略与执行接口。内核 packet ID、conntrack ID 和 WinDivert 地址只属于后端，不能作为跨平台流标识；后端通过 `FlowScope` 区分同端点的流量域。
 - `rustgfw-linux`：NFQUEUE 收包和裁决。使用 nfq 的纯 Rust netlink 实现，并在本地依赖分支补充 conntrack zone 解析，暂不需要 C/C++ 桥接。
-- `rustgfw-windows`：通过 WinDivert 2.2 DLL 捕获和重新注入网络层包，原样保留 WinDivert 地址；本机流量由 WFP 静态阻断开头连续的丢弃规则，转发流量由 WinDivert DROP 句柄执行同一静态前缀。已具备 FLOW 事件读取和按 compartment 限定的精确流规则接口；WinDivert 事件缺少 compartment ID，运行时关联与卸载生命周期尚未接通。
+- `rustgfw-windows`：通过 WinDivert 2.2 DLL 捕获和重新注入网络层包，原样保留 WinDivert 地址；本机流量由 WFP 静态阻断开头连续的丢弃规则，转发流量由 WinDivert DROP 句柄执行同一静态前缀。已具备 FLOW 事件读取和按 compartment ID 或本机接口 LUID 限定的精确流规则接口；WinDivert FLOW 事件缺少网络域与接口信息，运行时关联与卸载生命周期尚未接通。
 - 根二进制：按 `nfqueue` 或 `windivert` 选择 I/O 后端，共用默认动作、有序规则和应用层分析器；Linux 的 `nft=input|output|forward` 管理本实例 nft 表。
 
 `PacketIo` 保持内核消息所有权直到裁决；错误上报调用者。`KernelPolicy` 独立描述安装和撤销，由 Linux 的 `NftPolicy` 实现。NFQUEUE 后端默认用 `(ct zone, ct id)` 集合卸载已阻断的 TCP 流；集合项超时 120 秒，持续流量经过 115 秒后在一次 nft 事务中重建该项以续期。逐流 nft 写入和撤销由有序工作线程批量执行，用户态在写入完成前继续阻断该流；退出或销毁事件丢失时先结束当前写入并取消排队批次，再删除或清空本实例的内核策略。已卸载流的 RST 在 nft 包路径删除集合项并放行，conntrack 销毁事件清理用户态状态。可选 `ctmark=` 用预留 bit 在下一 nft hook 写入 conntrack mark，从而避免依赖近似唯一的 32 位 ID。只写入 packet mark 并不等于连接策略生效。Linux 从 NFQUEUE 的 conntrack 属性取得 zone 和 ID，把两者纳入用户态流作用域，并在销毁事件键中保留有方向的 zone；缺少 conntrack 元数据时以无序入出接口对及 packet mark 建立单独作用域，保留跨包检查。若不同 zone 共用这些接口与 mark，内核未提供 zone 元数据，用户态仍无法区分它们。Windows 本机和转发流量目前共用五元组作用域，以保留跨接口的双向流状态；WinDivert 的接口编号不能保证双向相同，跨网络域的重叠五元组仍需可靠身份来源才能隔离。规则版本与方向性 zone 的内核卸载碰撞风险仍待完善。

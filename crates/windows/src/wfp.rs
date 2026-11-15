@@ -13,7 +13,7 @@ use std::{
 use windows_sys::{
     Win32::{
         Foundation::HANDLE,
-        NetworkManagement::WindowsFilteringPlatform as wfp,
+        NetworkManagement::{IpHelper, Ndis, WindowsFilteringPlatform as wfp},
         System::Rpc::{RPC_C_AUTHN_WINNT, RPC_S_UUID_LOCAL_ONLY, UuidCreate},
     },
     core::GUID,
@@ -23,9 +23,36 @@ pub struct LocalFlow {
     pub local: SocketAddr,
     pub remote: SocketAddr,
     pub protocol: Protocol,
-    /// The caller must identify the Windows network compartment. A five-tuple
-    /// alone can refer to different connections in different compartments.
-    pub compartment_id: u32,
+    pub scope: LocalScope,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalScope {
+    Compartment(u32),
+    /// LUID of the interface associated with the local IP address.
+    InterfaceLuid(u64),
+}
+
+impl LocalFlow {
+    pub fn on_interface(
+        local: SocketAddr,
+        remote: SocketAddr,
+        protocol: Protocol,
+        interface_index: u32,
+    ) -> io::Result<Self> {
+        let mut luid = Ndis::NET_LUID_LH::default();
+        // SAFETY: the API writes one NET_LUID into the live output value.
+        let status = unsafe { IpHelper::ConvertInterfaceIndexToLuid(interface_index, &mut luid) };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        Ok(Self {
+            local,
+            remote,
+            protocol,
+            scope: LocalScope::InterfaceLuid(unsafe { luid.Value }),
+        })
+    }
 }
 
 pub struct FlowBlock {
@@ -204,6 +231,7 @@ fn conditions(
     flow: &LocalFlow,
     items: &mut [wfp::FWPM_FILTER_CONDITION0; 6],
     ipv6: &mut [wfp::FWP_BYTE_ARRAY16; 2],
+    interface_luid: &mut u64,
 ) -> io::Result<[GUID; 2]> {
     let layers = match (flow.local.ip(), flow.remote.ip()) {
         (IpAddr::V4(local), IpAddr::V4(remote)) => {
@@ -252,9 +280,19 @@ fn conditions(
         Protocol::Tcp => 6,
         Protocol::Udp => 17,
     };
-    items[5].fieldKey = wfp::FWPM_CONDITION_COMPARTMENT_ID;
-    items[5].conditionValue.r#type = wfp::FWP_UINT32;
-    items[5].conditionValue.Anonymous.uint32 = flow.compartment_id;
+    match flow.scope {
+        LocalScope::Compartment(id) => {
+            items[5].fieldKey = wfp::FWPM_CONDITION_COMPARTMENT_ID;
+            items[5].conditionValue.r#type = wfp::FWP_UINT32;
+            items[5].conditionValue.Anonymous.uint32 = id;
+        }
+        LocalScope::InterfaceLuid(luid) => {
+            *interface_luid = luid;
+            items[5].fieldKey = wfp::FWPM_CONDITION_IP_LOCAL_INTERFACE;
+            items[5].conditionValue.r#type = wfp::FWP_UINT64;
+            items[5].conditionValue.Anonymous.uint64 = interface_luid;
+        }
+    }
     Ok(layers)
 }
 
@@ -265,7 +303,8 @@ impl KernelPolicy for WfpPolicy {
     fn install(&mut self, flow: &LocalFlow) -> io::Result<FlowBlock> {
         let mut items = [wfp::FWPM_FILTER_CONDITION0::default(); 6];
         let mut ipv6 = [wfp::FWP_BYTE_ARRAY16::default(); 2];
-        let layers = conditions(flow, &mut items, &mut ipv6)?;
+        let mut interface_luid = 0;
+        let layers = conditions(flow, &mut items, &mut ipv6, &mut interface_luid)?;
         let name = wide("rustgfw blocked flow");
         let mut filter = wfp::FWPM_FILTER0::default();
         filter.displayData.name = name.as_ptr().cast_mut();
@@ -390,11 +429,12 @@ mod tests {
             local: "192.0.2.1:1234".parse().unwrap(),
             remote: "198.51.100.2:443".parse().unwrap(),
             protocol: Protocol::Tcp,
-            compartment_id: 7,
+            scope: LocalScope::Compartment(7),
         };
         let mut items = [wfp::FWPM_FILTER_CONDITION0::default(); 6];
         let mut ipv6 = [wfp::FWP_BYTE_ARRAY16::default(); 2];
-        let layers = conditions(&flow, &mut items, &mut ipv6).unwrap();
+        let mut interface_luid = 0;
+        let layers = conditions(&flow, &mut items, &mut ipv6, &mut interface_luid).unwrap();
         assert!(same_guid(layers[0], wfp::FWPM_LAYER_ALE_AUTH_CONNECT_V4));
         assert!(same_guid(
             layers[1],
@@ -422,11 +462,12 @@ mod tests {
             local: "[2001:db8::1]:1234".parse().unwrap(),
             remote: "[2001:db8::2]:443".parse().unwrap(),
             protocol: Protocol::Tcp,
-            compartment_id: 9,
+            scope: LocalScope::Compartment(9),
         };
         let mut items = [wfp::FWPM_FILTER_CONDITION0::default(); 6];
         let mut ipv6 = [wfp::FWP_BYTE_ARRAY16::default(); 2];
-        let layers = conditions(&flow, &mut items, &mut ipv6).unwrap();
+        let mut interface_luid = 0;
+        let layers = conditions(&flow, &mut items, &mut ipv6, &mut interface_luid).unwrap();
         assert!(same_guid(layers[0], wfp::FWPM_LAYER_ALE_AUTH_CONNECT_V6));
         assert!(same_guid(
             layers[1],
@@ -451,5 +492,28 @@ mod tests {
             wfp::FWPM_CONDITION_COMPARTMENT_ID
         ));
         unsafe { assert_eq!(items[5].conditionValue.Anonymous.uint32, 9) };
+    }
+
+    #[test]
+    fn exact_flow_can_use_local_interface_luid() {
+        let flow = LocalFlow {
+            local: "192.0.2.1:1234".parse().unwrap(),
+            remote: "198.51.100.2:443".parse().unwrap(),
+            protocol: Protocol::Tcp,
+            scope: LocalScope::InterfaceLuid(0x1234_5678_9abc_def0),
+        };
+        let mut items = [wfp::FWPM_FILTER_CONDITION0::default(); 6];
+        let mut ipv6 = [wfp::FWP_BYTE_ARRAY16::default(); 2];
+        let mut interface_luid = 0;
+        conditions(&flow, &mut items, &mut ipv6, &mut interface_luid).unwrap();
+        assert!(same_guid(
+            items[5].fieldKey,
+            wfp::FWPM_CONDITION_IP_LOCAL_INTERFACE
+        ));
+        assert_eq!(items[5].conditionValue.r#type, wfp::FWP_UINT64);
+        assert_eq!(interface_luid, 0x1234_5678_9abc_def0);
+        unsafe {
+            assert_eq!(*items[5].conditionValue.Anonymous.uint64, interface_luid);
+        }
     }
 }

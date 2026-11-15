@@ -71,8 +71,8 @@ impl Default for Address {
 const _: () = assert!(std::mem::size_of::<Address>() == 80);
 
 fn traffic_scope(_layer: Layer, _address: &Address) -> FlowScope {
-    // WinDivert does not guarantee an interface index for outbound packets.
-    // Keying on it would split the two directions of one local connection.
+    // The two directions may use different interfaces; outbound reinjection
+    // ignores these fields. Interface indices are not a bidirectional key.
     FlowScope::default()
 }
 

@@ -153,6 +153,7 @@ impl Options {
                 || rustgfw_core::http::FIELDS.contains(&field)
                 || rustgfw_core::fet::FIELDS.contains(&field)
                 || rustgfw_core::tls::FIELDS.contains(&field)
+                || rustgfw_core::trojan::FIELDS.contains(&field)
             {
                 protocol == Protocol::Tcp
             } else {
@@ -182,6 +183,9 @@ impl Options {
             .iter()
             .any(|field| needs_tcp_field(field));
         let needs_fet = rustgfw_core::fet::FIELDS
+            .iter()
+            .any(|field| needs_tcp_field(field));
+        let needs_trojan = rustgfw_core::trojan::FIELDS
             .iter()
             .any(|field| needs_tcp_field(field));
         let needs_dns_udp = self.expr_rules.iter().any(|rule| {
@@ -331,6 +335,11 @@ impl Options {
                 needs_fet.then(|| {
                     BidirectionalAnalyzerRule::observing(None, || {
                         Box::new(rustgfw_core::fet::FullyEncryptedTraffic::default())
+                    })
+                }),
+                needs_trojan.then(|| {
+                    BidirectionalAnalyzerRule::observing(None, || {
+                        Box::new(rustgfw_core::trojan::TrojanSequence::default())
                     })
                 }),
             ]
@@ -1178,6 +1187,59 @@ mod tests {
         assert_eq!(evaluate(&[0x0f; 64]), Verdict::DropFlow);
         assert_eq!(evaluate(b"GET / HTTP/1.1\r\n\r\n"), Verdict::Accept);
         assert_eq!(evaluate(&[0x0f; 8]), Verdict::Accept);
+    }
+
+    #[test]
+    fn trojan_sequence_combines_with_fet_expression() {
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"expressions":{
+                "tls_like":"fet.tls_http_prefix == true",
+                "lengths":"fresh.trojan.candidate == true && trojan.seq1 >= 200"
+            },"rules":[{"name":"length candidate","expr":"proto == tcp && dst.port == 443 && @tls_like && @lengths","action":"block"}]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let tcp = |sequence: u32, payload: &[u8], reverse: bool| {
+            let mut bytes = vec![0; 40 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 6;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&443u16.to_be_bytes());
+            bytes[24..28].copy_from_slice(&sequence.to_be_bytes());
+            bytes[32] = 0x50;
+            bytes[33] = 0x18;
+            bytes[40..].copy_from_slice(payload);
+            if reverse {
+                for offset in 0..4 {
+                    bytes.swap(12 + offset, 16 + offset);
+                }
+                bytes.swap(20, 22);
+                bytes.swap(21, 23);
+            }
+            bytes
+        };
+        let mut evaluate = |sequence, payload: &[u8], reverse| {
+            let bytes = tcp(sequence, payload, reverse);
+            policy.evaluate(Packet {
+                bytes: &bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        let mut ccs = vec![20, 3, 3, 0, 1, 1];
+        ccs.resize(200, 0);
+        assert_eq!(evaluate(100, b"\x16\x03\x03", false), Verdict::Accept);
+        assert_eq!(evaluate(103, &ccs, false), Verdict::Accept);
+        assert_eq!(evaluate(500, &[0; 100], true), Verdict::Accept);
+        assert_eq!(evaluate(303, &[0; 100], false), Verdict::Accept);
+        assert_eq!(evaluate(600, &[0; 100], true), Verdict::Accept);
+        assert_eq!(evaluate(403, b"x", false), Verdict::DropFlow);
     }
 
     #[test]

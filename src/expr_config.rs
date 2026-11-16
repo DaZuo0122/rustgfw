@@ -61,6 +61,7 @@ pub fn compile(source: &str) -> Result<Vec<MatchRule>, String> {
                         | "ssh.banner"
                 ) && !rustgfw_core::http::FIELDS.contains(&field)
                     && !rustgfw_core::tls::FIELDS.contains(&field)
+                    && !rustgfw_core::trojan::FIELDS.contains(&field)
                     && !rustgfw_core::fet::FIELDS.contains(&field)
                     && !rustgfw_core::wireguard::FIELDS.contains(&field)
                     && !rustgfw_core::openvpn::FIELDS.contains(&field)

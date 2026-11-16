@@ -150,6 +150,17 @@ mod tests {
         );
         assert!(rules[1].condition.references_field("tls.sni"));
 
+        let presence = compile(
+            r#"{"rules":[{"name":"data","expr":"wireguard.type exists && payload.len >= 32 && dst.port != 53","action":"drop_packet"}]}"#,
+        )
+        .unwrap();
+        assert!(presence[0].condition.references_field("wireguard.type"));
+        assert!(
+            compile(r#"{"rules":[{"name":"bad","expr":"unknown.field exists","action":"block"}]}"#)
+                .unwrap_err()
+                .contains("unknown observation field")
+        );
+
         let cycle = compile(
             r#"{"expressions":{"a":"@b","b":"@a"},"rules":[{"name":"loop","expr":"@a","action":"block"}]}"#,
         )

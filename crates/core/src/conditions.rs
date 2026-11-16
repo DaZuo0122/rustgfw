@@ -114,6 +114,34 @@ pub enum TextOperator {
     StartsWith,
     EndsWith,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumberOperator {
+    Equals,
+    NotEquals,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+}
+impl NumberOperator {
+    fn matches(self, actual: u64, expected: u64) -> bool {
+        match self {
+            Self::Equals => actual == expected,
+            Self::NotEquals => actual != expected,
+            Self::Less => actual < expected,
+            Self::LessEqual => actual <= expected,
+            Self::Greater => actual > expected,
+            Self::GreaterEqual => actual >= expected,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumberField {
+    Port(Endpoint),
+    PayloadLength,
+}
 impl TextOperator {
     fn matches(self, actual: &[u8], expected: &[u8], ignore_ascii_case: bool) -> bool {
         let equals = |part: &[u8]| {
@@ -163,6 +191,11 @@ pub enum Condition {
         endpoint: Endpoint,
         value: u16,
     },
+    Number {
+        field: NumberField,
+        operator: NumberOperator,
+        value: u64,
+    },
     IpIn {
         endpoint: Endpoint,
         network: IpNetwork,
@@ -173,6 +206,10 @@ pub enum Condition {
         value: String,
         fresh: bool,
         operator: TextOperator,
+    },
+    FieldExists {
+        field: String,
+        fresh: bool,
     },
     PayloadMatch {
         value: Vec<u8>,
@@ -187,6 +224,17 @@ impl Condition {
             Self::Not(item) => !item.matches(context),
             Self::Protocol(protocol) => context.protocol == *protocol,
             Self::Port { endpoint, value } => endpoint.address(context).port() == *value,
+            Self::Number {
+                field,
+                operator,
+                value,
+            } => {
+                let actual = match field {
+                    NumberField::Port(endpoint) => u64::from(endpoint.address(context).port()),
+                    NumberField::PayloadLength => context.payload.len() as u64,
+                };
+                operator.matches(actual, *value)
+            }
             Self::IpIn { endpoint, network } => network.contains(endpoint.address(context).ip()),
             Self::Reverse(value) => context.reverse == *value,
             Self::FieldMatch {
@@ -202,6 +250,12 @@ impl Condition {
                         })
                     })
             }
+            Self::FieldExists { field, fresh } => {
+                (!fresh || context.updated(field))
+                    && context
+                        .values(field)
+                        .is_some_and(|values| !values.is_empty())
+            }
             Self::PayloadMatch { value, operator } => {
                 operator.matches(context.payload, value, false)
             }
@@ -214,7 +268,9 @@ impl Condition {
                 items.iter().any(|item| item.references_field(field))
             }
             Self::Not(item) => item.references_field(field),
-            Self::FieldMatch { field: name, .. } => name == field,
+            Self::FieldMatch { field: name, .. } | Self::FieldExists { field: name, .. } => {
+                name == field
+            }
             _ => false,
         }
     }
@@ -233,7 +289,7 @@ impl Condition {
                 }
             }
             Self::Not(item) => item.collect_fields(fields),
-            Self::FieldMatch { field, .. } => fields.push(field),
+            Self::FieldMatch { field, .. } | Self::FieldExists { field, .. } => fields.push(field),
             _ => {}
         }
     }
@@ -308,12 +364,25 @@ impl Condition {
                     address.port() == *value
                 })
             }
+            Self::Number {
+                field: NumberField::Port(endpoint),
+                operator,
+                value,
+            } if let Some((source, destination)) = endpoints => {
+                endpoint_possibilities(*endpoint, source, destination, |address| {
+                    operator.matches(u64::from(address.port()), *value)
+                })
+            }
             Self::IpIn { endpoint, network } if let Some((source, destination)) = endpoints => {
                 endpoint_possibilities(*endpoint, source, destination, |address| {
                     network.contains(address.ip())
                 })
             }
-            Self::FieldMatch { field, .. } if !field_possible(field, protocol) => (true, false),
+            Self::FieldMatch { field, .. } | Self::FieldExists { field, .. }
+                if !field_possible(field, protocol) =>
+            {
+                (true, false)
+            }
             _ => (true, true),
         }
     }
@@ -326,6 +395,11 @@ enum Token {
     Or,
     Not,
     Eq,
+    NotEq,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
     Open,
     Close,
 }
@@ -345,9 +419,31 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 tokens.push(Token::Close);
                 index += 1;
             }
+            b'!' if bytes.get(index + 1) == Some(&b'=') => {
+                tokens.push(Token::NotEq);
+                index += 2;
+            }
             b'!' => {
                 tokens.push(Token::Not);
                 index += 1;
+            }
+            b'<' => {
+                if bytes.get(index + 1) == Some(&b'=') {
+                    tokens.push(Token::LessEqual);
+                    index += 2;
+                } else {
+                    tokens.push(Token::Less);
+                    index += 1;
+                }
+            }
+            b'>' => {
+                if bytes.get(index + 1) == Some(&b'=') {
+                    tokens.push(Token::GreaterEqual);
+                    index += 2;
+                } else {
+                    tokens.push(Token::Greater);
+                    index += 1;
+                }
             }
             b'&' if bytes.get(index + 1) == Some(&b'&') => {
                 tokens.push(Token::And);
@@ -415,6 +511,8 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                             | b'&'
                             | b'|'
                             | b'='
+                            | b'<'
+                            | b'>'
                             | b'"'
                     )
                 {
@@ -505,10 +603,47 @@ impl Parser<'_> {
     fn comparison(&mut self) -> Result<Condition, String> {
         let field = self.word()?;
         let operator = self.take().ok_or("missing comparison operator")?;
+        if operator == Token::Word("exists".into()) {
+            if matches!(
+                field.as_str(),
+                "proto"
+                    | "reverse"
+                    | "payload"
+                    | "payload_hex"
+                    | "payload.len"
+                    | "src.port"
+                    | "dst.port"
+                    | "origin.port"
+                    | "target.port"
+                    | "src.ip"
+                    | "dst.ip"
+                    | "origin.ip"
+                    | "target.ip"
+            ) {
+                return Err(format!("unsupported comparison for {field}"));
+            }
+            let (fresh, field) = field
+                .strip_prefix("fresh.")
+                .map_or((false, field.as_str()), |name| (true, name));
+            return Ok(Condition::FieldExists {
+                field: field.to_owned(),
+                fresh,
+            });
+        }
         let value = self.word()?;
-        let equality = operator == Token::Eq;
+        let equality = matches!(operator, Token::Eq | Token::NotEq);
+        let negate = operator == Token::NotEq;
+        let number_operator = match operator {
+            Token::Eq => Some(NumberOperator::Equals),
+            Token::NotEq => Some(NumberOperator::NotEquals),
+            Token::Less => Some(NumberOperator::Less),
+            Token::LessEqual => Some(NumberOperator::LessEqual),
+            Token::Greater => Some(NumberOperator::Greater),
+            Token::GreaterEqual => Some(NumberOperator::GreaterEqual),
+            _ => None,
+        };
         let text_operator = match &operator {
-            Token::Eq => Some(TextOperator::Equals),
+            Token::Eq | Token::NotEq => Some(TextOperator::Equals),
             Token::Word(word) => match word.as_str() {
                 "contains" => Some(TextOperator::Contains),
                 "starts_with" => Some(TextOperator::StartsWith),
@@ -517,7 +652,7 @@ impl Parser<'_> {
             },
             _ => None,
         };
-        match field.as_str() {
+        let condition = match field.as_str() {
             "proto" if equality => match value.as_str() {
                 "tcp" => Ok(Condition::Protocol(Protocol::Tcp)),
                 "udp" => Ok(Condition::Protocol(Protocol::Udp)),
@@ -536,10 +671,31 @@ impl Parser<'_> {
                 value: parse_hex_bytes(&value)?,
                 operator,
             }),
-            "src.port" | "dst.port" | "origin.port" | "target.port" if equality => {
+            "src.port" | "dst.port" | "origin.port" | "target.port" if operator == Token::Eq => {
                 let endpoint = parse_endpoint(field.split('.').next().unwrap());
                 let value = value.parse().map_err(|_| format!("invalid port {value}"))?;
                 Ok(Condition::Port { endpoint, value })
+            }
+            "src.port" | "dst.port" | "origin.port" | "target.port"
+                if let Some(operator) = number_operator =>
+            {
+                let endpoint = parse_endpoint(field.split('.').next().unwrap());
+                let value = value.parse().map_err(|_| format!("invalid port {value}"))?;
+                Ok(Condition::Number {
+                    field: NumberField::Port(endpoint),
+                    operator,
+                    value,
+                })
+            }
+            "payload.len" if let Some(operator) = number_operator => {
+                let value = value
+                    .parse()
+                    .map_err(|_| format!("invalid payload length {value}"))?;
+                Ok(Condition::Number {
+                    field: NumberField::PayloadLength,
+                    operator,
+                    value,
+                })
             }
             "src.ip" | "dst.ip" | "origin.ip" | "target.ip"
                 if equality || operator == Token::Word("in".into()) =>
@@ -559,10 +715,9 @@ impl Parser<'_> {
                     network: cidr.parse()?,
                 })
             }
-            "proto" | "reverse" | "payload" | "payload_hex" | "src.port" | "dst.port"
-            | "origin.port" | "target.port" | "src.ip" | "dst.ip" | "origin.ip" | "target.ip" => {
-                Err(format!("unsupported comparison for {field}"))
-            }
+            "proto" | "reverse" | "payload" | "payload_hex" | "payload.len" | "src.port"
+            | "dst.port" | "origin.port" | "target.port" | "src.ip" | "dst.ip" | "origin.ip"
+            | "target.ip" => Err(format!("unsupported comparison for {field}")),
             _ if let Some(operator) = text_operator => {
                 let (fresh, field) = field
                     .strip_prefix("fresh.")
@@ -575,7 +730,14 @@ impl Parser<'_> {
                 })
             }
             _ => Err(format!("unsupported comparison for {field}")),
-        }
+        }?;
+        Ok(
+            if negate && !matches!(condition, Condition::Number { .. }) {
+                Condition::Not(Box::new(condition))
+            } else {
+                condition
+            },
+        )
     }
 }
 
@@ -712,6 +874,10 @@ mod tests {
         assert!(mixed.can_match_protocol(Protocol::Udp, &field_possible));
         let absent_field = parse_expression("!(http.host == blocked.test)").unwrap();
         assert!(absent_field.can_match_protocol(Protocol::Udp, &field_possible));
+        let present_field = parse_expression("http.host exists").unwrap();
+        assert!(present_field.references_field("http.host"));
+        assert!(present_field.can_match_protocol(Protocol::Tcp, &field_possible));
+        assert!(!present_field.can_match_protocol(Protocol::Udp, &field_possible));
     }
 
     #[test]
@@ -733,6 +899,28 @@ mod tests {
         assert!(!possible("origin.port == 80"));
         assert!(!possible("!(target.port == 80)"));
         assert!(!possible("proto == udp"));
+        assert!(possible("src.port >= 80 && src.port < 2000"));
+        assert!(!possible("dst.port > 60000"));
+        assert!(!possible("origin.port != 1234"));
+        assert!(possible("payload.len > 100"));
+    }
+
+    #[test]
+    fn presence_and_numeric_comparisons_validate_operands() {
+        assert_eq!(
+            parse_expression("fresh.wireguard.type exists").unwrap(),
+            Condition::FieldExists {
+                field: "wireguard.type".into(),
+                fresh: true,
+            }
+        );
+        assert!(parse_expression("payload.len >= 32").is_ok());
+        assert!(parse_expression("src.port != 53").is_ok());
+        assert!(parse_expression("src.port > many").is_err());
+        assert!(parse_expression("payload.len > -1").is_err());
+        assert!(parse_expression("proto exists").is_err());
+        assert!(parse_expression("payload.len exists").is_err());
+        assert!(parse_expression("src.ip > 10.0.0.1").is_err());
     }
 
     #[test]

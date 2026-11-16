@@ -1058,6 +1058,56 @@ mod tests {
         assert!(parse_expression("payload_hex == 0x€€").is_err());
     }
 
+    #[test]
+    fn expression_numeric_and_presence_conditions_use_current_packet_and_facts() {
+        use crate::conditions::parse_expression;
+
+        let source = "192.0.2.1:1234".parse().unwrap();
+        let destination = "198.51.100.2:51820".parse().unwrap();
+        let facts = HashMap::from([("wireguard.type", vec!["data".into()])]);
+        let context = FlowContext {
+            protocol: Protocol::Udp,
+            scope: FlowScope::default(),
+            source,
+            destination,
+            origin: source,
+            target: destination,
+            reverse: false,
+            payload: &[0; 32],
+            facts: &facts,
+            updated: &["wireguard.type"],
+        };
+        for expression in [
+            "dst.port >= 51820",
+            "src.port < 2000",
+            "src.port != 443",
+            "payload.len == 32",
+            "payload.len > 16 && payload.len <= 32",
+            "wireguard.type exists",
+            "fresh.wireguard.type exists",
+            "proto != tcp",
+            "wireguard.type != initiation",
+        ] {
+            assert!(
+                parse_expression(expression).unwrap().matches(&context),
+                "{expression}"
+            );
+        }
+        for expression in [
+            "dst.port > 51820",
+            "src.port >= 2000",
+            "payload.len < 32",
+            "dns.qname exists",
+            "fresh.dns.qname exists",
+            "wireguard.type != data",
+        ] {
+            assert!(
+                !parse_expression(expression).unwrap().matches(&context),
+                "{expression}"
+            );
+        }
+    }
+
     fn udp(payload: &[u8], reverse: bool) -> Vec<u8> {
         let mut packet = crate::packet::udp(reverse);
         packet.truncate(28);

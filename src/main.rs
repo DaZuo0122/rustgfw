@@ -152,13 +152,12 @@ impl Options {
             } else if rustgfw_core::socks::FIELDS.contains(&field)
                 || rustgfw_core::http::FIELDS.contains(&field)
                 || rustgfw_core::fet::FIELDS.contains(&field)
+                || rustgfw_core::tls::FIELDS.contains(&field)
             {
                 protocol == Protocol::Tcp
             } else {
-                !matches!(
-                    field,
-                    "tls.sni" | "tls.alpn" | "ssh.protocol" | "ssh.software" | "ssh.banner"
-                ) || protocol == Protocol::Tcp
+                !matches!(field, "ssh.protocol" | "ssh.software" | "ssh.banner")
+                    || protocol == Protocol::Tcp
             }
         };
         let eligible = |rule: &MatchRule, protocol| {
@@ -172,7 +171,9 @@ impl Options {
         let needs_http = rustgfw_core::http::FIELDS
             .iter()
             .any(|field| needs_tcp_field(field));
-        let needs_tls = ["tls.sni", "tls.alpn"].into_iter().any(needs_tcp_field);
+        let needs_tls = rustgfw_core::tls::FIELDS
+            .iter()
+            .any(|field| needs_tcp_field(field));
         let needs_dns_tcp = needs_tcp_field("dns.qname");
         let needs_ssh = ["ssh.protocol", "ssh.software", "ssh.banner"]
             .into_iter()
@@ -242,14 +243,14 @@ impl Options {
             if self.tls_sni.is_empty() {
                 needs_tls.then(|| {
                     AnalyzerRule::observing(None, move || {
-                        Box::new(rustgfw_core::tls::TlsClientHello::with_buffer_limit(
+                        Box::new(rustgfw_core::tls::TlsHello::with_buffer_limit(
                             tls_buffer_bytes,
                         ))
                     })
                 })
             } else {
                 AnalyzerRule::exact("tls.sni", self.tls_sni, None, move || {
-                    Box::new(rustgfw_core::tls::TlsClientHello::with_buffer_limit(
+                    Box::new(rustgfw_core::tls::TlsHello::with_buffer_limit(
                         tls_buffer_bytes,
                     ))
                 })
@@ -1031,6 +1032,66 @@ mod tests {
             }),
             Verdict::DropFlow
         );
+    }
+
+    #[test]
+    fn tls_expression_combines_client_and_server_hello() {
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"selected TLS","expr":"proto == tcp && tls.alpn == h2 && fresh.tls.server_version == 0x0304 && tls.server_cipher == 0x1301","action":"block"}]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let record = |kind: u8, body: Vec<u8>| {
+            let mut handshake = vec![kind, 0, 0, body.len() as u8];
+            handshake.extend(body);
+            let mut record = vec![22, 3, 1];
+            record.extend((handshake.len() as u16).to_be_bytes());
+            record.extend(handshake);
+            record
+        };
+        let tcp = |sequence: u32, payload: &[u8], reverse: bool| {
+            let mut bytes = vec![0; 40 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 6;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&443u16.to_be_bytes());
+            bytes[24..28].copy_from_slice(&sequence.to_be_bytes());
+            bytes[32] = 0x50;
+            bytes[33] = 0x18;
+            bytes[40..].copy_from_slice(payload);
+            if reverse {
+                for offset in 0..4 {
+                    bytes.swap(12 + offset, 16 + offset);
+                }
+                bytes.swap(20, 22);
+                bytes.swap(21, 23);
+            }
+            bytes
+        };
+        let evaluate = |policy: &mut dyn Policy, bytes: &[u8]| {
+            policy.evaluate(Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        let mut client = vec![3, 3];
+        client.extend([0; 32]);
+        client.extend([0, 0, 2, 0x13, 1, 1, 0]);
+        client.extend([0, 9, 0, 16, 0, 5, 0, 3, 2, b'h', b'2']);
+        let mut server = vec![3, 3];
+        server.extend([0; 32]);
+        server.extend([0, 0x13, 1, 0, 0, 6, 0, 43, 0, 2, 3, 4]);
+        let request = tcp(100, &record(1, client), false);
+        let response = tcp(500, &record(2, server), true);
+        assert_eq!(evaluate(&mut policy, &request), Verdict::Accept);
+        assert_eq!(evaluate(&mut policy, &response), Verdict::DropFlow);
     }
 
     #[test]

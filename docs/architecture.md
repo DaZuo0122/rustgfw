@@ -27,7 +27,7 @@ Linux NFQUEUE 的 accept 表示恢复 netfilter 遍历，并不绕过其他链�
 
 DNS：`rustgfw nfqueue 100 accept dns-name=blocked.test` 匹配标准查询的 IN 类问题，域名大小写不敏感且配置可带尾点。UDP 目的端口 53 按数据报分析，不缓存域名裁决，因此同一 socket 的后续允许查询不受先前阻断影响。TCP 任一端口 53 启用长度前缀解析，支持连续消息、TCP 分段和压缩域名；命中后阻断整个 TCP 流。UDP 畸形查询丢弃，TCP 畸形消息或超出 `dns-message-bytes` 的消息结束分析并沿用传输层结果。尚不支持 DNS 修改、DoH/DoT、非 53 端口 DNS 自动识别。
 
-TLS：`rustgfw nfqueue 100 accept tls-sni=blocked.test` 检查明文 ClientHello SNI，表达式还可匹配客户端提供的 `tls.alpn`。支持 TCP 分段和 TLS handshake record 分段，可同时指定 `http-host=`。SNI 精确匹配且忽略 ASCII 大小写；不解密 ECH 内层域名，QUIC 使用单独的 Initial 分析器。ClientHello 声明的正文长度上限 64 KiB，暂存字节预算由 `tls-buffer-bytes` 控制；超预算或无法识别时结束该分析器并沿用传输层裁决。
+TLS：`rustgfw nfqueue 100 accept tls-sni=blocked.test` 检查明文 ClientHello SNI，表达式还可匹配客户端提供的 `tls.alpn` 及反向 ServerHello 的版本、密码套件和可见 ALPN。支持 TCP 分段和 TLS handshake record 分段，可同时指定 `http-host=`。SNI 精确匹配且忽略 ASCII 大小写；不解密 ECH 内层域名或 TLS 1.3 的服务端 ALPN，QUIC 使用单独的 Initial 分析器。首个 HelloRetryRequest 不作为最终协商结果报告，当前也不会继续跟踪后续 ServerHello。Hello 声明的正文长度上限 64 KiB，暂存字节预算由 `tls-buffer-bytes` 控制；超预算或无法识别时结束该分析器并沿用传输层裁决。
 
 SSH：表达式可用 `ssh.protocol`、`ssh.software`、`ssh.banner` 匹配 TCP 任一方向的首次 SSH 标识行，例如 `ssh.software contains "OpenSSH"`。分析器支持分段标识行和此前的提示行，不限定端口；单方向默认读取最多 1024 字节，可用 `ssh-banner-bytes=N` 调整。无法识别或超预算时结束该方向的分析，不解析后续加密握手。
 

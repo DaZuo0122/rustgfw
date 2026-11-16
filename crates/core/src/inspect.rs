@@ -930,6 +930,7 @@ mod tests {
             ("http.method", vec!["GET".into()]),
             ("http.target", vec!["/Admin".into()]),
             ("tls.alpn", vec!["h2".into()]),
+            ("tls.server_alpn", vec!["h2".into()]),
         ]);
         let context = FlowContext {
             protocol: Protocol::Tcp,
@@ -950,6 +951,7 @@ mod tests {
             "http.method == GET",
             "http.target == /Admin",
             "tls.alpn == h2",
+            "tls.server_alpn == h2",
             "payload contains BYTES",
             "payload starts_with prefix",
             "payload ends_with suffix",
@@ -969,6 +971,7 @@ mod tests {
             "http.method == get",
             "http.target == /admin",
             "tls.alpn == H2",
+            "tls.server_alpn == H2",
             "fresh.dns.qname contains example",
         ] {
             assert!(

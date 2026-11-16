@@ -254,7 +254,11 @@ impl Condition {
                         values.iter().any(|actual| {
                             let insensitive = !matches!(
                                 field.as_str(),
-                                "http.method" | "http.target" | "tls.alpn" | "quic.alpn"
+                                "http.method"
+                                    | "http.target"
+                                    | "tls.alpn"
+                                    | "tls.server_alpn"
+                                    | "quic.alpn"
                             );
                             operator.matches(actual.as_bytes(), value.as_bytes(), insensitive)
                         })

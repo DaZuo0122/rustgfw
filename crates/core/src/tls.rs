@@ -1,18 +1,32 @@
-//! Plaintext TLS ClientHello inspection; ECH inner names are not visible.
+//! Plaintext TLS ClientHello and ServerHello inspection.
 use crate::inspect::{Analysis, Observation, StreamAnalyzer};
 
-pub struct TlsClientHello {
+pub const FIELDS: &[&str] = &[
+    "tls.sni",
+    "tls.alpn",
+    "tls.server_version",
+    "tls.server_cipher",
+    "tls.server_alpn",
+];
+const HELLO_RETRY_RANDOM: [u8; 32] = [
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+];
+
+pub struct TlsHello {
     records: Vec<u8>,
     handshake: Vec<u8>,
     finished: bool,
     buffer_limit: usize,
 }
-impl Default for TlsClientHello {
+pub type TlsClientHello = TlsHello;
+
+impl Default for TlsHello {
     fn default() -> Self {
         Self::with_buffer_limit(131072)
     }
 }
-impl TlsClientHello {
+impl TlsHello {
     pub fn with_buffer_limit(buffer_limit: usize) -> Self {
         Self {
             records: Vec::new(),
@@ -22,7 +36,7 @@ impl TlsClientHello {
         }
     }
 }
-impl StreamAnalyzer for TlsClientHello {
+impl StreamAnalyzer for TlsHello {
     fn feed(&mut self, bytes: &[u8]) -> Analysis {
         if self.finished {
             return Analysis::Finished;
@@ -55,7 +69,7 @@ impl StreamAnalyzer for TlsClientHello {
             }
             let h = &self.handshake;
             let length = (usize::from(h[1]) << 16) | (usize::from(h[2]) << 8) | usize::from(h[3]);
-            if h[0] != 1 || length > 65536 {
+            if !matches!(h[0], 1 | 2) || length > 65536 {
                 self.finished = true;
                 return Analysis::Finished;
             }
@@ -63,20 +77,40 @@ impl StreamAnalyzer for TlsClientHello {
                 continue;
             }
             self.finished = true;
-            let Some(hello) = client_hello_metadata(&h[4..4 + length]) else {
-                return Analysis::Finished;
-            };
             let mut observations = Vec::new();
-            if let Some(value) = hello.sni {
-                observations.push(Observation {
-                    field: "tls.sni",
+            if h[0] == 1 {
+                let Some(hello) = client_hello_metadata(&h[4..4 + length]) else {
+                    return Analysis::Finished;
+                };
+                if let Some(value) = hello.sni {
+                    observations.push(Observation {
+                        field: "tls.sni",
+                        value,
+                    });
+                }
+                observations.extend(hello.alpn.into_iter().map(|value| Observation {
+                    field: "tls.alpn",
                     value,
+                }));
+            } else {
+                let Some(hello) = server_hello_metadata(&h[4..4 + length]) else {
+                    return Analysis::Finished;
+                };
+                observations.push(Observation {
+                    field: "tls.server_version",
+                    value: format!("0x{:04x}", hello.version),
                 });
+                observations.push(Observation {
+                    field: "tls.server_cipher",
+                    value: format!("0x{:04x}", hello.cipher),
+                });
+                if let Some(value) = hello.alpn {
+                    observations.push(Observation {
+                        field: "tls.server_alpn",
+                        value,
+                    });
+                }
             }
-            observations.extend(hello.alpn.into_iter().map(|value| Observation {
-                field: "tls.alpn",
-                value,
-            }));
             return if observations.is_empty() {
                 Analysis::Finished
             } else {
@@ -186,6 +220,80 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
     Some(ClientHelloMetadata { sni: name, alpn })
 }
 
+struct ServerHelloMetadata {
+    version: u16,
+    cipher: u16,
+    alpn: Option<String>,
+}
+
+fn server_hello_metadata(body: &[u8]) -> Option<ServerHelloMetadata> {
+    let mut c = Cursor(body);
+    let legacy_version = c.word()? as u16;
+    let random = c.take(32)?;
+    if random == HELLO_RETRY_RANDOM {
+        return None;
+    }
+    let session_len = c.byte()?;
+    if session_len > 32 {
+        return None;
+    }
+    c.take(session_len)?;
+    let cipher = c.word()? as u16;
+    c.byte()?; // Legacy compression method.
+    let mut version = legacy_version;
+    let mut alpn = None;
+    let mut seen_version = false;
+    let mut seen_alpn = false;
+    if !c.0.is_empty() {
+        let mut extensions = Cursor(c.vector()?);
+        if !c.0.is_empty() {
+            return None;
+        }
+        while !extensions.0.is_empty() {
+            let kind = extensions.word()?;
+            let data = extensions.vector()?;
+            match kind {
+                43 => {
+                    if seen_version || data.len() != 2 {
+                        return None;
+                    }
+                    seen_version = true;
+                    version = u16::from_be_bytes(data.try_into().ok()?);
+                }
+                16 => {
+                    if seen_alpn {
+                        return None;
+                    }
+                    seen_alpn = true;
+                    let mut ext = Cursor(data);
+                    let mut protocols = Cursor(ext.vector()?);
+                    if !ext.0.is_empty() {
+                        return None;
+                    }
+                    let len = protocols.byte()?;
+                    let bytes = protocols.take(len)?;
+                    if bytes.is_empty() || !protocols.0.is_empty() {
+                        return None;
+                    }
+                    if bytes.iter().all(u8::is_ascii_graphic) {
+                        alpn = Some(std::str::from_utf8(bytes).ok()?.to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if version == 0x0304 {
+        // TLS 1.3 sends its selected ALPN in encrypted EncryptedExtensions.
+        alpn = None;
+    }
+    Some(ServerHelloMetadata {
+        version,
+        cipher,
+        alpn,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +334,25 @@ mod tests {
         body.extend(vector(&extensions));
         let len = body.len();
         let mut handshake = vec![1, (len >> 16) as u8, (len >> 8) as u8, len as u8];
+        handshake.extend(body);
+        handshake
+    }
+    fn server_hello(tls13: bool, retry: bool) -> Vec<u8> {
+        let mut body = vec![3, 3];
+        body.extend(if retry { HELLO_RETRY_RANDOM } else { [0; 32] });
+        body.push(0);
+        body.extend(if tls13 { [0x13, 1] } else { [0xc0, 0x2f] });
+        body.push(0);
+        let mut extensions = Vec::new();
+        if tls13 {
+            extensions.extend([0, 43, 0, 2, 3, 4]);
+        } else {
+            extensions.extend([0, 16]);
+            extensions.extend(vector(&vector(&[2, b'h', b'2'])));
+        }
+        body.extend(vector(&extensions));
+        let len = body.len();
+        let mut handshake = vec![2, (len >> 16) as u8, (len >> 8) as u8, len as u8];
         handshake.extend(body);
         handshake
     }
@@ -306,5 +433,48 @@ mod tests {
                 .collect();
             assert_eq!(alpn, ["h2", "http/1.1"]);
         }
+    }
+    #[test]
+    fn server_hello_reports_selected_version_cipher_and_visible_alpn() {
+        for tls13 in [false, true] {
+            let hello = server_hello(tls13, false);
+            let split = hello.len() / 2;
+            let mut wire = record(&hello[..split]);
+            wire.extend(record(&hello[split..]));
+            let mut analyzer = TlsHello::default();
+            let mut result = Analysis::Pending;
+            for byte in wire {
+                result = analyzer.feed(&[byte]);
+            }
+            let Analysis::FinalObservations(values) = result else {
+                panic!("expected ServerHello observations");
+            };
+            let field = |name| {
+                values
+                    .iter()
+                    .find(|item| item.field == name)
+                    .map(|item| item.value.as_str())
+            };
+            assert_eq!(
+                field("tls.server_version"),
+                Some(if tls13 { "0x0304" } else { "0x0303" })
+            );
+            assert_eq!(
+                field("tls.server_cipher"),
+                Some(if tls13 { "0x1301" } else { "0xc02f" })
+            );
+            assert_eq!(
+                field("tls.server_alpn"),
+                if tls13 { None } else { Some("h2") }
+            );
+        }
+    }
+    #[test]
+    fn hello_retry_request_is_not_a_final_server_selection() {
+        let mut analyzer = TlsHello::default();
+        assert_eq!(
+            analyzer.feed(&record(&server_hello(true, true))),
+            Analysis::Finished
+        );
     }
 }

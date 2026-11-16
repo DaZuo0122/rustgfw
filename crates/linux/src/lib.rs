@@ -346,22 +346,6 @@ impl PacketIo for NfQueue {
         let bytes = message.get_payload();
         let conntrack = message.get_conntrack();
         let has_conntrack = conntrack.is_some();
-        let scope = conntrack.map_or_else(
-            || {
-                untracked_scope(
-                    message.get_indev(),
-                    message.get_outdev(),
-                    message.get_nfmark(),
-                )
-            },
-            |ct| {
-                conntrack::ConntrackKey {
-                    id: ct.get_id(),
-                    zone: ct.get_zone(),
-                }
-                .scope()
-            },
-        );
         let conntrack_key =
             conntrack
                 .filter(|ct| ct.get_id() != 0)
@@ -369,6 +353,16 @@ impl PacketIo for NfQueue {
                     id: ct.get_id(),
                     zone: ct.get_zone(),
                 });
+        let scope = conntrack_key.map_or_else(
+            || {
+                untracked_scope(
+                    message.get_indev(),
+                    message.get_outdev(),
+                    message.get_nfmark(),
+                )
+            },
+            conntrack::ConntrackKey::scope,
+        );
         let tcp_flags = rustgfw_core::packet::parse(bytes)
             .ok()
             .filter(|p| p.protocol == rustgfw_core::packet::Protocol::Tcp)

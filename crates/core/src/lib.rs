@@ -6,6 +6,7 @@ pub mod inspect;
 pub mod offload;
 pub mod openvpn;
 pub mod packet;
+pub mod quic;
 pub mod rules;
 pub mod socks;
 pub mod ssh;

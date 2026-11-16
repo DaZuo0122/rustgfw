@@ -93,7 +93,7 @@ impl<'a> Cursor<'a> {
         self.take(len)
     }
 }
-fn client_hello_name(body: &[u8]) -> Option<String> {
+pub(crate) fn client_hello_name(body: &[u8]) -> Option<String> {
     let mut c = Cursor(body);
     c.take(34)?;
     let session = c.byte()?;

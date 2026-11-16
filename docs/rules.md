@@ -39,6 +39,11 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
       "name": "block SOCKS proxy target",
       "expr": "proto == tcp && socks.command == connect && socks.target_host == blocked.test",
       "action": "block"
+    },
+    {
+      "name": "drop QUIC Initial by SNI",
+      "expr": "proto == udp && fresh.quic.sni == blocked.test",
+      "action": "drop_packet"
     }
   ]
 }
@@ -65,6 +70,7 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 | `openvpn.stage`、`openvpn.client_reset`、`openvpn.server_reset` | `openvpn.stage == handshake && openvpn.server_reset == 8` | TCP/UDP OpenVPN 双向重置握手；数值字段按十进制字符串比较 |
 | `openvpn.opcode`、`openvpn.tx_packets`、`openvpn.rx_packets` | `openvpn.stage == data && fresh.openvpn.opcode == 6` | 仅 UDP：当前包的 opcode 与握手后的双向包数 |
 | `socks.version`、`socks.command`、`socks.target_type`、`socks.target_host`、`socks.target_port`、`socks.auth` | `socks.target_host ends_with ".example.com"` | TCP SOCKS4/4a/5 客户端请求；命令为 `connect`、`bind` 或 `udp_associate`，认证类型为 `none` 或 `userpass` |
+| `quic.version`、`quic.sni` | `fresh.quic.sni == blocked.test` | UDP QUIC v1/v2 客户端 Initial 中的 TLS ClientHello；版本值为 `1` 或 `2` |
 | `fresh.` 加字段名 | `fresh.dns.qname == "blocked.test"` | 该字段必须由当前包更新 |
 | 观察字段加 `exists` | `fresh.wireguard.type exists` | 字段至少有一个值；`fresh.` 还要求当前包更新 |
 
@@ -77,6 +83,8 @@ WireGuard 分析器按需处理任意 UDP 端口，识别握手发起、握手�
 OpenVPN TCP/UDP 分析器按需处理任意端口。先看到首方向的客户端 hard reset，再看到反方向的服务端 hard reset，才报告 `openvpn.stage == handshake`。TCP 分析器读取双字节长度前缀，支持分段握手帧，确认后结束分析。UDP 后续合法控制或数据 opcode 报告 `stage == data` 并更新双向计数；`openvpn.opcode` 只描述当前数据报。分析器检查头部 opcode、首轮 key ID 与最短长度，不解密或验证会话。
 
 SOCKS 分析器按需检查任意 TCP 端口的首方向请求，支持 SOCKS4、SOCKS4a 域名及 SOCKS5 的 IPv4、IPv6、域名目标和用户名密码认证帧。请求完成时发布目标字段，不解析服务器应答；不会把用户名或密码放入观察字段。SOCKS4a 的版本值为 `4a`，目标端口目前按十进制字符串比较。
+
+QUIC 分析器按需检查任意 UDP 端口的 v1/v2 客户端 Initial，解开公开的 Initial 密钥保护，按 CRYPTO 偏移重组分段 TLS ClientHello，再提取可见 SNI。它在完整握手消息到达后报告一次 `quic.version`，有可见 SNI 时同时报告 `quic.sni`；每条流最多检查八个候选数据报。ECH 内层名称、非 v1/v2 版本及 Retry 后更换连接 ID 的握手暂不识别；`fresh.` 可让单包动作仅作用于报告观察值的那个包。实现依据：[RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html)、[RFC 9369](https://www.rfc-editor.org/rfc/rfc9369.html)。
 
 UDP 分析器拒绝数据报时，该包直接丢弃，本次不再用流内旧观察值执行表达式规则；后续数据报仍可继续检查。
 

@@ -2,3 +2,6 @@
 name = "rustgfw-core"
 version = "0.1.0"
 edition = "2024"
+
+[dependencies]
+ring = "0.17.14"

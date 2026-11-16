@@ -143,7 +143,9 @@ impl Options {
         let ssh_banner_bytes = self.ssh_banner_bytes;
         let dns_names = self.dns_names;
         let field_possible = |field: &str, protocol| {
-            if rustgfw_core::wireguard::FIELDS.contains(&field) {
+            if rustgfw_core::wireguard::FIELDS.contains(&field)
+                || rustgfw_core::quic::FIELDS.contains(&field)
+            {
                 protocol == Protocol::Udp
             } else if rustgfw_core::openvpn::FIELDS.contains(&field) {
                 protocol == Protocol::Udp || rustgfw_core::openvpn::TCP_FIELDS.contains(&field)
@@ -185,6 +187,12 @@ impl Options {
         let needs_openvpn_udp = self.expr_rules.iter().any(|rule| {
             eligible(rule, Protocol::Udp)
                 && rustgfw_core::openvpn::FIELDS
+                    .iter()
+                    .any(|field| rule.condition.references_field(field))
+        });
+        let needs_quic_udp = self.expr_rules.iter().any(|rule| {
+            eligible(rule, Protocol::Udp)
+                && rustgfw_core::quic::FIELDS
                     .iter()
                     .any(|field| rule.condition.references_field(field))
         });
@@ -282,6 +290,12 @@ impl Options {
                 UdpStreamRule::new(None, || {
                     Box::new(rustgfw_core::openvpn::OpenVpnUdp::default())
                 })
+            }),
+            needs_quic_udp.then(|| {
+                UdpStreamRule::new(
+                    None,
+                    || Box::new(rustgfw_core::quic::QuicInitial::default()),
+                )
             }),
         ]
         .into_iter()
@@ -964,6 +978,44 @@ mod tests {
             evaluate(&mut policy, &tcp(110, &request[7..])),
             Verdict::DropFlow
         );
+    }
+
+    #[test]
+    #[ignore = "requires the read-only OpenGFW QUIC capture fixture"]
+    fn quic_expression_drops_only_the_initial_with_matching_sni() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("references/opengfw/analyzer/udp/testdata/quic-ngtcp2-1.11-0.bin");
+        let payload = std::fs::read(fixture).unwrap();
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"QUIC SNI","expr":"proto == udp && fresh.quic.sni == ngtcp2.sniff.test","action":"drop_packet"}]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let udp = |payload: &[u8]| {
+            let mut bytes = vec![0; 28 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 17;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&443u16.to_be_bytes());
+            bytes[24..26].copy_from_slice(&(8 + payload.len() as u16).to_be_bytes());
+            bytes[28..].copy_from_slice(payload);
+            bytes
+        };
+        let evaluate = |policy: &mut dyn Policy, bytes: &[u8]| {
+            policy.evaluate(Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        assert_eq!(evaluate(&mut policy, &udp(&payload)), Verdict::Drop);
+        assert_eq!(evaluate(&mut policy, &udp(b"later")), Verdict::Accept);
     }
 
     #[test]

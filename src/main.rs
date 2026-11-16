@@ -229,21 +229,6 @@ impl Options {
             .map(MatchRule::into_flow_rule)
             .collect();
         let analyzers = [
-            if self.http_hosts.is_empty() {
-                needs_http.then(|| {
-                    AnalyzerRule::observing(None, move || {
-                        Box::new(rustgfw_core::http::HttpMessages::with_header_limit(
-                            http_header_bytes,
-                        ))
-                    })
-                })
-            } else {
-                AnalyzerRule::exact("http.host", self.http_hosts, None, move || {
-                    Box::new(rustgfw_core::http::HttpMessages::with_header_limit(
-                        http_header_bytes,
-                    ))
-                })
-            },
             if self.tls_sni.is_empty() {
                 needs_tls.then(|| {
                     AnalyzerRule::observing(None, move || {
@@ -322,6 +307,26 @@ impl Options {
         )
         .with_bidirectional_analyzers(
             [
+                if self.http_hosts.is_empty() {
+                    needs_http.then(|| {
+                        BidirectionalAnalyzerRule::observing(None, move || {
+                            Box::new(rustgfw_core::http::HttpConversation::with_header_limit(
+                                http_header_bytes,
+                            ))
+                        })
+                    })
+                } else {
+                    BidirectionalAnalyzerRule::exact(
+                        "http.host",
+                        self.http_hosts,
+                        None,
+                        move || {
+                            Box::new(rustgfw_core::http::HttpConversation::with_header_limit(
+                                http_header_bytes,
+                            ))
+                        },
+                    )
+                },
                 needs_openvpn_tcp.then(|| {
                     BidirectionalAnalyzerRule::observing(None, || {
                         Box::new(rustgfw_core::openvpn::OpenVpnTcp::default())
@@ -1152,6 +1157,82 @@ mod tests {
         let response = tcp(500, b"HTTP/1.1 404 Not Found\r\n\r\n", true);
         assert_eq!(evaluate(&mut policy, &request), Verdict::Accept);
         assert_eq!(evaluate(&mut policy, &response), Verdict::DropFlow);
+    }
+
+    #[test]
+    fn http_pipelined_responses_use_matching_request_context() {
+        let tcp = |sequence: u32, payload: &[u8], reverse: bool| {
+            let mut bytes = vec![0; 40 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 6;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&80u16.to_be_bytes());
+            bytes[24..28].copy_from_slice(&sequence.to_be_bytes());
+            bytes[32] = 0x50;
+            bytes[33] = 0x18;
+            bytes[40..].copy_from_slice(payload);
+            if reverse {
+                for offset in 0..4 {
+                    bytes.swap(12 + offset, 16 + offset);
+                }
+                bytes.swap(20, 22);
+                bytes.swap(21, 23);
+            }
+            bytes
+        };
+        let requests = tcp(
+            100,
+            b"GET /one HTTP/1.1\r\nHost: one.test\r\n\r\nGET /two HTTP/1.1\r\nHost: two.test\r\n\r\n",
+            false,
+        );
+        let first_response = tcp(
+            500,
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+            true,
+        );
+        let second_response = tcp(
+            500 + (first_response.len() - 40) as u32,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            true,
+        );
+        for (expression, expected_first) in [
+            (
+                "http.target == /two && fresh.http.status == 404",
+                Verdict::Accept,
+            ),
+            (
+                "http.target == /one && fresh.http.status == 404",
+                Verdict::DropFlow,
+            ),
+            (
+                "fresh.http.target == /one && fresh.http.status == 404",
+                Verdict::Accept,
+            ),
+        ] {
+            let source = format!(
+                r#"{{"rules":[{{"name":"paired","expr":"{expression}","action":"block"}}]}}"#
+            );
+            let mut options = Options::parse("accept", &[]).unwrap();
+            options.expr_rules = expr_config::compile(&source).unwrap();
+            let mut policy = options.into_policy();
+            let mut evaluate = |bytes: &[u8]| {
+                policy.evaluate(Packet {
+                    bytes,
+                    original_len: bytes.len(),
+                    checksum_ready: true,
+                    scope: FlowScope::default(),
+                })
+            };
+            assert_eq!(evaluate(&requests), Verdict::Accept, "{expression}");
+            assert_eq!(evaluate(&first_response), expected_first, "{expression}");
+            if expected_first == Verdict::Accept {
+                assert_eq!(evaluate(&second_response), Verdict::Accept, "{expression}");
+            }
+        }
     }
 
     #[test]

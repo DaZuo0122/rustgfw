@@ -1,5 +1,8 @@
-//! Incremental HTTP/1 message inspection in each reassembled TCP direction.
-use crate::inspect::{Analysis, Observation, ObservationBatch, StreamAnalyzer};
+//! Incremental HTTP/1 message inspection and request/response correlation.
+use crate::inspect::{
+    Analysis, BidirectionalStreamAnalyzer, Observation, ObservationBatch, StreamAnalyzer,
+};
+use std::collections::VecDeque;
 
 pub const FIELDS: &[&str] = &[
     "http.host",
@@ -50,6 +53,16 @@ impl HttpMessages {
 
 impl StreamAnalyzer for HttpMessages {
     fn feed(&mut self, bytes: &[u8]) -> Analysis {
+        self.feed_with(bytes, |_| Vec::new())
+    }
+}
+
+impl HttpMessages {
+    fn feed_with(
+        &mut self,
+        bytes: &[u8],
+        mut on_message: impl FnMut(&mut Message) -> Vec<Observation>,
+    ) -> Analysis {
         if self.finished {
             return Analysis::Finished;
         }
@@ -65,15 +78,17 @@ impl StreamAnalyzer for HttpMessages {
                     self.header.push(bytes[cursor]);
                     cursor += 1;
                     if self.header.ends_with(b"\r\n\r\n") {
-                        let Some(message) = parse_message(&self.header) else {
+                        let Some(mut message) = parse_message(&self.header) else {
                             self.finished = true;
                             break;
                         };
+                        let context = on_message(&mut message);
                         self.header.clear();
                         self.body = message.body;
                         self.finished = !message.continue_after;
                         batches.push(ObservationBatch {
                             clear_fields: message.clear_fields,
+                            context,
                             observations: message.observations,
                         });
                         if self.finished {
@@ -164,11 +179,110 @@ impl StreamAnalyzer for HttpMessages {
     }
 }
 
+/// Associates responses with requests in HTTP/1 wire order, including pipelined requests.
+pub struct HttpConversation {
+    directions: [HttpMessages; 2],
+    pending: VecDeque<Vec<Observation>>,
+    finished: [bool; 2],
+}
+
+impl Default for HttpConversation {
+    fn default() -> Self {
+        Self::with_header_limit(16384)
+    }
+}
+
+impl HttpConversation {
+    pub fn with_header_limit(limit: usize) -> Self {
+        Self {
+            directions: [
+                HttpMessages::with_header_limit(limit),
+                HttpMessages::with_header_limit(limit),
+            ],
+            pending: VecDeque::new(),
+            finished: [false; 2],
+        }
+    }
+}
+
+impl BidirectionalStreamAnalyzer for HttpConversation {
+    fn feed(&mut self, bytes: &[u8], reverse: bool) -> Analysis {
+        if self.finished.iter().all(|done| *done) {
+            return Analysis::Finished;
+        }
+        let direction = usize::from(reverse);
+        let mut tunnel = false;
+        let result = self.directions[direction].feed_with(bytes, |message| {
+            let request = message
+                .observations
+                .iter()
+                .any(|item| item.field == "http.method");
+            if request {
+                self.pending.push_back(message.observations.clone());
+                return Vec::new();
+            }
+            message.clear_fields = FIELDS;
+            let status = message
+                .observations
+                .iter()
+                .find(|item| item.field == "http.status")
+                .and_then(|item| item.value.parse::<u16>().ok());
+            let interim = status.is_some_and(|code| (100..200).contains(&code) && code != 101);
+            let context = if interim {
+                self.pending.front().cloned().unwrap_or_default()
+            } else {
+                self.pending.pop_front().unwrap_or_default()
+            };
+            if !interim {
+                let method = context
+                    .iter()
+                    .find(|item| item.field == "http.method")
+                    .map(|item| item.value.as_str());
+                if method == Some("HEAD") {
+                    message.body = Body::None;
+                    message.continue_after = message.head_can_continue;
+                } else if method == Some("CONNECT")
+                    && status.is_some_and(|code| (200..300).contains(&code))
+                {
+                    message.body = Body::None;
+                    message.continue_after = false;
+                    tunnel = true;
+                }
+                if status == Some(101) {
+                    tunnel = true;
+                }
+            }
+            context
+        });
+        let (batches, finished) = match result {
+            Analysis::Batches { batches, finished } => (batches, finished),
+            Analysis::Finished => (Vec::new(), true),
+            Analysis::Pending => (Vec::new(), false),
+            Analysis::Observations(_) | Analysis::FinalObservations(_) => unreachable!(),
+        };
+        self.finished[direction] |= finished;
+        if tunnel {
+            self.finished = [true; 2];
+        }
+        if !batches.is_empty() {
+            Analysis::Batches {
+                batches,
+                finished: self.finished.iter().all(|done| *done),
+            }
+        } else if self.finished.iter().all(|done| *done) {
+            Analysis::Finished
+        } else {
+            Analysis::Pending
+        }
+    }
+}
+
 struct Message {
     observations: Vec<Observation>,
     clear_fields: &'static [&'static str],
     body: Body,
     continue_after: bool,
+    head_can_continue: bool,
 }
 
 fn chunk_size(line: &[u8]) -> Option<usize> {
@@ -352,12 +466,76 @@ fn parse_message(header: &[u8]) -> Option<Message> {
         clear_fields,
         body,
         continue_after,
+        head_can_continue: framing_valid && !connection_close,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn correlates_pipelined_responses_without_consuming_informational_response() {
+        let mut conversation = HttpConversation::default();
+        let (requests, _) = batches(conversation.feed(
+            b"GET /one HTTP/1.1\r\nHost: one.test\r\n\r\nGET /two HTTP/1.1\r\nHost: two.test\r\n\r\n",
+            false,
+        ));
+        assert_eq!(requests.len(), 2);
+        let (responses, _) = batches(conversation.feed(
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            true,
+        ));
+        assert_eq!(responses.len(), 3);
+        assert_eq!(target(&responses[0]), Some("/one"));
+        assert_eq!(target(&responses[1]), Some("/one"));
+        assert_eq!(target(&responses[2]), Some("/two"));
+        assert!(responses.iter().all(|batch| batch.clear_fields == FIELDS));
+    }
+
+    #[test]
+    fn head_response_length_does_not_hide_following_response() {
+        let mut conversation = HttpConversation::default();
+        let (requests, _) = batches(conversation.feed(
+            b"HEAD /head HTTP/1.1\r\n\r\nGET /next HTTP/1.1\r\n\r\n",
+            false,
+        ));
+        assert_eq!(requests.len(), 2);
+        let (responses, finished) = batches(conversation.feed(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nHTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+            true,
+        ));
+        assert!(!finished);
+        assert_eq!(responses.len(), 2);
+        assert_eq!(target(&responses[0]), Some("/head"));
+        assert_eq!(target(&responses[1]), Some("/next"));
+    }
+
+    #[test]
+    fn successful_connect_ends_http_inspection() {
+        let mut conversation = HttpConversation::default();
+        let (requests, _) =
+            batches(conversation.feed(b"CONNECT relay.test:443 HTTP/1.1\r\n\r\n", false));
+        assert_eq!(requests.len(), 1);
+        let (responses, finished) = batches(conversation.feed(
+            b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\nGET /tunnel HTTP/1.1\r\n\r\n",
+            true,
+        ));
+        assert_eq!(responses.len(), 1);
+        assert!(finished);
+        assert_eq!(
+            conversation.feed(b"GET /inside HTTP/1.1\r\n\r\n", false),
+            Analysis::Finished
+        );
+    }
+
+    fn target(batch: &ObservationBatch) -> Option<&str> {
+        batch
+            .context
+            .iter()
+            .find(|item| item.field == "http.target")
+            .map(|item| item.value.as_str())
+    }
 
     fn batches(result: Analysis) -> (Vec<ObservationBatch>, bool) {
         let Analysis::Batches { batches, finished } = result else {

@@ -26,7 +26,7 @@ pub enum Analysis {
     Finished,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Observation {
     pub field: &'static str,
     pub value: String,
@@ -35,6 +35,8 @@ pub struct Observation {
 #[derive(Debug, PartialEq, Eq)]
 pub struct ObservationBatch {
     pub clear_fields: &'static [&'static str],
+    /// Facts restored for this event without marking them as fresh observations.
+    pub context: Vec<Observation>,
     pub observations: Vec<Observation>,
 }
 
@@ -449,11 +451,12 @@ pub struct Inspect<P> {
 }
 impl<P> Inspect<P> {
     pub fn http_hosts(transport: P, hosts: Vec<String>) -> Self {
-        Self::with_analyzers(
-            transport,
-            AnalyzerRule::exact("http.host", hosts, None, || Box::<HttpHost>::default())
-                .into_iter()
-                .collect(),
+        Self::with_analyzers(transport, Vec::new()).with_bidirectional_analyzers(
+            BidirectionalAnalyzerRule::exact("http.host", hosts, None, || {
+                Box::<crate::http::HttpConversation>::default()
+            })
+            .into_iter()
+            .collect(),
         )
     }
     pub fn with_analyzers(transport: P, analyzers: Vec<AnalyzerRule>) -> Self {
@@ -957,6 +960,7 @@ impl<P: Policy> Policy for Inspect<P> {
                         flow.facts.remove(field);
                         batch_updated.retain(|item| item != field);
                     }
+                    store_observations(&mut flow.facts, batch.context, &mut Vec::new());
                     store_observations(&mut flow.facts, batch.observations, &mut batch_updated);
                     apply_tcp_flow_rules(
                         flow,
@@ -1003,6 +1007,7 @@ mod tests {
         Analysis::Batches {
             batches: vec![ObservationBatch {
                 clear_fields: crate::http::FIELDS,
+                context: Vec::new(),
                 observations,
             }],
             finished,

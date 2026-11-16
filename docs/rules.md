@@ -83,7 +83,7 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 
 `origin`、`target` 是创建流时第一个包的端点；`src`、`dst` 随当前包方向变化。HTTP 按 TCP 方向连续分析 HTTP/1 消息；同包多条消息逐条求值，新请求会原子替换旧请求字段并清除旧响应字段，`http.target` 保留请求目标原文。请求字段和反向响应字段可在同一流的表达式中组合；多条请求在收到对应响应前并行等待时，当前字段只保留最新请求，尚不能准确关联每条响应。TLS 分析可见的 ClientHello SNI、ALPN 和反向 ServerHello；DNS 在 TCP/UDP 端口 53 分析。SSH 读取每个 TCP 方向的首条标识行，允许此前出现提示行，单方向最多读取 `ssh-banner-bytes` 字节。`fresh.` 适合逐包丢弃或修改，避免沿用较早数据报留下的观察值。
 
-HTTP 分析器依据 `Content-Length` 跳过定长消息体，避免把消息体中的文本误识别为下一条请求；没有长度标记的请求视为无消息体。遇到 `Transfer-Encoding`、不一致的长度、`Connection: close` 或无法定界的响应体时，报告当前可见头部后停止该方向的后续解析。暂不跨 chunked 消息体继续识别；明文 HTTP/2 不在此分析器内。消息体长度判定依据：[RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html)。
+HTTP 分析器依据 `Content-Length` 跳过定长消息体，也能按最终 `Transfer-Encoding: chunked` 的块长度、扩展和 trailer 找到下一条消息；消息体中的文本不会被当成新请求。没有长度标记的请求视为无消息体。遇到同时出现 `Transfer-Encoding` 与 `Content-Length`、不一致的长度、无法识别的传输编码、`Connection: close` 或无法定界的响应体时，报告当前可见头部后停止该方向的后续解析。明文 HTTP/2 不在此分析器内。消息体长度判定依据：[RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html)。
 
 `tls.server_version` 优先取 ServerHello 的 `supported_versions` 扩展，若无该扩展则取旧版版本字段。TLS 1.3 的服务端 ALPN 位于加密的 EncryptedExtensions，因而不会产生 `tls.server_alpn`；TLS 1.2 的明文 ServerHello 可报告该字段。分析器识别 HelloRetryRequest 后等待最终 ServerHello，允许两者间的兼容性 ChangeCipherSpec 记录；重试请求本身不产生最终选择字段。字段反映可见握手内容，不验证完整连接是否成功。依据：[RFC 8446](https://www.rfc-editor.org/rfc/rfc8446.html)、[RFC 7301](https://www.rfc-editor.org/rfc/rfc7301.html)。
 

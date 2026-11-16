@@ -51,7 +51,7 @@ HTTP/TLS/DNS TCP/SSH 通过 `AnalyzerRule` 注册，共享流表及每方向 TCP
 
 TCP 重组模块 `core::tcp` 已接入 `core::inspect` 的双向分析路径，支持连续字节交付、乱序缓存、重复数据裁剪和序号回绕。缓冲区冲突重叠会阻断流；已交付字节不保留副本。
 
-`rustgfw nfqueue 100 accept http-host=blocked.test` 连续检查 HTTP/1 请求的所有 Host 头、绝对 URI 的 authority，以及 CONNECT 目标（大小写不敏感，含端口时需完整匹配）。表达式可读取请求方法、目标、版本及反向响应的状态码、版本；两方向观察值保存在同一流内。同包多条消息依次求值，上一条请求的字段不会与下一条请求的 Host 混用。任一 Host 值命中即阻断；无关头里的非 UTF-8 字节不妨碍 Host 识别。传输层规则先执行，Host 规则进一步阻断。识别前的包会放行；跨包分析不是代理式整请求缓冲。每方向乱序缓存及 HTTP 头默认各限 16 KiB，TCP 与可选的有状态 UDP 检查共用默认最多 16384 条流的容量，空闲 120 秒过期。双向 FIN 或未阻断流的 RST 会释放检查状态；单向 FIN 保留反向分析。容量满时只在有新完成流时扫描回收；仍满则丢弃新流的包。阻断流的 RST 不单凭包头清除用户态阻断状态。`Content-Length` 消息体按声明长度跳过；chunked 及无法定界的响应体只检查当前头部，然后结束该方向分析。超长或无法识别的 HTTP 头也会结束该分析器并沿用传输层结果；减小头预算可能让更长的阻断目标头无法被识别。不支持 HTTP/2，也不保证流水线请求与响应逐条对应。
+`rustgfw nfqueue 100 accept http-host=blocked.test` 连续检查 HTTP/1 请求的所有 Host 头、绝对 URI 的 authority，以及 CONNECT 目标（大小写不敏感，含端口时需完整匹配）。表达式可读取请求方法、目标、版本及反向响应的状态码、版本；两方向观察值保存在同一流内。同包多条消息依次求值，上一条请求的字段不会与下一条请求的 Host 混用。任一 Host 值命中即阻断；无关头里的非 UTF-8 字节不妨碍 Host 识别。传输层规则先执行，Host 规则进一步阻断。识别前的包会放行；跨包分析不是代理式整请求缓冲。每方向乱序缓存及 HTTP 头默认各限 16 KiB，TCP 与可选的有状态 UDP 检查共用默认最多 16384 条流的容量，空闲 120 秒过期。双向 FIN 或未阻断流的 RST 会释放检查状态；单向 FIN 保留反向分析。容量满时只在有新完成流时扫描回收；仍满则丢弃新流的包。阻断流的 RST 不单凭包头清除用户态阻断状态。`Content-Length` 消息体按声明长度跳过；最终采用 chunked 传输编码时，解析块边界和 trailer 后继续检查下一条消息。无法定界的响应体、含糊的长度声明、超长或无法识别的 HTTP 头会结束该方向分析并沿用传输层结果；减小头预算可能让更长的阻断目标头无法被识别。不支持 HTTP/2，也不保证流水线请求与响应逐条对应。
 
 资源预算可由 `inspect-flows=N`、`transport-flows=N`、`flow-idle-seconds=N`、`reorder-bytes=N`、`http-header-bytes=N`、`tls-buffer-bytes=N`、`dns-message-bytes=N` 设置，Linux 和 Windows 命令使用同一组参数。例如 `rustgfw nfqueue 100 accept nft=forward inspect-flows=8192 transport-flows=131072 flow-idle-seconds=300 reorder-bytes=32768 http-header-bytes=32768 tls-buffer-bytes=131072 dns-message-bytes=65535 http-host=blocked.test`。`flow-idle-seconds` 同时作用于检查流表和传输层规则缓存；乱序预算按每方向计算。TLS 暂存预算默认 128 KiB，DNS TCP 单消息预算默认 65535 字节，UDP DNS 不受该预算影响。预算过低会使较大的匹配目标无法识别，此时使用传输层裁决。
 
@@ -62,6 +62,8 @@ SSH 标识行单方向读取预算另由 `ssh-banner-bytes=N` 设置，默认 10
 通用观察结果改造后，在隔离 IPv4/IPv6 本机拓扑实测 DNS TCP 同一连接先放行查询、后续查询命中后阻断整条流；HTTP 分段 Host 与 TLS 分段 ClientHello 的回归也通过。
 
 2026-11-16 HTTP/1 连续消息回归：Debian 隔离网络命名空间的真实 NFQUEUE 路径中，同一 TCP 连接首个允许请求到达服务端、第二个阻断 Host 请求未到达；两条请求合并发送时整包被阻断；定长 POST 消息体中的伪 Host 请求未触发阻断。测试脚本只保留在忽略的 `target/` 目录。
+
+同一隔离路径随后验证 chunked POST：块数据中的伪阻断 Host 和 trailer 未触发误判，trailer 后紧接的允许请求到达服务端，再后的阻断 Host 请求被拦截。测试脚本仍只保留在忽略的 `target/` 目录。
 
 2026-11-15 多流回归：Debian 隔离本机网络命名空间中，1000 条 TCP 流、64 个客户端并发交替发送允许与阻断 HTTP 请求。原逐流同步 nft 路径有 27 个客户端未收到允许响应并出现 NFQUEUE `ENOBUFS`；批量卸载与内核 RST 清理后，连续三轮均为 500 条允许流收到响应、500 条阻断流无泄漏，连接关闭后 `blocked_ct` 无残留项，进程无溢出日志。一次紧接编译和故障注入的运行出现 40 个客户端超时，未见溢出日志；随后独立三轮及故障注入后两轮均未复现，原因尚未定位。单流回归确认内核 RST 删除规则计数器递增，方向性 zone、重复阻断与事件丢失恢复仍通过。该结果只覆盖这一隔离拓扑与负载，尚不代表长期多流压力测试完成。测试脚本仅放在忽略目录 `target/`。
 
@@ -88,7 +90,7 @@ IPv6 扩展头会跳过；原子分片可解析，其他 IP 分片暂时丢弃�
 
 1. Linux 长时间压力与故障测试：裁决错误、真实 conntrack 事件丢失和 ID 复用；量化队列拥塞时的丢包率，并验证卸载故障后的恢复。
 2. 方向性 zone 的卸载碰撞风险、同接口同 mark 的无 conntrack 多 zone 流隔离、规则版本与配置热更新；解析 IPv4 非首片及更复杂的 IPv6 扩展头组合。
-3. TLS/DNS 等分析器的累计输入和时间预算、HTTP chunked 消息体跨请求检查与流水线响应关联，以及未识别协议的处理策略。
+3. TLS/DNS 等分析器的累计输入和时间预算、HTTP 流水线响应关联，以及未识别协议的处理策略。
 4. 验证 Windows WFP 静态与动态规则、真实 WinDivert 收发；验证 FLOW 删除事件静默丢失后的规则回收和同五元组复用，再设计转发流量卸载。
 
 参照本地 `references/opengfw` 的 io、engine、ruleset 和 analyzer 接口，以及 `references/gfw-rs` 的 NFQUEUE 尝试。参考项目保持只读；Trojan 决策树由 OpenGFW 模型移植，单独标注原始出处和 MPL-2.0 许可。API 核对：[nfq Queue](https://docs.rs/nfq/0.2.6/nfq/struct.Queue.html)、[nfq Message](https://docs.rs/nfq/0.2.6/nfq/struct.Message.html)。

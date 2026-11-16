@@ -81,7 +81,7 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 
 `origin`、`target` 是创建流时第一个包的端点；`src`、`dst` 随当前包方向变化。HTTP 在每个 TCP 方向只分析首个 HTTP/1 消息：请求字段和反向响应字段可在同一流的表达式中组合，`http.target` 保留请求目标原文。TLS 分析可见的 ClientHello SNI、ALPN 和反向 ServerHello；DNS 在 TCP/UDP 端口 53 分析。SSH 读取每个 TCP 方向的首条标识行，允许此前出现提示行，单方向最多读取 `ssh-banner-bytes` 字节。`fresh.` 适合逐包丢弃或修改，避免沿用较早数据报留下的观察值。
 
-`tls.server_version` 优先取 ServerHello 的 `supported_versions` 扩展，若无该扩展则取旧版版本字段。TLS 1.3 的服务端 ALPN 位于加密的 EncryptedExtensions，因而不会产生 `tls.server_alpn`；TLS 1.2 的明文 ServerHello 可报告该字段。当前分析器在 HelloRetryRequest 后结束该方向的检查，不把重试请求当作最终 ServerHello。字段反映可见握手内容，不验证完整连接是否成功。依据：[RFC 8446](https://www.rfc-editor.org/rfc/rfc8446.html)、[RFC 7301](https://www.rfc-editor.org/rfc/rfc7301.html)。
+`tls.server_version` 优先取 ServerHello 的 `supported_versions` 扩展，若无该扩展则取旧版版本字段。TLS 1.3 的服务端 ALPN 位于加密的 EncryptedExtensions，因而不会产生 `tls.server_alpn`；TLS 1.2 的明文 ServerHello 可报告该字段。分析器识别 HelloRetryRequest 后等待最终 ServerHello，允许两者间的兼容性 ChangeCipherSpec 记录；重试请求本身不产生最终选择字段。字段反映可见握手内容，不验证完整连接是否成功。依据：[RFC 8446](https://www.rfc-editor.org/rfc/rfc8446.html)、[RFC 7301](https://www.rfc-editor.org/rfc/rfc7301.html)。
 
 `field != value` 等价于 `!(field == value)`，因此字段缺失时也成立；需要字段实际存在时可写 `field exists && field != value`。观察字段的相等比较仍按文本处理；大小比较按无符号十进制整数处理，字段缺失时为假。
 

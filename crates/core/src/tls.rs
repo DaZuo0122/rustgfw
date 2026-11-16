@@ -16,6 +16,7 @@ const HELLO_RETRY_RANDOM: [u8; 32] = [
 pub struct TlsHello {
     records: Vec<u8>,
     handshake: Vec<u8>,
+    seen_retry: bool,
     finished: bool,
     buffer_limit: usize,
 }
@@ -31,6 +32,7 @@ impl TlsHello {
         Self {
             records: Vec::new(),
             handshake: Vec::new(),
+            seen_retry: false,
             finished: false,
             buffer_limit,
         }
@@ -47,10 +49,74 @@ impl StreamAnalyzer for TlsHello {
         }
         self.records.extend_from_slice(bytes);
         loop {
+            if self.handshake.len() >= 4 {
+                let h = &self.handshake;
+                let length =
+                    (usize::from(h[1]) << 16) | (usize::from(h[2]) << 8) | usize::from(h[3]);
+                if !matches!(h[0], 1 | 2) || length > 65536 || (self.seen_retry && h[0] != 2) {
+                    self.finished = true;
+                    return Analysis::Finished;
+                }
+                if h.len() >= 4 + length {
+                    let mut observations = Vec::new();
+                    if h[0] == 1 {
+                        let Some(hello) = client_hello_metadata(&h[4..4 + length]) else {
+                            self.finished = true;
+                            return Analysis::Finished;
+                        };
+                        if let Some(value) = hello.sni {
+                            observations.push(Observation {
+                                field: "tls.sni",
+                                value,
+                            });
+                        }
+                        observations.extend(hello.alpn.into_iter().map(|value| Observation {
+                            field: "tls.alpn",
+                            value,
+                        }));
+                    } else {
+                        let Some(hello) = server_hello_metadata(&h[4..4 + length]) else {
+                            self.finished = true;
+                            return Analysis::Finished;
+                        };
+                        if hello.retry {
+                            if self.seen_retry {
+                                self.finished = true;
+                                return Analysis::Finished;
+                            }
+                            self.seen_retry = true;
+                            self.handshake.drain(..4 + length);
+                            continue;
+                        }
+                        observations.push(Observation {
+                            field: "tls.server_version",
+                            value: format!("0x{:04x}", hello.version),
+                        });
+                        observations.push(Observation {
+                            field: "tls.server_cipher",
+                            value: format!("0x{:04x}", hello.cipher),
+                        });
+                        if let Some(value) = hello.alpn {
+                            observations.push(Observation {
+                                field: "tls.server_alpn",
+                                value,
+                            });
+                        }
+                    }
+                    self.finished = true;
+                    return if observations.is_empty() {
+                        Analysis::Finished
+                    } else {
+                        Analysis::FinalObservations(observations)
+                    };
+                }
+            }
             if self.records.len() < 5 {
                 return Analysis::Pending;
             }
-            if self.records[0] != 22 || self.records[1] != 3 {
+            if self.records[1] != 3
+                || (self.records[0] != 22 && !(self.records[0] == 20 && self.seen_retry))
+            {
                 self.finished = true;
                 return Analysis::Finished;
             }
@@ -62,60 +128,16 @@ impl StreamAnalyzer for TlsHello {
             if self.records.len() < 5 + len {
                 return Analysis::Pending;
             }
-            self.handshake.extend_from_slice(&self.records[5..5 + len]);
-            self.records.drain(..5 + len);
-            if self.handshake.len() < 4 {
+            if self.records[0] == 20 && self.seen_retry && self.records[5..5 + len] == [1] {
+                self.records.drain(..5 + len);
                 continue;
             }
-            let h = &self.handshake;
-            let length = (usize::from(h[1]) << 16) | (usize::from(h[2]) << 8) | usize::from(h[3]);
-            if !matches!(h[0], 1 | 2) || length > 65536 {
+            if self.records[0] != 22 {
                 self.finished = true;
                 return Analysis::Finished;
             }
-            if h.len() < 4 + length {
-                continue;
-            }
-            self.finished = true;
-            let mut observations = Vec::new();
-            if h[0] == 1 {
-                let Some(hello) = client_hello_metadata(&h[4..4 + length]) else {
-                    return Analysis::Finished;
-                };
-                if let Some(value) = hello.sni {
-                    observations.push(Observation {
-                        field: "tls.sni",
-                        value,
-                    });
-                }
-                observations.extend(hello.alpn.into_iter().map(|value| Observation {
-                    field: "tls.alpn",
-                    value,
-                }));
-            } else {
-                let Some(hello) = server_hello_metadata(&h[4..4 + length]) else {
-                    return Analysis::Finished;
-                };
-                observations.push(Observation {
-                    field: "tls.server_version",
-                    value: format!("0x{:04x}", hello.version),
-                });
-                observations.push(Observation {
-                    field: "tls.server_cipher",
-                    value: format!("0x{:04x}", hello.cipher),
-                });
-                if let Some(value) = hello.alpn {
-                    observations.push(Observation {
-                        field: "tls.server_alpn",
-                        value,
-                    });
-                }
-            }
-            return if observations.is_empty() {
-                Analysis::Finished
-            } else {
-                Analysis::FinalObservations(observations)
-            };
+            self.handshake.extend_from_slice(&self.records[5..5 + len]);
+            self.records.drain(..5 + len);
         }
     }
 }
@@ -224,15 +246,14 @@ struct ServerHelloMetadata {
     version: u16,
     cipher: u16,
     alpn: Option<String>,
+    retry: bool,
 }
 
 fn server_hello_metadata(body: &[u8]) -> Option<ServerHelloMetadata> {
     let mut c = Cursor(body);
     let legacy_version = c.word()? as u16;
     let random = c.take(32)?;
-    if random == HELLO_RETRY_RANDOM {
-        return None;
-    }
+    let retry = random == HELLO_RETRY_RANDOM;
     let session_len = c.byte()?;
     if session_len > 32 {
         return None;
@@ -291,6 +312,7 @@ fn server_hello_metadata(body: &[u8]) -> Option<ServerHelloMetadata> {
         version,
         cipher,
         alpn,
+        retry,
     })
 }
 
@@ -470,11 +492,37 @@ mod tests {
         }
     }
     #[test]
-    fn hello_retry_request_is_not_a_final_server_selection() {
+    fn hello_retry_request_waits_for_final_server_hello() {
         let mut analyzer = TlsHello::default();
         assert_eq!(
             analyzer.feed(&record(&server_hello(true, true))),
-            Analysis::Finished
+            Analysis::Pending
         );
+        assert_eq!(analyzer.feed(&[20, 3, 3, 0, 1, 1]), Analysis::Pending);
+        let result = analyzer.feed(&record(&server_hello(true, false)));
+        let Analysis::FinalObservations(values) = result else {
+            panic!("expected final ServerHello observations");
+        };
+        assert!(
+            values
+                .iter()
+                .any(|item| item.field == "tls.server_version" && item.value == "0x0304")
+        );
+
+        let coalesced = [
+            record(&server_hello(true, true)),
+            record(&server_hello(true, false)),
+        ]
+        .concat();
+        assert!(matches!(
+            TlsHello::default().feed(&coalesced),
+            Analysis::FinalObservations(_)
+        ));
+        let duplicate = [
+            record(&server_hello(true, true)),
+            record(&server_hello(true, true)),
+        ]
+        .concat();
+        assert_eq!(TlsHello::default().feed(&duplicate), Analysis::Finished);
     }
 }

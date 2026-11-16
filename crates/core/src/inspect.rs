@@ -665,7 +665,7 @@ impl<P> Inspect<P> {
                     }
                 }
             }
-            if !self.udp_rules.is_empty() {
+            if !drop_packet && !self.udp_rules.is_empty() {
                 let context = FlowContext {
                     protocol: Protocol::Udp,
                     scope: packet.scope,
@@ -1076,6 +1076,41 @@ mod tests {
             Verdict::Accept
         );
         assert_eq!(evaluate_udp(&mut policy, 0, b"bad", false), Verdict::Accept);
+    }
+
+    #[test]
+    fn rejected_udp_datagram_does_not_match_stale_observations() {
+        struct Word;
+        impl UdpStreamAnalyzer for Word {
+            fn feed(&mut self, payload: &[u8], _: bool) -> UdpStreamAnalysis {
+                if payload == b"invalid" {
+                    UdpStreamAnalysis::Drop
+                } else {
+                    UdpStreamAnalysis::Observations(vec![Observation {
+                        field: "udp.word",
+                        value: String::from_utf8_lossy(payload).into_owned(),
+                    }])
+                }
+            }
+        }
+        let mut policy =
+            Inspect::with_analyzers(crate::ConstantPolicy(Verdict::Accept), Vec::new())
+                .with_udp_streams(
+                    vec![UdpStreamRule::new(None, || Box::new(Word))],
+                    vec![FlowRule::new(|context| {
+                        (!context.updated("udp.word") && context.get("udp.word") == Some("old"))
+                            .then_some(FlowAction::Block)
+                    })],
+                );
+        assert_eq!(evaluate_udp(&mut policy, 0, b"old", false), Verdict::Accept);
+        assert_eq!(
+            evaluate_udp(&mut policy, 0, b"invalid", false),
+            Verdict::Drop
+        );
+        assert_eq!(
+            evaluate_udp(&mut policy, 0, b"next", false),
+            Verdict::Accept
+        );
     }
 
     #[test]

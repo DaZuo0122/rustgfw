@@ -13,7 +13,8 @@ use std::{
 use windows_sys::{
     Win32::{
         Foundation::HANDLE,
-        NetworkManagement::{IpHelper, Ndis, WindowsFilteringPlatform as wfp},
+        NetworkManagement::{IpHelper, WindowsFilteringPlatform as wfp},
+        Networking::WinSock,
         System::Rpc::{RPC_C_AUTHN_WINNT, RPC_S_UUID_LOCAL_ONLY, UuidCreate},
     },
     core::GUID,
@@ -35,24 +36,64 @@ pub enum LocalScope {
 }
 
 impl LocalFlow {
-    pub fn on_interface(
+    pub fn for_local_address(
         local: SocketAddr,
         remote: SocketAddr,
         protocol: Protocol,
-        interface_index: u32,
     ) -> io::Result<Self> {
-        let mut luid = Ndis::NET_LUID_LH::default();
-        // SAFETY: the API writes one NET_LUID into the live output value.
-        let status = unsafe { IpHelper::ConvertInterfaceIndexToLuid(interface_index, &mut luid) };
+        let family = match local {
+            SocketAddr::V4(_) => WinSock::AF_INET,
+            SocketAddr::V6(_) => WinSock::AF_INET6,
+        };
+        let mut table = ptr::null_mut();
+        // SAFETY: the API allocates a table and writes its pointer on success.
+        let status = unsafe { IpHelper::GetUnicastIpAddressTable(family, &mut table) };
         if status != 0 {
             return Err(io::Error::from_raw_os_error(status as i32));
         }
+        let result = (|| {
+            let mut matched = None;
+            // SAFETY: GetUnicastIpAddressTable returns NumEntries initialized rows.
+            let rows = unsafe {
+                std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
+            };
+            for row in rows {
+                if !address_matches(local.ip(), &row.Address) {
+                    continue;
+                }
+                let luid = unsafe { row.InterfaceLuid.Value };
+                match matched {
+                    None => matched = Some(luid),
+                    Some(previous) if previous == luid => {}
+                    Some(_) => {
+                        return Err(io::Error::other("local IP belongs to multiple interfaces"));
+                    }
+                }
+            }
+            matched
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "local IP has no interface"))
+        })();
+        // SAFETY: the table came from GetUnicastIpAddressTable.
+        unsafe { IpHelper::FreeMibTable(table.cast()) };
         Ok(Self {
             local,
             remote,
             protocol,
-            scope: LocalScope::InterfaceLuid(unsafe { luid.Value }),
+            scope: LocalScope::InterfaceLuid(result?),
         })
+    }
+}
+
+fn address_matches(ip: IpAddr, address: &WinSock::SOCKADDR_INET) -> bool {
+    // SAFETY: si_family selects the initialized union variant.
+    unsafe {
+        match (ip, address.si_family) {
+            (IpAddr::V4(ip), WinSock::AF_INET) => {
+                address.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes() == ip.octets()
+            }
+            (IpAddr::V6(ip), WinSock::AF_INET6) => address.Ipv6.sin6_addr.u.Byte == ip.octets(),
+            _ => false,
+        }
     }
 }
 
@@ -383,6 +424,17 @@ impl Drop for WfpPolicy {
 mod tests {
     use super::*;
     use rustgfw_core::Verdict;
+
+    #[test]
+    fn local_loopback_address_resolves_to_its_interface() {
+        let flow = LocalFlow::for_local_address(
+            "127.0.0.1:1234".parse().unwrap(),
+            "127.0.0.1:443".parse().unwrap(),
+            Protocol::Tcp,
+        )
+        .unwrap();
+        assert!(matches!(flow.scope, LocalScope::InterfaceLuid(luid) if luid != 0));
+    }
 
     #[test]
     fn static_offload_stops_at_first_accept_rule() {

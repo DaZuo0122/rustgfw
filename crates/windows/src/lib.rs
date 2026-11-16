@@ -195,12 +195,10 @@ impl PacketIo for WinDivert {
             } else {
                 (transport.destination, transport.source)
             };
-            let interface_index = u32::from_ne_bytes(address.data[..4].try_into().unwrap());
             let _ = sender.send(dynamic::Command::Block {
                 local,
                 remote,
                 protocol: transport.protocol,
-                interface_index,
             });
         }
         if verdict != Verdict::Accept {
@@ -488,13 +486,11 @@ mod tests {
                 local,
                 remote,
                 protocol,
-                interface_index,
             } => {
                 // The fake address describes an inbound packet.
                 assert_eq!(local, "198.51.100.2:443".parse().unwrap());
                 assert_eq!(remote, "192.0.2.1:12345".parse().unwrap());
                 assert_eq!(protocol, Protocol::Tcp);
-                assert_eq!(interface_index, 9);
             }
             _ => panic!("expected a WFP block request"),
         }

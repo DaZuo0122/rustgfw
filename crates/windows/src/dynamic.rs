@@ -45,7 +45,6 @@ pub enum Command {
         local: SocketAddr,
         remote: SocketAddr,
         protocol: Protocol,
-        interface_index: u32,
     },
     EventsEnded,
 }
@@ -135,13 +134,7 @@ impl<P: KernelPolicy<Rule = LocalFlow>> State<P> {
         Ok(())
     }
 
-    fn block(
-        &mut self,
-        local: SocketAddr,
-        remote: SocketAddr,
-        protocol: Protocol,
-        interface_index: u32,
-    ) {
+    fn block(&mut self, local: SocketAddr, remote: SocketAddr, protocol: Protocol) {
         let key = FlowKey {
             local,
             remote,
@@ -154,15 +147,14 @@ impl<P: KernelPolicy<Rule = LocalFlow>> State<P> {
             .active
             .get(&key)
             .is_some_and(|entries| entries.len() == 1 && !entries[0].attempted)
-            || interface_index == 0
         {
             return;
         }
-        match LocalFlow::on_interface(local, remote, protocol, interface_index) {
+        match LocalFlow::for_local_address(local, remote, protocol) {
             Ok(flow) => self.block_resolved(flow),
             Err(error) => {
                 self.active.get_mut(&key).unwrap()[0].attempted = true;
-                eprintln!("WFP interface lookup failed: {error}; using WinDivert policy");
+                eprintln!("WFP local address lookup failed: {error}; using WinDivert policy");
             }
         }
     }
@@ -252,9 +244,8 @@ impl FlowBlocker {
                         local,
                         remote,
                         protocol,
-                        interface_index,
                     } => {
-                        state.block(local, remote, protocol, interface_index);
+                        state.block(local, remote, protocol);
                         Ok(())
                     }
                     Command::EventsEnded => break,

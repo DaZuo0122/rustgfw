@@ -497,6 +497,12 @@ mod tests {
             let mut policy = Options::parse("accept", &args).unwrap().into_policy();
             assert_eq!(policy.evaluate(packet), expected);
         }
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"web substring","expr":"proto == tcp && http.host contains LOCKED","action":"block"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(options.into_policy().evaluate(packet), Verdict::DropFlow);
         assert!(Options::parse("accept", &["flow-idle-seconds=0".into()]).is_err());
     }
     #[test]

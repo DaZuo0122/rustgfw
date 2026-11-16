@@ -80,6 +80,33 @@ impl FromStr for IpNetwork {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextOperator {
+    Equals,
+    Contains,
+    StartsWith,
+    EndsWith,
+}
+impl TextOperator {
+    fn matches(self, actual: &[u8], expected: &[u8], ignore_ascii_case: bool) -> bool {
+        let equals = |part: &[u8]| {
+            if ignore_ascii_case {
+                part.eq_ignore_ascii_case(expected)
+            } else {
+                part == expected
+            }
+        };
+        match self {
+            Self::Equals => equals(actual),
+            Self::Contains => expected.is_empty() || actual.windows(expected.len()).any(equals),
+            Self::StartsWith => actual.get(..expected.len()).is_some_and(equals),
+            Self::EndsWith => actual
+                .get(actual.len().saturating_sub(expected.len())..)
+                .is_some_and(equals),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Condition {
     All(Vec<Self>),
@@ -95,12 +122,16 @@ pub enum Condition {
         network: IpNetwork,
     },
     Reverse(bool),
-    FieldEquals {
+    FieldMatch {
         field: String,
         value: String,
         fresh: bool,
+        operator: TextOperator,
     },
-    PayloadEquals(Vec<u8>),
+    PayloadMatch {
+        value: Vec<u8>,
+        operator: TextOperator,
+    },
 }
 impl Condition {
     pub fn matches(&self, context: &FlowContext<'_>) -> bool {
@@ -112,19 +143,22 @@ impl Condition {
             Self::Port { endpoint, value } => endpoint.address(context).port() == *value,
             Self::IpIn { endpoint, network } => network.contains(endpoint.address(context).ip()),
             Self::Reverse(value) => context.reverse == *value,
-            Self::FieldEquals {
+            Self::FieldMatch {
                 field,
                 value,
                 fresh,
+                operator,
             } => {
                 (!fresh || context.updated(field))
                     && context.values(field).is_some_and(|values| {
-                        values
-                            .iter()
-                            .any(|actual| actual.eq_ignore_ascii_case(value))
+                        values.iter().any(|actual| {
+                            operator.matches(actual.as_bytes(), value.as_bytes(), true)
+                        })
                     })
             }
-            Self::PayloadEquals(value) => context.payload == value,
+            Self::PayloadMatch { value, operator } => {
+                operator.matches(context.payload, value, false)
+            }
         }
     }
 
@@ -134,7 +168,7 @@ impl Condition {
                 items.iter().any(|item| item.references_field(field))
             }
             Self::Not(item) => item.references_field(field),
-            Self::FieldEquals { field: name, .. } => name == field,
+            Self::FieldMatch { field: name, .. } => name == field,
             _ => false,
         }
     }
@@ -153,7 +187,7 @@ impl Condition {
                 }
             }
             Self::Not(item) => item.collect_fields(fields),
-            Self::FieldEquals { field, .. } => fields.push(field),
+            Self::FieldMatch { field, .. } => fields.push(field),
             _ => {}
         }
     }
@@ -207,7 +241,7 @@ impl Condition {
                     (true, false)
                 }
             }
-            Self::FieldEquals { field, .. } if !field_possible(field, protocol) => (true, false),
+            Self::FieldMatch { field, .. } if !field_possible(field, protocol) => (true, false),
             _ => (true, true),
         }
     }
@@ -401,6 +435,16 @@ impl Parser<'_> {
         let operator = self.take().ok_or("missing comparison operator")?;
         let value = self.word()?;
         let equality = operator == Token::Eq;
+        let text_operator = match &operator {
+            Token::Eq => Some(TextOperator::Equals),
+            Token::Word(word) => match word.as_str() {
+                "contains" => Some(TextOperator::Contains),
+                "starts_with" => Some(TextOperator::StartsWith),
+                "ends_with" => Some(TextOperator::EndsWith),
+                _ => None,
+            },
+            _ => None,
+        };
         match field.as_str() {
             "proto" if equality => match value.as_str() {
                 "tcp" => Ok(Condition::Protocol(Protocol::Tcp)),
@@ -412,7 +456,10 @@ impl Parser<'_> {
                 "false" => Ok(Condition::Reverse(false)),
                 _ => Err(format!("reverse expects true or false: {value}")),
             },
-            "payload" if equality => Ok(Condition::PayloadEquals(value.into_bytes())),
+            "payload" if let Some(operator) = text_operator => Ok(Condition::PayloadMatch {
+                value: value.into_bytes(),
+                operator,
+            }),
             "src.port" | "dst.port" | "origin.port" | "target.port" if equality => {
                 let endpoint = parse_endpoint(field.split('.').next().unwrap());
                 let value = value.parse().map_err(|_| format!("invalid port {value}"))?;
@@ -436,14 +483,19 @@ impl Parser<'_> {
                     network: cidr.parse()?,
                 })
             }
-            _ if equality => {
+            "proto" | "reverse" | "payload" | "src.port" | "dst.port" | "origin.port"
+            | "target.port" | "src.ip" | "dst.ip" | "origin.ip" | "target.ip" => {
+                Err(format!("unsupported comparison for {field}"))
+            }
+            _ if let Some(operator) = text_operator => {
                 let (fresh, field) = field
                     .strip_prefix("fresh.")
                     .map_or((false, field.as_str()), |name| (true, name));
-                Ok(Condition::FieldEquals {
+                Ok(Condition::FieldMatch {
                     field: field.to_owned(),
                     value,
                     fresh,
+                    operator,
                 })
             }
             _ => Err(format!("unsupported comparison for {field}")),
@@ -537,10 +589,11 @@ mod tests {
         assert!(matches!(condition, Condition::All(_)));
         assert_eq!(
             parse_expression("fresh.dns.qname == blocked.test").unwrap(),
-            Condition::FieldEquals {
+            Condition::FieldMatch {
                 field: "dns.qname".into(),
                 value: "blocked.test".into(),
                 fresh: true,
+                operator: TextOperator::Equals,
             }
         );
         assert_eq!(

@@ -953,6 +953,56 @@ impl<P: Policy> Policy for Inspect<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expression_text_operators_keep_field_and_payload_case_semantics() {
+        use crate::conditions::parse_expression;
+
+        let source = "192.0.2.1:1234".parse().unwrap();
+        let destination = "198.51.100.2:80".parse().unwrap();
+        let facts = HashMap::from([(
+            "http.host",
+            vec!["other.test".into(), "Api.Example.Com".into()],
+        )]);
+        let context = FlowContext {
+            protocol: Protocol::Tcp,
+            scope: FlowScope::default(),
+            source,
+            destination,
+            origin: source,
+            target: destination,
+            reverse: false,
+            payload: b"prefix BYTES suffix",
+            facts: &facts,
+            updated: &["http.host"],
+        };
+        for expression in [
+            "http.host ends_with .example.com",
+            "fresh.http.host starts_with api.",
+            "http.host contains AMPLE",
+            "payload contains BYTES",
+            "payload starts_with prefix",
+            "payload ends_with suffix",
+            "payload contains \"\"",
+        ] {
+            assert!(
+                parse_expression(expression).unwrap().matches(&context),
+                "{expression}"
+            );
+        }
+        for expression in [
+            "payload contains bytes",
+            "http.host ends_with .invalid.test",
+            "fresh.dns.qname contains example",
+        ] {
+            assert!(
+                !parse_expression(expression).unwrap().matches(&context),
+                "{expression}"
+            );
+        }
+        assert!(parse_expression("src.port contains 1234").is_err());
+    }
+
     fn udp(payload: &[u8], reverse: bool) -> Vec<u8> {
         let mut packet = crate::packet::udp(reverse);
         packet.truncate(28);

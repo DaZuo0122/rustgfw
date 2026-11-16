@@ -232,14 +232,14 @@ impl Options {
             if self.http_hosts.is_empty() {
                 needs_http.then(|| {
                     AnalyzerRule::observing(None, move || {
-                        Box::new(rustgfw_core::http::HttpFirstMessage::with_header_limit(
+                        Box::new(rustgfw_core::http::HttpMessages::with_header_limit(
                             http_header_bytes,
                         ))
                     })
                 })
             } else {
                 AnalyzerRule::exact("http.host", self.http_hosts, None, move || {
-                    Box::new(rustgfw_core::http::HttpFirstMessage::with_header_limit(
+                    Box::new(rustgfw_core::http::HttpMessages::with_header_limit(
                         http_header_bytes,
                     ))
                 })
@@ -1152,6 +1152,50 @@ mod tests {
         let response = tcp(500, b"HTTP/1.1 404 Not Found\r\n\r\n", true);
         assert_eq!(evaluate(&mut policy, &request), Verdict::Accept);
         assert_eq!(evaluate(&mut policy, &response), Verdict::DropFlow);
+    }
+
+    #[test]
+    fn http_expression_keeps_pipelined_request_fields_together() {
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"POST target","expr":"proto == tcp && http.method == POST && http.host == blocked.test","action":"block"}]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let tcp = |sequence: u32, payload: &[u8]| {
+            let mut bytes = vec![0; 40 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 6;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&80u16.to_be_bytes());
+            bytes[24..28].copy_from_slice(&sequence.to_be_bytes());
+            bytes[32] = 0x50;
+            bytes[33] = 0x18;
+            bytes[40..].copy_from_slice(payload);
+            bytes
+        };
+        let mut evaluate = |sequence, payload: &[u8]| {
+            let bytes = tcp(sequence, payload);
+            policy.evaluate(Packet {
+                bytes: &bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        let first_two = b"POST /one HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 0\r\n\r\nGET /two HTTP/1.1\r\nHost: blocked.test\r\n\r\n";
+        assert_eq!(evaluate(100, first_two), Verdict::Accept);
+        assert_eq!(
+            evaluate(
+                100 + first_two.len() as u32,
+                b"POST /three HTTP/1.1\r\nHost: blocked.test\r\nContent-Length: 0\r\n\r\n",
+            ),
+            Verdict::DropFlow
+        );
     }
 
     #[test]

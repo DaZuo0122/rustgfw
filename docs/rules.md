@@ -64,8 +64,8 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 | `payload` | `payload contains "old"` | 当前传输层载荷中的字节片段 |
 | `payload.len` | `payload.len >= 32` | 当前包传输层载荷的字节数；TCP 按当前分段计算 |
 | `payload_hex` | `payload_hex starts_with 0x00ff` | 当前传输层载荷中的二进制字节；十六进制数字须成对 |
-| `http.host`、`http.method`、`http.target`、`http.request_version` | `http.method == CONNECT && http.target ends_with :443` | TCP 首个 HTTP/1 请求的请求行与可见 authority/Host |
-| `http.status`、`http.response_version` | `http.status >= 400` | TCP 首个 HTTP/1 响应的状态码与版本；状态码是十进制观察值 |
+| `http.host`、`http.method`、`http.target`、`http.request_version` | `http.method == CONNECT && http.target ends_with :443` | TCP HTTP/1 请求的请求行与可见 authority/Host |
+| `http.status`、`http.response_version` | `http.status >= 400` | TCP HTTP/1 响应的状态码与版本；状态码是十进制观察值 |
 | `tls.sni`、`tls.alpn`、`dns.qname` | `tls.alpn == h2` | 流内最近一次观察批次的任一值；`tls.alpn` 为客户端提供的协议列表 |
 | `tls.supported_version`、`tls.ech_extension` | `tls.supported_version == 0x0304 && tls.ech_extension == true` | ClientHello 的 `supported_versions` 提供列表及 ECH 扩展是否出现；列表中的版本各产生一个观察值 |
 | `tls.server_version`、`tls.server_cipher`、`tls.server_alpn` | `tls.alpn == h2 && fresh.tls.server_version == 0x0304` | TCP ServerHello 所选版本与密码套件以四位十六进制字符串表示；明文 ServerHello 中的 ALPN 单独报告 |
@@ -81,7 +81,9 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 | 观察字段加 `exists` | `fresh.wireguard.type exists` | 字段至少有一个值；`fresh.` 还要求当前包更新 |
 | 数值观察字段 | `fresh.openvpn.tx_packets > 10` | `>`、`>=`、`<`、`<=` 按无符号十进制整数比较；非数字值不匹配 |
 
-`origin`、`target` 是创建流时第一个包的端点；`src`、`dst` 随当前包方向变化。HTTP 在每个 TCP 方向只分析首个 HTTP/1 消息：请求字段和反向响应字段可在同一流的表达式中组合，`http.target` 保留请求目标原文。TLS 分析可见的 ClientHello SNI、ALPN 和反向 ServerHello；DNS 在 TCP/UDP 端口 53 分析。SSH 读取每个 TCP 方向的首条标识行，允许此前出现提示行，单方向最多读取 `ssh-banner-bytes` 字节。`fresh.` 适合逐包丢弃或修改，避免沿用较早数据报留下的观察值。
+`origin`、`target` 是创建流时第一个包的端点；`src`、`dst` 随当前包方向变化。HTTP 按 TCP 方向连续分析 HTTP/1 消息；同包多条消息逐条求值，新请求会原子替换旧请求字段并清除旧响应字段，`http.target` 保留请求目标原文。请求字段和反向响应字段可在同一流的表达式中组合；多条请求在收到对应响应前并行等待时，当前字段只保留最新请求，尚不能准确关联每条响应。TLS 分析可见的 ClientHello SNI、ALPN 和反向 ServerHello；DNS 在 TCP/UDP 端口 53 分析。SSH 读取每个 TCP 方向的首条标识行，允许此前出现提示行，单方向最多读取 `ssh-banner-bytes` 字节。`fresh.` 适合逐包丢弃或修改，避免沿用较早数据报留下的观察值。
+
+HTTP 分析器依据 `Content-Length` 跳过定长消息体，避免把消息体中的文本误识别为下一条请求；没有长度标记的请求视为无消息体。遇到 `Transfer-Encoding`、不一致的长度、`Connection: close` 或无法定界的响应体时，报告当前可见头部后停止该方向的后续解析。暂不跨 chunked 消息体继续识别；明文 HTTP/2 不在此分析器内。消息体长度判定依据：[RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html)。
 
 `tls.server_version` 优先取 ServerHello 的 `supported_versions` 扩展，若无该扩展则取旧版版本字段。TLS 1.3 的服务端 ALPN 位于加密的 EncryptedExtensions，因而不会产生 `tls.server_alpn`；TLS 1.2 的明文 ServerHello 可报告该字段。分析器识别 HelloRetryRequest 后等待最终 ServerHello，允许两者间的兼容性 ChangeCipherSpec 记录；重试请求本身不产生最终选择字段。字段反映可见握手内容，不验证完整连接是否成功。依据：[RFC 8446](https://www.rfc-editor.org/rfc/rfc8446.html)、[RFC 7301](https://www.rfc-editor.org/rfc/rfc7301.html)。
 

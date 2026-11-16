@@ -18,6 +18,11 @@ pub enum Analysis {
     Observations(Vec<Observation>),
     /// Facts from an analyzer that has completed inspection.
     FinalObservations(Vec<Observation>),
+    /// Ordered messages from one feed; each has its own fact replacement scope.
+    Batches {
+        batches: Vec<ObservationBatch>,
+        finished: bool,
+    },
     Finished,
 }
 
@@ -25,6 +30,12 @@ pub enum Analysis {
 pub struct Observation {
     pub field: &'static str,
     pub value: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ObservationBatch {
+    pub clear_fields: &'static [&'static str],
+    pub observations: Vec<Observation>,
 }
 
 pub trait StreamAnalyzer {
@@ -197,6 +208,40 @@ fn match_tcp_observations(
         store_observations(facts, observations, updated);
     }
     blocked
+}
+
+fn apply_tcp_flow_rules(
+    flow: &mut Flow,
+    rules: &[FlowRule],
+    scope: FlowScope,
+    source: SocketAddr,
+    destination: SocketAddr,
+    payload: &[u8],
+    updated: &[&'static str],
+) {
+    let context = FlowContext {
+        protocol: Protocol::Tcp,
+        scope,
+        source,
+        destination,
+        origin: flow.origin,
+        target: flow.target,
+        reverse: source != flow.origin,
+        payload,
+        facts: &flow.facts,
+        updated,
+    };
+    for rule in rules {
+        let Some(action) = (rule.matches)(&context) else {
+            continue;
+        };
+        match action {
+            FlowAction::Allow => flow.allowed = true,
+            FlowAction::Block | FlowAction::DropPacket => flow.blocked = true,
+            FlowAction::ReplaceUdpPayload(_) => continue,
+        }
+        break;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -790,6 +835,7 @@ impl<P: Policy> Policy for Inspect<P> {
             return Verdict::DropFlow.into();
         }
         let mut updated = Vec::new();
+        let mut batches = Vec::new();
         if !flow.allowed {
             let d = &mut flow.directions[direction];
             if d.analyzers.iter().any(Option::is_some)
@@ -825,6 +871,20 @@ impl<P: Policy> Policy for Inspect<P> {
                                     );
                                     *slot = None;
                                 }
+                                Analysis::Batches {
+                                    batches: messages,
+                                    finished,
+                                } => {
+                                    flow.blocked |= messages.iter().any(|message| {
+                                        message.observations.iter().any(rule.matches.as_ref())
+                                    });
+                                    if !self.flow_rules.is_empty() {
+                                        batches.extend(messages);
+                                    }
+                                    if finished {
+                                        *slot = None;
+                                    }
+                                }
                                 Analysis::Pending => {}
                             }
                         }
@@ -857,6 +917,20 @@ impl<P: Policy> Policy for Inspect<P> {
                                     );
                                     *slot = None;
                                 }
+                                Analysis::Batches {
+                                    batches: messages,
+                                    finished,
+                                } => {
+                                    flow.blocked |= messages.iter().any(|message| {
+                                        message.observations.iter().any(rule.matches.as_ref())
+                                    });
+                                    if !self.flow_rules.is_empty() {
+                                        batches.extend(messages);
+                                    }
+                                    if finished {
+                                        *slot = None;
+                                    }
+                                }
                                 Analysis::Pending => {}
                             }
                         }
@@ -866,28 +940,37 @@ impl<P: Policy> Policy for Inspect<P> {
             }
         }
         if !flow.blocked && !flow.allowed && !self.flow_rules.is_empty() {
-            let context = FlowContext {
-                protocol: Protocol::Tcp,
-                scope: packet.scope,
-                source: t.source,
-                destination: t.destination,
-                origin: flow.origin,
-                target: flow.target,
-                reverse: t.source != flow.origin,
-                payload: t.payload,
-                facts: &flow.facts,
-                updated: &updated,
-            };
-            for rule in &self.flow_rules {
-                let Some(action) = (rule.matches)(&context) else {
-                    continue;
-                };
-                match action {
-                    FlowAction::Allow => flow.allowed = true,
-                    FlowAction::Block | FlowAction::DropPacket => flow.blocked = true,
-                    FlowAction::ReplaceUdpPayload(_) => continue,
+            if batches.is_empty() {
+                apply_tcp_flow_rules(
+                    flow,
+                    &self.flow_rules,
+                    packet.scope,
+                    t.source,
+                    t.destination,
+                    t.payload,
+                    &updated,
+                );
+            } else {
+                for batch in batches {
+                    let mut batch_updated = updated.clone();
+                    for field in batch.clear_fields {
+                        flow.facts.remove(field);
+                        batch_updated.retain(|item| item != field);
+                    }
+                    store_observations(&mut flow.facts, batch.observations, &mut batch_updated);
+                    apply_tcp_flow_rules(
+                        flow,
+                        &self.flow_rules,
+                        packet.scope,
+                        t.source,
+                        t.destination,
+                        t.payload,
+                        &batch_updated,
+                    );
+                    if flow.allowed || flow.blocked {
+                        break;
+                    }
                 }
-                break;
             }
         }
         let result = if flow.blocked {
@@ -915,6 +998,16 @@ impl<P: Policy> Policy for Inspect<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request_batch(observations: Vec<Observation>, finished: bool) -> Analysis {
+        Analysis::Batches {
+            batches: vec![ObservationBatch {
+                clear_fields: crate::http::FIELDS,
+                observations,
+            }],
+            finished,
+        }
+    }
 
     #[test]
     fn expression_text_operators_keep_field_and_payload_case_semantics() {
@@ -1453,25 +1546,28 @@ mod tests {
         let mut a = HttpHost::default();
         assert_eq!(a.feed(b"GET / HTTP/1.1\r\nHo"), Analysis::Pending);
         assert_eq!(
-            a.feed(b"st: EXAMPLE.COM\r\n\r\nbody"),
-            Analysis::FinalObservations(vec![
-                Observation {
-                    field: "http.method",
-                    value: "GET".into()
-                },
-                Observation {
-                    field: "http.target",
-                    value: "/".into()
-                },
-                Observation {
-                    field: "http.request_version",
-                    value: "HTTP/1.1".into()
-                },
-                Observation {
-                    field: "http.host",
-                    value: "example.com".into()
-                },
-            ])
+            a.feed(b"st: EXAMPLE.COM\r\nConnection: close\r\n\r\nbody"),
+            request_batch(
+                vec![
+                    Observation {
+                        field: "http.method",
+                        value: "GET".into()
+                    },
+                    Observation {
+                        field: "http.target",
+                        value: "/".into()
+                    },
+                    Observation {
+                        field: "http.request_version",
+                        value: "HTTP/1.1".into()
+                    },
+                    Observation {
+                        field: "http.host",
+                        value: "example.com".into()
+                    },
+                ],
+                true
+            )
         );
         assert_eq!(a.feed(b"more"), Analysis::Finished);
     }
@@ -1482,7 +1578,7 @@ mod tests {
             absolute.feed(
                 b"GET http://Blocked.Test/path HTTP/1.1\r\nHost: allowed.test\r\nHost: also-blocked.test\r\n\r\n"
             ),
-            Analysis::FinalObservations(vec![
+            request_batch(vec![
                 Observation { field: "http.method", value: "GET".into() },
                 Observation { field: "http.target", value: "http://Blocked.Test/path".into() },
                 Observation { field: "http.request_version", value: "HTTP/1.1".into() },
@@ -1498,29 +1594,32 @@ mod tests {
                     field: "http.host",
                     value: "also-blocked.test".into(),
                 },
-            ])
+            ], false)
         );
         let mut connect = HttpHost::default();
         assert_eq!(
             connect.feed(b"CONNECT blocked.test:443 HTTP/1.1\r\n\r\n"),
-            Analysis::FinalObservations(vec![
-                Observation {
-                    field: "http.method",
-                    value: "CONNECT".into()
-                },
-                Observation {
-                    field: "http.target",
-                    value: "blocked.test:443".into()
-                },
-                Observation {
-                    field: "http.request_version",
-                    value: "HTTP/1.1".into()
-                },
-                Observation {
-                    field: "http.host",
-                    value: "blocked.test:443".into()
-                },
-            ])
+            request_batch(
+                vec![
+                    Observation {
+                        field: "http.method",
+                        value: "CONNECT".into()
+                    },
+                    Observation {
+                        field: "http.target",
+                        value: "blocked.test:443".into()
+                    },
+                    Observation {
+                        field: "http.request_version",
+                        value: "HTTP/1.1".into()
+                    },
+                    Observation {
+                        field: "http.host",
+                        value: "blocked.test:443".into()
+                    },
+                ],
+                false
+            )
         );
     }
     #[test]
@@ -1555,6 +1654,24 @@ mod tests {
                 Verdict::DropFlow
             );
         }
+    }
+    #[test]
+    fn http_policy_inspects_second_request_in_one_tcp_segment() {
+        let mut policy = Inspect::http_hosts(
+            crate::ConstantPolicy(Verdict::Accept),
+            vec!["blocked.test".into()],
+        );
+        let payload = b"GET /one HTTP/1.1\r\nHost: allowed.test\r\n\r\nGET /two HTTP/1.1\r\nHost: blocked.test\r\n\r\n";
+        let packet = tcp(100, 16, payload, false);
+        assert_eq!(
+            policy.evaluate(Packet {
+                bytes: &packet,
+                original_len: packet.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            }),
+            Verdict::DropFlow
+        );
     }
     #[test]
     fn custom_analyzer_matches_its_own_field() {
@@ -2208,7 +2325,11 @@ mod tests {
         assert_eq!(feed(101, 4, b""), Verdict::DropFlow);
         assert_eq!(feed(5000, 2, b""), Verdict::Accept);
         assert_eq!(
-            feed(5001, 16, b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n"),
+            feed(
+                5001,
+                16,
+                b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n"
+            ),
             Verdict::Accept
         );
         assert_eq!(p.flows.len(), 1);
@@ -2369,7 +2490,7 @@ mod tests {
                     port,
                     101,
                     16,
-                    b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
+                    b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n",
                     false
                 ),
                 Verdict::Accept

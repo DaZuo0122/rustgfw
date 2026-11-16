@@ -1,5 +1,5 @@
 use rustgfw_core::{
-    conditions::{Condition, MatchRule, parse_expression_with},
+    conditions::{Condition, MatchRule, parse_expression_with, parse_hex_bytes},
     inspect::FlowAction,
 };
 use serde::Deserialize;
@@ -21,23 +21,6 @@ struct RuleSpec {
     action: String,
     replacement: Option<String>,
     replacement_hex: Option<String>,
-}
-
-fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
-    let value = value.strip_prefix("0x").unwrap_or(value);
-    if !value.len().is_multiple_of(2) {
-        return Err("replacement_hex must have an even number of digits".into());
-    }
-    value
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let pair = std::str::from_utf8(pair).unwrap();
-            u8::from_str_radix(pair, 16).map_err(|_| format!("invalid replacement_hex byte {pair}"))
-        })
-        .collect()
 }
 
 fn parse_with_expressions(
@@ -81,8 +64,8 @@ pub fn compile(source: &str) -> Result<Vec<MatchRule>, String> {
                 "replace_udp_payload" => {
                     let payload = match (spec.replacement, spec.replacement_hex) {
                         (Some(value), None) => value.into_bytes(),
-                        (None, Some(value)) => decode_hex(&value)
-                            .map_err(|error| format!("rule {:?}: {error}", spec.name))?,
+                        (None, Some(value)) => parse_hex_bytes(&value)
+                            .map_err(|error| format!("rule {:?}: invalid replacement_hex: {error}", spec.name))?,
                         _ => {
                             return Err(format!(
                                 "rule {:?}: replace_udp_payload requires one replacement or replacement_hex",

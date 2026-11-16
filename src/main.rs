@@ -551,7 +551,8 @@ mod tests {
                 "rewrite_old":"proto == udp && payload == \"old\""
             },"rules":[
                 {"name":"blocked DNS","expr":"@blocked_dns","action":"drop_packet"},
-                {"name":"rewrite","expr":"@rewrite_old","action":"replace_udp_payload","replacement":"new"}
+                {"name":"rewrite","expr":"@rewrite_old","action":"replace_udp_payload","replacement":"new"},
+                {"name":"binary","expr":"proto == udp && payload_hex starts_with 0x00ff","action":"drop_packet"}
             ]}"#,
         )
         .unwrap();
@@ -607,6 +608,11 @@ mod tests {
         assert_eq!(
             rustgfw_core::packet::parse(&output).unwrap().payload,
             b"new"
+        );
+        let binary = udp(&[0, 255, 1], 5353);
+        assert_eq!(
+            decide(&binary),
+            rustgfw_core::Decision::Verdict(Verdict::Drop)
         );
     }
 

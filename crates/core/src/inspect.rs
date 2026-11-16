@@ -984,6 +984,8 @@ mod tests {
             "payload starts_with prefix",
             "payload ends_with suffix",
             "payload contains \"\"",
+            "payload_hex contains 0x4259544553",
+            "payload_hex starts_with 0x707265666978",
         ] {
             assert!(
                 parse_expression(expression).unwrap().matches(&context),
@@ -992,6 +994,7 @@ mod tests {
         }
         for expression in [
             "payload contains bytes",
+            "payload_hex contains 0x00ff",
             "http.host ends_with .invalid.test",
             "fresh.dns.qname contains example",
         ] {
@@ -1001,6 +1004,8 @@ mod tests {
             );
         }
         assert!(parse_expression("src.port contains 1234").is_err());
+        assert!(parse_expression("payload_hex == 0x0").is_err());
+        assert!(parse_expression("payload_hex == 0xzz").is_err());
     }
 
     fn udp(payload: &[u8], reverse: bool) -> Vec<u8> {

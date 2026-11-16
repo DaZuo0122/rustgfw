@@ -107,6 +107,23 @@ impl TextOperator {
     }
 }
 
+pub fn parse_hex_bytes(value: &str) -> Result<Vec<u8>, String> {
+    let digits = value.strip_prefix("0x").unwrap_or(value);
+    if !digits.len().is_multiple_of(2) {
+        return Err("hex value must have an even number of digits".into());
+    }
+    digits
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).unwrap();
+            u8::from_str_radix(pair, 16).map_err(|_| format!("invalid hex byte {pair}"))
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Condition {
     All(Vec<Self>),
@@ -460,6 +477,10 @@ impl Parser<'_> {
                 value: value.into_bytes(),
                 operator,
             }),
+            "payload_hex" if let Some(operator) = text_operator => Ok(Condition::PayloadMatch {
+                value: parse_hex_bytes(&value)?,
+                operator,
+            }),
             "src.port" | "dst.port" | "origin.port" | "target.port" if equality => {
                 let endpoint = parse_endpoint(field.split('.').next().unwrap());
                 let value = value.parse().map_err(|_| format!("invalid port {value}"))?;
@@ -483,8 +504,8 @@ impl Parser<'_> {
                     network: cidr.parse()?,
                 })
             }
-            "proto" | "reverse" | "payload" | "src.port" | "dst.port" | "origin.port"
-            | "target.port" | "src.ip" | "dst.ip" | "origin.ip" | "target.ip" => {
+            "proto" | "reverse" | "payload" | "payload_hex" | "src.port" | "dst.port"
+            | "origin.port" | "target.port" | "src.ip" | "dst.ip" | "origin.ip" | "target.ip" => {
                 Err(format!("unsupported comparison for {field}"))
             }
             _ if let Some(operator) = text_operator => {

@@ -4,15 +4,19 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 
 ```json
 {
+  "expressions": {
+    "blocked_web": "http.host == \"blocked.test\" || tls.sni == \"blocked.test\"",
+    "blocked_dns": "proto == udp && fresh.dns.qname == \"blocked.test\""
+  },
   "rules": [
     {
       "name": "block web host",
-      "expr": "proto == tcp && (http.host == \"blocked.test\" || tls.sni == \"blocked.test\")",
+      "expr": "proto == tcp && @blocked_web",
       "action": "block"
     },
     {
       "name": "drop one DNS query",
-      "expr": "proto == udp && fresh.dns.qname == \"blocked.test\"",
+      "expr": "@blocked_dns",
       "action": "drop_packet"
     },
     {
@@ -28,6 +32,8 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 例如 `rustgfw nfqueue 100 accept nft=forward rules-file=rules.json`。`rules-file` 可以和现有的传输层规则、资源预算参数一起使用；传输层规则先执行。当前没有规则文件热更新入口。
 
 表达式使用 `!`、`&&`、`||` 和括号，优先级依次递减。比较值可用裸词或双引号字符串；字符串支持 `\"`、`\\`、`\n`、`\r`、`\t`。可比较的内容：
+
+可选的 `expressions` 对象定义命名条件，在规则或其他命名条件中以 `@名称` 引用。加载时递归展开引用，并检查未知名称和循环引用；展开后的规则按正常布尔逻辑求值。命名条件只组合匹配条件，动作仍由各条规则指定。
 
 | 左侧 | 写法 | 含义 |
 | --- | --- | --- |

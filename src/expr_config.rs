@@ -1,13 +1,15 @@
 use rustgfw_core::{
-    conditions::{MatchRule, parse_expression},
+    conditions::{Condition, MatchRule, parse_expression_with},
     inspect::FlowAction,
 };
 use serde::Deserialize;
-use std::{error::Error, fs, path::Path};
+use std::{collections::HashMap, error::Error, fs, path::Path};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuleFile {
+    #[serde(default)]
+    expressions: HashMap<String, String>,
     rules: Vec<RuleSpec>,
 }
 
@@ -38,12 +40,34 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+fn parse_with_expressions(
+    source: &str,
+    expressions: &HashMap<String, String>,
+    active: &mut Vec<String>,
+) -> Result<Condition, String> {
+    parse_expression_with(source, &mut |name| {
+        if active.iter().any(|item| item == name) {
+            return Err(format!(
+                "cyclic expression reference: {} -> {name}",
+                active.join(" -> ")
+            ));
+        }
+        let expression = expressions
+            .get(name)
+            .ok_or_else(|| format!("unknown expression reference @{name}"))?;
+        active.push(name.to_owned());
+        let result = parse_with_expressions(expression, expressions, active);
+        active.pop();
+        result
+    })
+}
+
 pub fn compile(source: &str) -> Result<Vec<MatchRule>, String> {
     let file: RuleFile = serde_json::from_str(source).map_err(|error| error.to_string())?;
     file.rules
         .into_iter()
         .map(|spec| {
-            let condition = parse_expression(&spec.expr)
+            let condition = parse_with_expressions(&spec.expr, &file.expressions, &mut Vec::new())
                 .map_err(|error| format!("rule {:?}: {error}", spec.name))?;
             for field in condition.fields() {
                 if !matches!(field, "http.host" | "tls.sni" | "dns.qname") {
@@ -107,5 +131,41 @@ mod tests {
         assert!(compile(r#"{"rules":[{"name":"bad","expr":"proto == udp","action":"replace_udp_payload","replacement_hex":"z0"}]}"#)
             .unwrap_err()
             .contains("invalid replacement_hex"));
+    }
+
+    #[test]
+    fn expands_reusable_expressions_and_rejects_reference_cycles() {
+        let rules = compile(
+            r#"{
+                "expressions": {
+                    "web": "http.host == blocked.test || tls.sni == blocked.test",
+                    "restricted": "proto == tcp && @web"
+                },
+                "rules": [
+                    {"name":"block web", "expr":"@restricted && !reverse == true", "action":"block"},
+                    {"name":"allow web", "expr":"@web", "action":"allow"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(
+            rules[0].condition,
+            rustgfw_core::conditions::parse_expression(
+                "(proto == tcp && (http.host == blocked.test || tls.sni == blocked.test)) && !reverse == true"
+            )
+            .unwrap()
+        );
+        assert!(rules[1].condition.references_field("tls.sni"));
+
+        let cycle = compile(
+            r#"{"expressions":{"a":"@b","b":"@a"},"rules":[{"name":"loop","expr":"@a","action":"block"}]}"#,
+        )
+        .unwrap_err();
+        assert!(cycle.contains("cyclic expression reference: a -> b -> a"));
+        let unknown =
+            compile(r#"{"rules":[{"name":"missing","expr":"@missing","action":"block"}]}"#)
+                .unwrap_err();
+        assert!(unknown.contains("unknown expression reference @missing"));
     }
 }

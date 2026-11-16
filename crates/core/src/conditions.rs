@@ -321,11 +321,12 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
     Ok(tokens)
 }
 
-struct Parser {
+struct Parser<'a> {
     tokens: Vec<Token>,
     index: usize,
+    resolve: &'a mut dyn FnMut(&str) -> Result<Condition, String>,
 }
-impl Parser {
+impl Parser<'_> {
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.index)
     }
@@ -381,6 +382,16 @@ impl Parser {
                 return Err("missing closing parenthesis".into());
             }
             return Ok(condition);
+        }
+        if let Some(Token::Word(reference)) = self.peek()
+            && let Some(name) = reference.strip_prefix('@')
+        {
+            let name = name.to_owned();
+            self.take();
+            if name.is_empty() {
+                return Err("empty expression reference".into());
+            }
+            return (self.resolve)(&name);
         }
         self.comparison()
     }
@@ -451,9 +462,21 @@ fn parse_endpoint(name: &str) -> Endpoint {
 }
 
 pub fn parse_expression(input: &str) -> Result<Condition, String> {
+    parse_expression_with(input, &mut |name| {
+        Err(format!("unknown expression reference @{name}"))
+    })
+}
+
+/// Parse an expression with reusable named conditions resolved by the caller.
+/// The resolver returns an expanded condition, so matching has no lookup step.
+pub fn parse_expression_with(
+    input: &str,
+    resolve: &mut dyn FnMut(&str) -> Result<Condition, String>,
+) -> Result<Condition, String> {
     let mut parser = Parser {
         tokens: tokenize(input)?,
         index: 0,
+        resolve,
     };
     let condition = parser.or()?;
     if parser.peek().is_some() {
@@ -554,5 +577,21 @@ mod tests {
         assert!(mixed.can_match_protocol(Protocol::Udp, &field_possible));
         let absent_field = parse_expression("!(http.host == blocked.test)").unwrap();
         assert!(absent_field.can_match_protocol(Protocol::Udp, &field_possible));
+    }
+
+    #[test]
+    fn named_conditions_expand_inside_boolean_expressions() {
+        let mut resolve = |name: &str| match name {
+            "web" => parse_expression("http.host == blocked.test || tls.sni == blocked.test"),
+            _ => Err(format!("unknown expression reference @{name}")),
+        };
+        let actual = parse_expression_with("proto == tcp && @web", &mut resolve).unwrap();
+        let expected = parse_expression(
+            "proto == tcp && (http.host == blocked.test || tls.sni == blocked.test)",
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+        assert!(parse_expression("@web").is_err());
+        assert!(parse_expression_with("@", &mut resolve).is_err());
     }
 }

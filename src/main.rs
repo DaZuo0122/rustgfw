@@ -540,9 +540,12 @@ mod tests {
             std::path::PathBuf::from(format!("target/expr-rules-{}.json", std::process::id()));
         std::fs::write(
             &path,
-            r#"{"rules":[
-                {"name":"blocked DNS","expr":"proto == udp && fresh.dns.qname == blocked.test","action":"drop_packet"},
-                {"name":"rewrite","expr":"proto == udp && payload == \"old\"","action":"replace_udp_payload","replacement":"new"}
+            r#"{"expressions":{
+                "blocked_dns":"proto == udp && fresh.dns.qname == blocked.test",
+                "rewrite_old":"proto == udp && payload == \"old\""
+            },"rules":[
+                {"name":"blocked DNS","expr":"@blocked_dns","action":"drop_packet"},
+                {"name":"rewrite","expr":"@rewrite_old","action":"replace_udp_payload","replacement":"new"}
             ]}"#,
         )
         .unwrap();

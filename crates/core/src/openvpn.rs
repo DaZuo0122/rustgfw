@@ -1,5 +1,13 @@
 //! OpenVPN UDP control handshake observations.
-use crate::inspect::{Observation, UdpStreamAnalysis, UdpStreamAnalyzer};
+use crate::inspect::{
+    Analysis, BidirectionalStreamAnalyzer, Observation, UdpStreamAnalysis, UdpStreamAnalyzer,
+};
+
+pub const TCP_FIELDS: &[&str] = &[
+    "openvpn.stage",
+    "openvpn.client_reset",
+    "openvpn.server_reset",
+];
 
 pub const FIELDS: &[&str] = &[
     "openvpn.stage",
@@ -99,6 +107,75 @@ impl UdpStreamAnalyzer for OpenVpnUdp {
     }
 }
 
+#[derive(Default)]
+pub struct OpenVpnTcp {
+    pending: [Vec<u8>; 2],
+    client_reset: Option<u8>,
+    finished: bool,
+}
+
+impl BidirectionalStreamAnalyzer for OpenVpnTcp {
+    fn feed(&mut self, bytes: &[u8], reverse: bool) -> Analysis {
+        if self.finished {
+            return Analysis::Finished;
+        }
+        if !reverse && self.client_reset.is_some() {
+            return Analysis::Pending;
+        }
+        let pending = &mut self.pending[usize::from(reverse)];
+        pending.extend_from_slice(bytes);
+        if pending.len() < 2 {
+            return Analysis::Pending;
+        }
+        let frame_len = usize::from(u16::from_be_bytes([pending[0], pending[1]]));
+        if frame_len < 9 {
+            self.finished = true;
+            return Analysis::Finished;
+        }
+        if pending.len() < frame_len + 2 {
+            return Analysis::Pending;
+        }
+        let first = pending[2];
+        let opcode = first >> 3;
+        if first & 7 != 0 {
+            self.finished = true;
+            return Analysis::Finished;
+        }
+        if reverse {
+            let Some(client) = self.client_reset else {
+                self.finished = true;
+                return Analysis::Finished;
+            };
+            if !server_reset(opcode) {
+                self.finished = true;
+                return Analysis::Finished;
+            }
+            self.finished = true;
+            Analysis::FinalObservations(vec![
+                Observation {
+                    field: "openvpn.stage",
+                    value: "handshake".into(),
+                },
+                Observation {
+                    field: "openvpn.client_reset",
+                    value: client.to_string(),
+                },
+                Observation {
+                    field: "openvpn.server_reset",
+                    value: opcode.to_string(),
+                },
+            ])
+        } else if client_reset(opcode) {
+            self.client_reset = Some(opcode);
+            pending.clear();
+            Analysis::Pending
+        } else {
+            self.finished = true;
+            Analysis::Finished
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +216,37 @@ mod tests {
         assert!(matches!(
             analyzer.feed(&[0xff; 6], true),
             UdpStreamAnalysis::ClearFields(_)
+        ));
+    }
+
+    #[test]
+    fn tcp_waits_for_complete_framed_resets_in_both_directions() {
+        let mut analyzer = OpenVpnTcp::default();
+        let client = [0, 9, 7 << 3, 1, 2, 3, 4, 5, 6, 7, 8];
+        let server = [0, 9, 8 << 3, 9, 10, 11, 12, 13, 14, 15, 16];
+        for byte in client {
+            assert!(matches!(analyzer.feed(&[byte], false), Analysis::Pending));
+        }
+        assert!(matches!(
+            analyzer.feed(&server[..5], true),
+            Analysis::Pending
+        ));
+        let result = analyzer.feed(&server[5..], true);
+        let Analysis::FinalObservations(fields) = result else {
+            panic!("expected complete OpenVPN TCP handshake");
+        };
+        assert_eq!(
+            fields
+                .iter()
+                .find(|item| item.field == "openvpn.stage")
+                .map(|item| item.value.as_str()),
+            Some("handshake")
+        );
+
+        let mut invalid = OpenVpnTcp::default();
+        assert!(matches!(
+            invalid.feed(&[0, 9, 6 << 3, 0, 0, 0, 0, 0, 0, 0, 0], false),
+            Analysis::Finished
         ));
     }
 }

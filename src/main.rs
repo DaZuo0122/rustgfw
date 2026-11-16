@@ -1,7 +1,10 @@
 use rustgfw_core::{
     Verdict,
     conditions::MatchRule,
-    inspect::{AnalyzerRule, DatagramPort, DatagramRule, InspectLimits, UdpStreamRule},
+    inspect::{
+        AnalyzerRule, BidirectionalAnalyzerRule, DatagramPort, DatagramRule, InspectLimits,
+        UdpStreamRule,
+    },
     packet::Protocol,
     rules::{Rule, RulesLimits},
 };
@@ -140,10 +143,10 @@ impl Options {
         let ssh_banner_bytes = self.ssh_banner_bytes;
         let dns_names = self.dns_names;
         let field_possible = |field: &str, protocol| {
-            if rustgfw_core::wireguard::FIELDS.contains(&field)
-                || rustgfw_core::openvpn::FIELDS.contains(&field)
-            {
+            if rustgfw_core::wireguard::FIELDS.contains(&field) {
                 protocol == Protocol::Udp
+            } else if rustgfw_core::openvpn::FIELDS.contains(&field) {
+                protocol == Protocol::Udp || rustgfw_core::openvpn::TCP_FIELDS.contains(&field)
             } else {
                 !matches!(
                     field,
@@ -177,6 +180,12 @@ impl Options {
         let needs_openvpn_udp = self.expr_rules.iter().any(|rule| {
             eligible(rule, Protocol::Udp)
                 && rustgfw_core::openvpn::FIELDS
+                    .iter()
+                    .any(|field| rule.condition.references_field(field))
+        });
+        let needs_openvpn_tcp = self.expr_rules.iter().any(|rule| {
+            eligible(rule, Protocol::Tcp)
+                && rustgfw_core::openvpn::TCP_FIELDS
                     .iter()
                     .any(|field| rule.condition.references_field(field))
         });
@@ -278,6 +287,16 @@ impl Options {
             analyzers,
             datagrams,
             self.inspect_limits,
+        )
+        .with_bidirectional_analyzers(
+            needs_openvpn_tcp
+                .then(|| {
+                    BidirectionalAnalyzerRule::observing(None, || {
+                        Box::new(rustgfw_core::openvpn::OpenVpnTcp::default())
+                    })
+                })
+                .into_iter()
+                .collect(),
         )
         .with_flow_rules(tcp_rules)
         .with_udp_streams(udp_analyzers, udp_rules)
@@ -826,6 +845,65 @@ mod tests {
             Verdict::Accept
         );
         assert_eq!(evaluate(&mut policy, &udp(&data, false)), Verdict::Accept);
+    }
+
+    #[test]
+    fn openvpn_tcp_expression_waits_for_split_reverse_reset() {
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"openvpn tcp","expr":"proto == tcp && openvpn.stage == handshake && openvpn.client_reset == 7 && openvpn.server_reset == 8","action":"block"}]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let tcp = |sequence: u32, payload: &[u8], reverse: bool| {
+            let mut bytes = vec![0; 40 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 6;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&1194u16.to_be_bytes());
+            bytes[24..28].copy_from_slice(&sequence.to_be_bytes());
+            bytes[32] = 0x50;
+            bytes[33] = 0x18;
+            bytes[40..].copy_from_slice(payload);
+            if reverse {
+                for offset in 0..4 {
+                    bytes.swap(12 + offset, 16 + offset);
+                }
+                bytes.swap(20, 22);
+                bytes.swap(21, 23);
+            }
+            bytes
+        };
+        let evaluate = |policy: &mut dyn Policy, bytes: &[u8]| {
+            policy.evaluate(Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        let client = [0, 9, 7 << 3, 1, 2, 3, 4, 5, 6, 7, 8];
+        let server = [0, 9, 8 << 3, 9, 10, 11, 12, 13, 14, 15, 16];
+        assert_eq!(
+            evaluate(&mut policy, &tcp(100, &client[..3], false)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            evaluate(&mut policy, &tcp(103, &client[3..], false)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            evaluate(&mut policy, &tcp(500, &server[..4], true)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            evaluate(&mut policy, &tcp(504, &server[4..], true)),
+            Verdict::DropFlow
+        );
     }
 
     #[test]

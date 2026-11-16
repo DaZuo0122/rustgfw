@@ -53,7 +53,15 @@ pub fn compile(source: &str) -> Result<Vec<MatchRule>, String> {
             let condition = parse_with_expressions(&spec.expr, &file.expressions, &mut Vec::new())
                 .map_err(|error| format!("rule {:?}: {error}", spec.name))?;
             for field in condition.fields() {
-                if !matches!(field, "http.host" | "tls.sni" | "dns.qname") {
+                if !matches!(
+                    field,
+                    "http.host"
+                        | "tls.sni"
+                        | "dns.qname"
+                        | "ssh.protocol"
+                        | "ssh.software"
+                        | "ssh.banner"
+                ) {
                     return Err(format!("rule {:?}: unknown observation field {field}", spec.name));
                 }
             }

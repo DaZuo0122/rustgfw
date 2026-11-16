@@ -16,7 +16,7 @@ fn main() -> Result<(), Error> {
     match args.first().map(String::as_str) {
         Some("nfqueue") => run_nfqueue(&args[1..]),
         Some("windivert") => run_windivert(&args[1..]),
-        _ => Err("usage: rustgfw nfqueue <queue> <accept|drop> [rules...] [nft=input|output|forward] [ctmark=0x80000000] | rustgfw windivert <dll> <network|forward> <accept|drop> [rules...]; shared options: rules-file=path inspect-flows=N transport-flows=N flow-idle-seconds=N reorder-bytes=N http-header-bytes=N tls-buffer-bytes=N dns-message-bytes=N".into()),
+        _ => Err("usage: rustgfw nfqueue <queue> <accept|drop> [rules...] [nft=input|output|forward] [ctmark=0x80000000] | rustgfw windivert <dll> <network|forward> <accept|drop> [rules...]; shared options: rules-file=path inspect-flows=N transport-flows=N flow-idle-seconds=N reorder-bytes=N http-header-bytes=N tls-buffer-bytes=N dns-message-bytes=N ssh-banner-bytes=N".into()),
     }
 }
 
@@ -34,6 +34,7 @@ struct Options {
     http_header_bytes: usize,
     tls_buffer_bytes: usize,
     dns_message_bytes: usize,
+    ssh_banner_bytes: usize,
 }
 impl Options {
     fn parse(default: &str, args: &[String]) -> Result<Self, Error> {
@@ -56,6 +57,7 @@ impl Options {
             http_header_bytes: 16384,
             tls_buffer_bytes: 131072,
             dns_message_bytes: 65535,
+            ssh_banner_bytes: 1024,
         };
         let mut rule_file_seen = false;
         for arg in args {
@@ -114,6 +116,11 @@ impl Options {
                 if options.dns_message_bytes == 0 {
                     return Err("dns-message-bytes must be positive".into());
                 }
+            } else if let Some(value) = arg.strip_prefix("ssh-banner-bytes=") {
+                options.ssh_banner_bytes = value.parse()?;
+                if options.ssh_banner_bytes == 0 {
+                    return Err("ssh-banner-bytes must be positive".into());
+                }
             } else {
                 options.rules.push(parse_rule(arg)?);
             }
@@ -130,9 +137,13 @@ impl Options {
         let http_header_bytes = self.http_header_bytes;
         let tls_buffer_bytes = self.tls_buffer_bytes;
         let dns_message_bytes = self.dns_message_bytes;
+        let ssh_banner_bytes = self.ssh_banner_bytes;
         let dns_names = self.dns_names;
         let field_possible = |field: &str, protocol| {
-            !matches!(field, "http.host" | "tls.sni") || protocol == Protocol::Tcp
+            !matches!(
+                field,
+                "http.host" | "tls.sni" | "ssh.protocol" | "ssh.software" | "ssh.banner"
+            ) || protocol == Protocol::Tcp
         };
         let eligible = |rule: &MatchRule, protocol| {
             rule.condition.can_match_protocol(protocol, &field_possible)
@@ -145,6 +156,9 @@ impl Options {
         let needs_http = needs_tcp_field("http.host");
         let needs_tls = needs_tcp_field("tls.sni");
         let needs_dns_tcp = needs_tcp_field("dns.qname");
+        let needs_ssh = ["ssh.protocol", "ssh.software", "ssh.banner"]
+            .into_iter()
+            .any(needs_tcp_field);
         let needs_dns_udp = self.expr_rules.iter().any(|rule| {
             eligible(rule, Protocol::Udp) && rule.condition.references_field("dns.qname")
         });
@@ -207,6 +221,11 @@ impl Options {
                     ))
                 })
             },
+            needs_ssh.then(|| {
+                AnalyzerRule::observing(None, move || {
+                    Box::new(rustgfw_core::ssh::SshBanner::with_limit(ssh_banner_bytes))
+                })
+            }),
         ]
         .into_iter()
         .flatten()
@@ -505,6 +524,51 @@ mod tests {
         assert_eq!(options.into_policy().evaluate(packet), Verdict::DropFlow);
         assert!(Options::parse("accept", &["flow-idle-seconds=0".into()]).is_err());
     }
+
+    #[test]
+    fn ssh_expression_inspects_fragmented_banner_on_nonstandard_port() {
+        let rules = expr_config::compile(
+            r#"{"rules":[{"name":"ssh software","expr":"proto == tcp && fresh.ssh.software contains openssh","action":"block"}]}"#,
+        )
+        .unwrap();
+        let tcp = |sequence: u32, payload: &[u8]| {
+            let mut bytes = vec![0; 40 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 6;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&2222u16.to_be_bytes());
+            bytes[24..28].copy_from_slice(&sequence.to_be_bytes());
+            bytes[32] = 0x50;
+            bytes[33] = 0x18;
+            bytes[40..].copy_from_slice(payload);
+            bytes
+        };
+        let first = b"notice\r\nSSH-2.";
+        let second = b"0-OpenSSH_9.9 comments\r\n";
+        let first_packet = tcp(100, first);
+        let second_packet = tcp(100 + first.len() as u32, second);
+        for (limit, expected) in [(1024, Verdict::DropFlow), (8, Verdict::Accept)] {
+            let mut options =
+                Options::parse("accept", &[format!("ssh-banner-bytes={limit}")]).unwrap();
+            options.expr_rules = rules.clone();
+            let mut policy = options.into_policy();
+            let evaluate = |policy: &mut dyn Policy, bytes: &[u8]| {
+                policy.evaluate(Packet {
+                    bytes,
+                    original_len: bytes.len(),
+                    checksum_ready: true,
+                    scope: FlowScope::default(),
+                })
+            };
+            assert_eq!(evaluate(&mut policy, &first_packet), Verdict::Accept);
+            assert_eq!(evaluate(&mut policy, &second_packet), expected);
+        }
+    }
+
     #[test]
     fn cli_dns_message_budget_reaches_tcp_analyzer() {
         let mut query = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];

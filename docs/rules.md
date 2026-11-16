@@ -44,9 +44,10 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 | `payload` | `payload contains "old"` | 当前传输层载荷中的字节片段 |
 | `payload_hex` | `payload_hex starts_with 0x00ff` | 当前传输层载荷中的二进制字节；十六进制数字须成对 |
 | `http.host`、`tls.sni`、`dns.qname` | `http.host ends_with ".example.com"` | 流内最近一次观察批次的任一值 |
+| `ssh.protocol`、`ssh.software`、`ssh.banner` | `fresh.ssh.software contains "OpenSSH"` | TCP 任一方向首次识别出的 SSH 标识行字段 |
 | `fresh.` 加字段名 | `fresh.dns.qname == "blocked.test"` | 该字段必须由当前包更新 |
 
-`origin`、`target` 是创建流时第一个包的端点；`src`、`dst` 随当前包方向变化。HTTP 只分析首个 HTTP/1 请求，TLS 只分析可见的 ClientHello SNI；DNS 在 TCP/UDP 端口 53 分析。`fresh.` 适合逐包丢弃或修改，避免沿用较早数据报留下的观察值。
+`origin`、`target` 是创建流时第一个包的端点；`src`、`dst` 随当前包方向变化。HTTP 只分析首个 HTTP/1 请求，TLS 只分析可见的 ClientHello SNI；DNS 在 TCP/UDP 端口 53 分析。SSH 读取每个 TCP 方向的首条标识行，允许此前出现提示行，单方向最多读取 `ssh-banner-bytes` 字节。`fresh.` 适合逐包丢弃或修改，避免沿用较早数据报留下的观察值。
 
 UDP 分析器拒绝数据报时，该包直接丢弃，本次不再用流内旧观察值执行表达式规则；后续数据报仍可继续检查。
 

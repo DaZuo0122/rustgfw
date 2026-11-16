@@ -6,6 +6,7 @@ pub mod inspect;
 pub mod offload;
 pub mod packet;
 pub mod rules;
+pub mod ssh;
 pub mod tcp;
 pub mod tls;
 

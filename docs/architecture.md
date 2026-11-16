@@ -29,7 +29,9 @@ DNS：`rustgfw nfqueue 100 accept dns-name=blocked.test` 匹配标准查询的 I
 
 TLS：`rustgfw nfqueue 100 accept tls-sni=blocked.test` 检查明文 ClientHello SNI，支持 TCP 分段和 TLS handshake record 分段。可同时指定 `http-host=`。SNI 精确匹配且忽略 ASCII 大小写；不解密 ECH 内层域名，不涵盖 QUIC。ClientHello 声明的正文长度上限 64 KiB，暂存字节预算由 `tls-buffer-bytes` 控制；超预算、无 SNI 或无法识别时结束该分析器并沿用传输层裁决。
 
-HTTP/TLS/DNS TCP 通过 `AnalyzerRule` 注册，共享流表及每方向 TCP 重组。UDP DNS 通过 `DatagramRule` 注册，逐个数据报分析，不占用 TCP 流表；数据报规则可限制源端口、目的端口或任一端口，畸形结果可要求丢弃该包。两类分析器都报告带字段名的观察值，由规则回调匹配；新增同类分析器无需修改引擎中的协议匹配分支。TCP 观察结果区分完成与可继续分析，HTTP/TLS 报告后释放分析器，DNS TCP 可在同一流中报告后续查询。带端口限制的 TCP 分析器只为匹配端口的连接建立检查状态，其他 TCP 连接不占用检查流表。任一分析器匹配即阻断，其他分析器不能撤销这一决定。相同初始 SYN 重传保持状态，新的初始序号触发端点复用重建；这是被动流识别，不是内核 TCP 状态机的等价实现。
+SSH：表达式可用 `ssh.protocol`、`ssh.software`、`ssh.banner` 匹配 TCP 任一方向的首次 SSH 标识行，例如 `ssh.software contains "OpenSSH"`。分析器支持分段标识行和此前的提示行，不限定端口；单方向默认读取最多 1024 字节，可用 `ssh-banner-bytes=N` 调整。无法识别或超预算时结束该方向的分析，不解析后续加密握手。
+
+HTTP/TLS/DNS TCP/SSH 通过 `AnalyzerRule` 注册，共享流表及每方向 TCP 重组。UDP DNS 通过 `DatagramRule` 注册，逐个数据报分析，不占用 TCP 流表；数据报规则可限制源端口、目的端口或任一端口，畸形结果可要求丢弃该包。两类分析器都报告带字段名的观察值，由规则回调匹配；新增同类分析器无需修改引擎中的协议匹配分支。TCP 观察结果区分完成与可继续分析，HTTP/TLS/SSH 报告后释放分析器，DNS TCP 可在同一流中报告后续查询。带端口限制的 TCP 分析器只为匹配端口的连接建立检查状态，其他 TCP 连接不占用检查流表。任一分析器匹配即阻断，其他分析器不能撤销这一决定。相同初始 SYN 重传保持状态，新的初始序号触发端点复用重建；这是被动流识别，不是内核 TCP 状态机的等价实现。
 
 核心还支持 `AnalyzerRule::observing` 与 `FlowRule`：分析器只产出观察值，流级回调通过 `FlowContext` 读取同一双向 TCP 流的多个字段并组合判断，也可直接根据端点与作用域判断。`BidirectionalAnalyzerRule` 为整条 TCP 流创建一个分析器实例，两方向共用内部状态，但输入仍分别经过 TCP 重组；原有 `AnalyzerRule` 继续按方向创建实例。`FlowContext` 同时提供当前包的 `source`/`destination`、载荷 `payload` 和建流时固定的 `origin`/`target`，`reverse` 标示当前包相对建流方向是否反向。规则按注册顺序取第一个命中的 `Allow` 或 `Block`；`Allow` 结束该流的应用层检查，传输层规则仍逐包执行。`UdpStreamRule` 为双向 UDP 流创建独立分析器实例，保留跨数据报观察值并复用流级规则；`DropPacket` 只丢当前 UDP 数据报，对 TCP 则阻断整条流。原有 `DatagramRule` 继续按单个数据报执行，当前命令行的 UDP DNS 使用这一路径。每个字段保留最近一次观察批次的所有值；TCP 的新初始 SYN、空闲过期或显式清空会丢弃相关属性。平台后端提供的 `FlowScope` 参与流键，防止不同流量域复用属性。Linux 的动态内核卸载只处理 TCP `DropFlow`，UDP 阻断留在用户态逐包执行。
 
@@ -40,6 +42,8 @@ TCP 重组模块 `core::tcp` 已接入 `core::inspect` 的双向分析路径，�
 `rustgfw nfqueue 100 accept http-host=blocked.test` 检查首个 HTTP/1 请求的所有 Host 头、绝对 URI 的 authority，以及 CONNECT 目标（大小写不敏感，含端口时需完整匹配）。任一值命中即阻断；无关头里的非 UTF-8 字节不妨碍 Host 识别。传输层规则先执行，Host 规则进一步阻断。识别前的包会放行；跨包分析不是代理式整请求缓冲。每方向乱序缓存及 HTTP 头默认各限 16 KiB，TCP 与可选的有状态 UDP 检查共用默认最多 16384 条流的容量，空闲 120 秒过期。双向 FIN 或未阻断流的 RST 会释放检查状态；单向 FIN 保留反向分析。容量满时只在有新完成流时扫描回收；仍满则丢弃新流的包。阻断流的 RST 不单凭包头清除用户态阻断状态。如果已完成分析的长连接继续发包，容量回收后可能再次进入首请求分析。超长或无法识别的 HTTP 头结束该分析器并沿用传输层结果；减小头预算可能让更长的阻断目标头无法被识别。不支持 keep-alive 多请求检查和 HTTP/2。
 
 资源预算可由 `inspect-flows=N`、`transport-flows=N`、`flow-idle-seconds=N`、`reorder-bytes=N`、`http-header-bytes=N`、`tls-buffer-bytes=N`、`dns-message-bytes=N` 设置，Linux 和 Windows 命令使用同一组参数。例如 `rustgfw nfqueue 100 accept nft=forward inspect-flows=8192 transport-flows=131072 flow-idle-seconds=300 reorder-bytes=32768 http-header-bytes=32768 tls-buffer-bytes=131072 dns-message-bytes=65535 http-host=blocked.test`。`flow-idle-seconds` 同时作用于检查流表和传输层规则缓存；乱序预算按每方向计算。TLS 暂存预算默认 128 KiB，DNS TCP 单消息预算默认 65535 字节，UDP DNS 不受该预算影响。预算过低会使较大的匹配目标无法识别，此时使用传输层裁决。
+
+SSH 标识行单方向读取预算另由 `ssh-banner-bytes=N` 设置，默认 1024 字节。
 
 2026-11-13/14 验证：Windows 与 Debian workspace 单元测试及 Clippy `-D warnings` 通过。Debian 使用隔离网络命名空间验证 nftables → NFQUEUE → 引擎路径的 UDP、跨包 HTTP、TLS SNI、DNS、动态 TCP 阻断、RST 撤销及 conntrack 销毁事件。双 veth 转发拓扑中 IPv4/IPv6 UDP 的放行和内核丢弃、分段 HTTP Host 的放行和阻断均通过；UDP nft 计数器分别记录 2 个入队包和 2 个内核丢弃包。两种 IP 版本各连续发送 300 个有序 UDP 包，全部到达。额外通过 prerouting `notrack` 验证无 conntrack ID 的 IPv4/IPv6 HTTP 流仍在用户态阻断，且未写入 `blocked_ct`。20,000 包突发触发 NFQUEUE `ENOBUFS`，修复后进程保持运行且后续包正常交付；这不证明突发中的 UDP 包无损。故障注入移除动态集合但保留队列规则后，`nft` 卸载写入失败仍由用户态阻断且进程保持运行。单条转发 UDP 流以约 1,750 包/秒持续 34 秒，60,000 包全部按序到达，之后 HTTP Host 阻断仍生效；尚未覆盖多流长期高负载及 conntrack 事件流溢出。未使用 sudo，未改主机防火墙。测试辅助脚本放本地忽略目录 `target/`，不提交。
 

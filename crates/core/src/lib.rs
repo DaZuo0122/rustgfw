@@ -7,6 +7,7 @@ pub mod offload;
 pub mod openvpn;
 pub mod packet;
 pub mod rules;
+pub mod socks;
 pub mod ssh;
 pub mod tcp;
 pub mod tls;

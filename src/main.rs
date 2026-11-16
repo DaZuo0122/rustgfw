@@ -147,6 +147,8 @@ impl Options {
                 protocol == Protocol::Udp
             } else if rustgfw_core::openvpn::FIELDS.contains(&field) {
                 protocol == Protocol::Udp || rustgfw_core::openvpn::TCP_FIELDS.contains(&field)
+            } else if rustgfw_core::socks::FIELDS.contains(&field) {
+                protocol == Protocol::Tcp
             } else {
                 !matches!(
                     field,
@@ -168,6 +170,9 @@ impl Options {
         let needs_ssh = ["ssh.protocol", "ssh.software", "ssh.banner"]
             .into_iter()
             .any(needs_tcp_field);
+        let needs_socks = rustgfw_core::socks::FIELDS
+            .iter()
+            .any(|field| needs_tcp_field(field));
         let needs_dns_udp = self.expr_rules.iter().any(|rule| {
             eligible(rule, Protocol::Udp) && rule.condition.references_field("dns.qname")
         });
@@ -289,14 +294,21 @@ impl Options {
             self.inspect_limits,
         )
         .with_bidirectional_analyzers(
-            needs_openvpn_tcp
-                .then(|| {
+            [
+                needs_openvpn_tcp.then(|| {
                     BidirectionalAnalyzerRule::observing(None, || {
                         Box::new(rustgfw_core::openvpn::OpenVpnTcp::default())
                     })
-                })
-                .into_iter()
-                .collect(),
+                }),
+                needs_socks.then(|| {
+                    BidirectionalAnalyzerRule::observing(None, || {
+                        Box::new(rustgfw_core::socks::SocksRequest::default())
+                    })
+                }),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
         )
         .with_flow_rules(tcp_rules)
         .with_udp_streams(udp_analyzers, udp_rules)
@@ -902,6 +914,54 @@ mod tests {
         );
         assert_eq!(
             evaluate(&mut policy, &tcp(504, &server[4..], true)),
+            Verdict::DropFlow
+        );
+    }
+
+    #[test]
+    fn socks_expression_matches_fragmented_proxy_target() {
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"expressions":{
+                "proxy_target":"socks.target_type == domain && socks.target_host == blocked.test",
+                "socks_request":"socks.version == 5 && socks.command == connect && socks.target_port == 443"
+            },"rules":[{"name":"proxy target","expr":"proto == tcp && @proxy_target && @socks_request","action":"block"}]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let tcp = |sequence: u32, payload: &[u8]| {
+            let mut bytes = vec![0; 40 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 6;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&1081u16.to_be_bytes());
+            bytes[24..28].copy_from_slice(&sequence.to_be_bytes());
+            bytes[32] = 0x50;
+            bytes[33] = 0x18;
+            bytes[40..].copy_from_slice(payload);
+            bytes
+        };
+        let evaluate = |policy: &mut dyn Policy, bytes: &[u8]| {
+            policy.evaluate(Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        let greeting = b"\x05\x01\x00";
+        let request = b"\x05\x01\x00\x03\x0cblocked.test\x01\xbb";
+        assert_eq!(evaluate(&mut policy, &tcp(100, greeting)), Verdict::Accept);
+        assert_eq!(
+            evaluate(&mut policy, &tcp(103, &request[..7])),
+            Verdict::Accept
+        );
+        assert_eq!(
+            evaluate(&mut policy, &tcp(110, &request[7..])),
             Verdict::DropFlow
         );
     }

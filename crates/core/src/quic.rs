@@ -14,6 +14,7 @@ pub const FIELDS: &[&str] = &[
     "quic.alpn",
     "quic.tls_supported_version",
     "quic.ech_extension",
+    "quic.transport_parameters",
 ];
 const V1: u32 = 1;
 const V2: u32 = 0x6b33_43cf;
@@ -401,6 +402,10 @@ impl UdpStreamAnalyzer for QuicInitial {
                 field: "quic.ech_extension",
                 value: hello.ech_extension.to_string(),
             });
+            observations.push(Observation {
+                field: "quic.transport_parameters",
+                value: hello.quic_transport_parameters.to_string(),
+            });
         }
         UdpStreamAnalysis::FinalObservations(observations)
     }
@@ -426,7 +431,7 @@ mod tests {
         output
     }
 
-    fn client_hello(name: &str) -> Vec<u8> {
+    fn client_hello(name: &str, with_transport_parameters: bool) -> Vec<u8> {
         let mut server_name = vec![0];
         server_name.extend(vector(name.as_bytes()));
         let mut extension = vec![0, 0];
@@ -440,6 +445,9 @@ mod tests {
         extension.extend([0, 43]);
         extension.extend(vector(&[4, 3, 4, 3, 3]));
         extension.extend([0xfe, 0x0d, 0, 1, 0]);
+        if with_transport_parameters {
+            extension.extend([0, 0x39, 0, 2, 0x0f, 0]);
+        }
         let mut body = vec![3, 3];
         body.extend([0; 32]);
         body.push(0);
@@ -531,7 +539,7 @@ mod tests {
     #[test]
     fn decrypts_and_reassembles_v1_v2_client_hello() {
         for version in [V1, V2] {
-            let hello = client_hello("Blocked.Test");
+            let hello = client_hello("Blocked.Test", true);
             let split = hello.len() / 2;
             let later = initial(version, 1, split, &hello[split..]);
             let earlier = initial(version, 0, 0, &hello[..split]);
@@ -549,6 +557,7 @@ mod tests {
             assert_eq!(field(&result, "quic.alpn"), Some("h3"));
             assert_eq!(field(&result, "quic.tls_supported_version"), Some("0x0304"));
             assert_eq!(field(&result, "quic.ech_extension"), Some("true"));
+            assert_eq!(field(&result, "quic.transport_parameters"), Some("true"));
             if let UdpStreamAnalysis::FinalObservations(values) = &result {
                 assert!(
                     values
@@ -576,8 +585,16 @@ mod tests {
     }
 
     #[test]
+    fn missing_transport_parameters_are_reported_separately_from_h3_alpn() {
+        let hello = client_hello("example.test", false);
+        let result = QuicInitial::default().feed(&initial(V1, 0, 0, &hello), false);
+        assert_eq!(field(&result, "quic.alpn"), Some("h3"));
+        assert_eq!(field(&result, "quic.transport_parameters"), Some("false"));
+    }
+
+    #[test]
     fn rejects_corrupt_initial_before_binding_connection() {
-        let hello = client_hello("blocked.test");
+        let hello = client_hello("blocked.test", true);
         let valid = initial(V1, 0, 0, &hello);
         let mut corrupt = valid.clone();
         *corrupt.last_mut().unwrap() ^= 1;

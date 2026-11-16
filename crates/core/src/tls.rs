@@ -179,6 +179,7 @@ pub(crate) struct ClientHelloMetadata {
     pub alpn: Vec<String>,
     pub supported_versions: Vec<u16>,
     pub ech_extension: bool,
+    pub quic_transport_parameters: bool,
 }
 
 pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> {
@@ -208,6 +209,7 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
     let mut supported_versions = Vec::new();
     let mut seen_versions = false;
     let mut ech_extension = false;
+    let mut quic_transport_parameters = false;
     while !extensions.0.is_empty() {
         let kind = extensions.word()?;
         let data = extensions.vector()?;
@@ -269,6 +271,7 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
                 }
             }
             0xfe0d => ech_extension = true,
+            0x0039 => quic_transport_parameters = true,
             _ => {}
         }
     }
@@ -277,6 +280,7 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
         alpn,
         supported_versions,
         ech_extension,
+        quic_transport_parameters,
     })
 }
 

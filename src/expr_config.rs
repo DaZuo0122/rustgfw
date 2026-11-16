@@ -55,11 +55,11 @@ pub fn compile(source: &str) -> Result<Vec<MatchRule>, String> {
             for field in condition.fields() {
                 if !matches!(
                     field,
-                    "dns.qname"
-                        | "ssh.protocol"
+                    "ssh.protocol"
                         | "ssh.software"
                         | "ssh.banner"
-                ) && !rustgfw_core::http::FIELDS.contains(&field)
+                ) && !rustgfw_core::dns::FIELDS.contains(&field)
+                    && !rustgfw_core::http::FIELDS.contains(&field)
                     && !rustgfw_core::tls::FIELDS.contains(&field)
                     && !rustgfw_core::trojan::FIELDS.contains(&field)
                     && !rustgfw_core::fet::FIELDS.contains(&field)

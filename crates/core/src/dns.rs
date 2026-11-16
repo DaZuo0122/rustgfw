@@ -1,8 +1,17 @@
-//! DNS question inspection. UDP decisions apply to one datagram, not its socket.
+//! DNS header and question inspection. UDP decisions apply to one datagram.
 use crate::inspect::{
-    Analysis, DatagramAnalysis, DatagramAnalyzer, Observation, StreamAnalyzer, UdpStreamAnalysis,
-    UdpStreamAnalyzer,
+    Analysis, DatagramAnalysis, DatagramAnalyzer, Observation, ObservationBatch, StreamAnalyzer,
+    UdpStreamAnalysis, UdpStreamAnalyzer,
 };
+
+pub const FIELDS: &[&str] = &[
+    "dns.id",
+    "dns.qr",
+    "dns.opcode",
+    "dns.qname",
+    "dns.qtype",
+    "dns.rcode",
+];
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct InvalidDns;
@@ -66,37 +75,99 @@ fn name(message: &[u8], offset: &mut usize) -> Result<String, InvalidDns> {
     Err(InvalidDns)
 }
 
-/// Extract query questions; responses and nonstandard opcodes produce no names.
-pub fn questions(message: &[u8]) -> Result<Vec<String>, InvalidDns> {
+struct DnsMessage {
+    id: u16,
+    response: bool,
+    opcode: u8,
+    rcode: u8,
+    questions: Vec<(String, u16, u16)>,
+}
+
+fn parse_message(message: &[u8]) -> Result<DnsMessage, InvalidDns> {
     if message.len() < 12 {
         return Err(InvalidDns);
     }
-    if word(message, 2)? & 0xf800 != 0 {
-        return Ok(Vec::new());
-    }
+    let flags = word(message, 2)?;
+    let opcode = ((flags >> 11) & 0x0f) as u8;
     let count = word(message, 4)?;
     let mut cursor = 12;
-    let mut names = Vec::new();
-    for _ in 0..count {
-        let qname = name(message, &mut cursor)?;
-        word(message, cursor)?;
-        let class = word(message, cursor + 2)?;
-        cursor += 4;
-        if class == 1 {
-            names.push(qname);
+    let mut questions = Vec::new();
+    if opcode == 0 {
+        for _ in 0..count {
+            let qname = name(message, &mut cursor)?;
+            let qtype = word(message, cursor)?;
+            let class = word(message, cursor + 2)?;
+            cursor += 4;
+            questions.push((qname, qtype, class));
         }
     }
-    Ok(names)
+    Ok(DnsMessage {
+        id: word(message, 0)?,
+        response: flags & 0x8000 != 0,
+        opcode,
+        rcode: (flags & 0x0f) as u8,
+        questions,
+    })
 }
 
-fn observations(names: Vec<String>) -> Vec<Observation> {
-    names
+/// Extract query questions; responses and nonstandard opcodes produce no names.
+pub fn questions(message: &[u8]) -> Result<Vec<String>, InvalidDns> {
+    let message = parse_message(message)?;
+    if message.response {
+        return Ok(Vec::new());
+    }
+    Ok(message
+        .questions
         .into_iter()
-        .map(|value| Observation {
-            field: "dns.qname",
-            value,
-        })
-        .collect()
+        .filter(|(_, _, class)| *class == 1)
+        .map(|(name, _, _)| name)
+        .collect())
+}
+
+fn observations(message: DnsMessage) -> Vec<Observation> {
+    let mut result = vec![
+        Observation {
+            field: "dns.id",
+            value: message.id.to_string(),
+        },
+        Observation {
+            field: "dns.qr",
+            value: if message.response {
+                "response"
+            } else {
+                "query"
+            }
+            .into(),
+        },
+        Observation {
+            field: "dns.opcode",
+            value: message.opcode.to_string(),
+        },
+    ];
+    if message.response {
+        result.push(Observation {
+            field: "dns.rcode",
+            value: message.rcode.to_string(),
+        });
+    }
+    if message.questions.len() == 1 && message.questions[0].2 == 1 {
+        result.push(Observation {
+            field: "dns.qtype",
+            value: message.questions[0].1.to_string(),
+        });
+    }
+    result.extend(
+        message
+            .questions
+            .into_iter()
+            .filter_map(|(name, _, class)| {
+                (class == 1).then_some(Observation {
+                    field: "dns.qname",
+                    value: name,
+                })
+            }),
+    );
+    result
 }
 
 #[derive(Default)]
@@ -104,7 +175,15 @@ pub struct DnsDatagram;
 impl DatagramAnalyzer for DnsDatagram {
     fn inspect(&self, payload: &[u8]) -> DatagramAnalysis {
         match questions(payload) {
-            Ok(names) => DatagramAnalysis::Observations(observations(names)),
+            Ok(names) => DatagramAnalysis::Observations(
+                names
+                    .into_iter()
+                    .map(|value| Observation {
+                        field: "dns.qname",
+                        value,
+                    })
+                    .collect(),
+            ),
             Err(_) => DatagramAnalysis::Malformed,
         }
     }
@@ -114,9 +193,11 @@ impl DatagramAnalyzer for DnsDatagram {
 pub struct DnsUdp;
 impl UdpStreamAnalyzer for DnsUdp {
     fn feed(&mut self, payload: &[u8], _: bool) -> UdpStreamAnalysis {
-        match questions(payload) {
-            Ok(names) if names.is_empty() => UdpStreamAnalysis::ClearFields(vec!["dns.qname"]),
-            Ok(names) => UdpStreamAnalysis::Observations(observations(names)),
+        match parse_message(payload) {
+            Ok(message) => UdpStreamAnalysis::ReplaceFields {
+                fields: FIELDS.to_vec(),
+                observations: observations(message),
+            },
             Err(_) => UdpStreamAnalysis::Drop,
         }
     }
@@ -142,27 +223,45 @@ impl DnsTcp {
 impl StreamAnalyzer for DnsTcp {
     fn feed(&mut self, bytes: &[u8]) -> Analysis {
         self.pending.extend_from_slice(bytes);
-        let mut names = Vec::new();
+        let mut batches = Vec::new();
         let mut consumed = 0;
         while self.pending.len() - consumed >= 2 {
             let len = usize::from(word(&self.pending, consumed).unwrap());
             if len > self.message_limit {
-                return Analysis::Finished;
+                return finished_batches(batches);
             }
             if self.pending.len() - consumed < len + 2 {
                 break;
             }
-            match questions(&self.pending[consumed + 2..consumed + 2 + len]) {
-                Ok(found) => names.extend(found),
-                Err(_) => return Analysis::Finished,
+            match parse_message(&self.pending[consumed + 2..consumed + 2 + len]) {
+                Ok(message) => batches.push(ObservationBatch {
+                    clear_fields: FIELDS,
+                    context: Vec::new(),
+                    observations: observations(message),
+                }),
+                Err(_) => return finished_batches(batches),
             }
             consumed += len + 2;
         }
         self.pending.drain(..consumed);
-        if names.is_empty() {
+        if batches.is_empty() {
             Analysis::Pending
         } else {
-            Analysis::Observations(observations(names))
+            Analysis::Batches {
+                batches,
+                finished: false,
+            }
+        }
+    }
+}
+
+fn finished_batches(batches: Vec<ObservationBatch>) -> Analysis {
+    if batches.is_empty() {
+        Analysis::Finished
+    } else {
+        Analysis::Batches {
+            batches,
+            finished: true,
         }
     }
 }
@@ -179,12 +278,90 @@ mod tests {
         q.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
         q
     }
+
+    fn field<'a>(items: &'a [Observation], name: &str) -> Option<&'a str> {
+        items
+            .iter()
+            .find(|item| item.field == name)
+            .map(|item| item.value.as_str())
+    }
+
+    #[test]
+    fn udp_exposes_query_type_and_response_code_per_datagram() {
+        let mut analyzer = DnsUdp;
+        let mut request = query();
+        let qtype = request.len() - 4;
+        request[qtype..qtype + 2].copy_from_slice(&28u16.to_be_bytes());
+        let UdpStreamAnalysis::ReplaceFields {
+            fields,
+            observations: request_fields,
+        } = analyzer.feed(&request, false)
+        else {
+            panic!("expected DNS request observations");
+        };
+        assert_eq!(fields, FIELDS);
+        assert_eq!(field(&request_fields, "dns.id"), Some("1"));
+        assert_eq!(field(&request_fields, "dns.qr"), Some("query"));
+        assert_eq!(field(&request_fields, "dns.qname"), Some("example.com"));
+        assert_eq!(field(&request_fields, "dns.qtype"), Some("28"));
+        assert_eq!(field(&request_fields, "dns.rcode"), None);
+
+        let mut response = request.clone();
+        response[2] = 0x81;
+        response[3] = 0x83;
+        let UdpStreamAnalysis::ReplaceFields {
+            observations: response_fields,
+            ..
+        } = analyzer.feed(&response, true)
+        else {
+            panic!("expected DNS response observations");
+        };
+        assert_eq!(field(&response_fields, "dns.qr"), Some("response"));
+        assert_eq!(field(&response_fields, "dns.qname"), Some("example.com"));
+        assert_eq!(field(&response_fields, "dns.qtype"), Some("28"));
+        assert_eq!(field(&response_fields, "dns.rcode"), Some("3"));
+        assert!(questions(&response).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tcp_batches_consecutive_messages_and_keeps_earlier_valid_message() {
+        let first = query();
+        let mut second = query();
+        let qtype = second.len() - 4;
+        second[qtype..qtype + 2].copy_from_slice(&28u16.to_be_bytes());
+        let mut wire = Vec::new();
+        for message in [&first, &second] {
+            wire.extend_from_slice(&(message.len() as u16).to_be_bytes());
+            wire.extend_from_slice(message);
+        }
+        let Analysis::Batches { batches, finished } = DnsTcp::default().feed(&wire) else {
+            panic!("expected separate DNS messages");
+        };
+        assert!(!finished);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].clear_fields, FIELDS);
+        assert_eq!(field(&batches[0].observations, "dns.qtype"), Some("1"));
+        assert_eq!(field(&batches[1].observations, "dns.qtype"), Some("28"));
+
+        wire.extend_from_slice(&3u16.to_be_bytes());
+        wire.extend_from_slice(&[0, 0, 0]);
+        let Analysis::Batches { batches, finished } = DnsTcp::default().feed(&wire) else {
+            panic!("valid messages before malformed one must still be reported");
+        };
+        assert!(finished);
+        assert_eq!(batches.len(), 2);
+    }
     #[test]
     fn compressed_questions_and_cycles() {
         let mut q = query();
         q[5] = 2;
         q.extend([0xc0, 12, 0, 1, 0, 1]);
         assert_eq!(questions(&q).unwrap(), ["example.com", "example.com"]);
+        let UdpStreamAnalysis::ReplaceFields { observations, .. } = DnsUdp.feed(&q, false) else {
+            panic!("expected multi-question DNS observations");
+        };
+        assert_eq!(field(&observations, "dns.qname"), Some("example.com"));
+        assert_eq!(field(&observations, "dns.qtype"), None);
         for len in 0..q.len() {
             assert!(questions(&q[..len]).is_err());
         }
@@ -201,8 +378,14 @@ mod tests {
         let mut parser = DnsTcp::default();
         let mut names = Vec::new();
         for byte in wire {
-            if let Analysis::Observations(found) = parser.feed(&[byte]) {
-                names.extend(found.into_iter().map(|o| o.value));
+            if let Analysis::Batches { batches, .. } = parser.feed(&[byte]) {
+                names.extend(
+                    batches
+                        .into_iter()
+                        .flat_map(|batch| batch.observations)
+                        .filter(|item| item.field == "dns.qname")
+                        .map(|item| item.value),
+                );
             }
         }
         assert_eq!(names, ["example.com", "example.com"]);
@@ -217,7 +400,7 @@ mod tests {
         assert_eq!(limited.feed(&wire[1..2]), Analysis::Finished);
         assert!(matches!(
             DnsTcp::with_message_limit(wire.len() - 2).feed(&wire),
-            Analysis::Observations(_)
+            Analysis::Batches { .. }
         ));
     }
     #[test]

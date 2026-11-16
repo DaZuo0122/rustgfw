@@ -175,7 +175,9 @@ impl Options {
         let needs_tls = rustgfw_core::tls::FIELDS
             .iter()
             .any(|field| needs_tcp_field(field));
-        let needs_dns_tcp = needs_tcp_field("dns.qname");
+        let needs_dns_tcp = rustgfw_core::dns::FIELDS
+            .iter()
+            .any(|field| needs_tcp_field(field));
         let needs_ssh = ["ssh.protocol", "ssh.software", "ssh.banner"]
             .into_iter()
             .any(needs_tcp_field);
@@ -189,7 +191,10 @@ impl Options {
             .iter()
             .any(|field| needs_tcp_field(field));
         let needs_dns_udp = self.expr_rules.iter().any(|rule| {
-            eligible(rule, Protocol::Udp) && rule.condition.references_field("dns.qname")
+            eligible(rule, Protocol::Udp)
+                && rustgfw_core::dns::FIELDS
+                    .iter()
+                    .any(|field| rule.condition.references_field(field))
         });
         let needs_wireguard_udp = self.expr_rules.iter().any(|rule| {
             eligible(rule, Protocol::Udp)
@@ -778,6 +783,141 @@ mod tests {
         assert_eq!(
             decide(&binary),
             rustgfw_core::Decision::Verdict(Verdict::Drop)
+        );
+    }
+
+    #[test]
+    fn dns_expression_matches_query_type_and_response_code() {
+        let dns = |name: &str, qtype: u16, response: bool, rcode: u8| {
+            let mut message = vec![
+                0,
+                7,
+                if response { 0x81 } else { 1 },
+                if response { 0x80 | rcode } else { 0 },
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ];
+            for label in name.split('.') {
+                message.push(label.len() as u8);
+                message.extend_from_slice(label.as_bytes());
+            }
+            message.push(0);
+            message.extend_from_slice(&qtype.to_be_bytes());
+            message.extend_from_slice(&1u16.to_be_bytes());
+            message
+        };
+        let udp = |payload: &[u8], reverse: bool| {
+            let mut bytes = vec![0; 28];
+            let length = (bytes.len() + payload.len()) as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 17;
+            bytes[12] = 10;
+            bytes[16] = 20;
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&53u16.to_be_bytes());
+            bytes[24..26].copy_from_slice(&(8 + payload.len() as u16).to_be_bytes());
+            if reverse {
+                bytes.swap(12, 16);
+                bytes.swap(20, 22);
+                bytes.swap(21, 23);
+            }
+            bytes.extend_from_slice(payload);
+            bytes
+        };
+        let source = r#"{"rules":[{"name":"AAAA query","expr":"proto == udp && dns.qname == example.test && dns.qtype == 28 && fresh.dns.qr == query","action":"drop_packet"},{"name":"NXDOMAIN response","expr":"proto == udp && dns.qname == example.test && fresh.dns.rcode == 3","action":"drop_packet"}]}"#;
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(source).unwrap();
+        let mut policy = options.into_policy();
+        let mut evaluate = |bytes: &[u8]| {
+            policy.evaluate(Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        assert_eq!(
+            evaluate(&udp(&dns("example.test", 1, false, 0), false)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            evaluate(&udp(&dns("example.test", 28, false, 0), false)),
+            Verdict::Drop
+        );
+        assert_eq!(
+            evaluate(&udp(&dns("example.test", 28, true, 0), true)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            evaluate(&udp(&dns("example.test", 28, true, 3), true)),
+            Verdict::Drop
+        );
+    }
+
+    #[test]
+    fn dns_tcp_expression_evaluates_each_message_separately() {
+        let query = |name: &str, qtype: u16| {
+            let mut message = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+            for label in name.split('.') {
+                message.push(label.len() as u8);
+                message.extend_from_slice(label.as_bytes());
+            }
+            message.push(0);
+            message.extend_from_slice(&qtype.to_be_bytes());
+            message.extend_from_slice(&1u16.to_be_bytes());
+            message
+        };
+        let first = query("blocked.test", 1);
+        let first_qtype_offset = 42 + first.len() - 4;
+        let mut payload = Vec::new();
+        for message in [first, query("allowed.test", 28)] {
+            payload.extend_from_slice(&(message.len() as u16).to_be_bytes());
+            payload.extend_from_slice(&message);
+        }
+        let mut packet = vec![0; 40 + payload.len()];
+        let length = packet.len() as u16;
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&length.to_be_bytes());
+        packet[9] = 6;
+        packet[12] = 10;
+        packet[16] = 20;
+        packet[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&53u16.to_be_bytes());
+        packet[32] = 0x50;
+        packet[33] = 0x18;
+        packet[40..].copy_from_slice(&payload);
+        let source = r#"{"rules":[{"name":"paired question","expr":"proto == tcp && dns.qname == blocked.test && dns.qtype == 28","action":"block"}]}"#;
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(source).unwrap();
+        let mut policy = options.into_policy();
+        assert_eq!(
+            policy.evaluate(Packet {
+                bytes: &packet,
+                original_len: packet.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            }),
+            Verdict::Accept
+        );
+        packet[first_qtype_offset..first_qtype_offset + 2].copy_from_slice(&28u16.to_be_bytes());
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(source).unwrap();
+        let mut policy = options.into_policy();
+        assert_eq!(
+            policy.evaluate(Packet {
+                bytes: &packet,
+                original_len: packet.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            }),
+            Verdict::DropFlow
         );
     }
 

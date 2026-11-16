@@ -64,17 +64,17 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 | `payload` | `payload contains "old"` | 当前传输层载荷中的字节片段 |
 | `payload.len` | `payload.len >= 32` | 当前包传输层载荷的字节数；TCP 按当前分段计算 |
 | `payload_hex` | `payload_hex starts_with 0x00ff` | 当前传输层载荷中的二进制字节；十六进制数字须成对 |
-| `http.host`、`tls.sni`、`dns.qname` | `http.host ends_with ".example.com"` | 流内最近一次观察批次的任一值 |
+| `http.host`、`tls.sni`、`tls.alpn`、`dns.qname` | `tls.alpn == h2` | 流内最近一次观察批次的任一值；`tls.alpn` 为客户端提供的协议列表 |
 | `ssh.protocol`、`ssh.software`、`ssh.banner` | `fresh.ssh.software contains "OpenSSH"` | TCP 任一方向首次识别出的 SSH 标识行字段 |
 | `wireguard.type`、`wireguard.sender_index`、`wireguard.receiver_index`、`wireguard.receiver_matched`、`wireguard.counter` | `wireguard.receiver_matched == true` | UDP WireGuard 报文形状与最近的反方向索引关联；索引和计数器按十进制字符串比较 |
 | `openvpn.stage`、`openvpn.client_reset`、`openvpn.server_reset` | `openvpn.stage == handshake && openvpn.server_reset == 8` | TCP/UDP OpenVPN 双向重置握手；数值字段按十进制字符串比较 |
 | `openvpn.opcode`、`openvpn.tx_packets`、`openvpn.rx_packets` | `openvpn.stage == data && fresh.openvpn.opcode == 6` | 仅 UDP：当前包的 opcode 与握手后的双向包数 |
 | `socks.version`、`socks.command`、`socks.target_type`、`socks.target_host`、`socks.target_port`、`socks.auth` | `socks.target_host ends_with ".example.com"` | TCP SOCKS4/4a/5 客户端请求；命令为 `connect`、`bind` 或 `udp_associate`，认证类型为 `none` 或 `userpass` |
-| `quic.version`、`quic.sni` | `fresh.quic.sni == blocked.test` | UDP QUIC v1/v2 客户端 Initial 中的 TLS ClientHello；版本值为 `1` 或 `2` |
+| `quic.version`、`quic.sni`、`quic.alpn` | `fresh.quic.alpn == h3` | UDP QUIC v1/v2 客户端 Initial 中的 TLS ClientHello；版本值为 `1` 或 `2`，ALPN 为客户端提供的协议列表 |
 | `fresh.` 加字段名 | `fresh.dns.qname == "blocked.test"` | 该字段必须由当前包更新 |
 | 观察字段加 `exists` | `fresh.wireguard.type exists` | 字段至少有一个值；`fresh.` 还要求当前包更新 |
 
-`origin`、`target` 是创建流时第一个包的端点；`src`、`dst` 随当前包方向变化。HTTP 只分析首个 HTTP/1 请求，TLS 只分析可见的 ClientHello SNI；DNS 在 TCP/UDP 端口 53 分析。SSH 读取每个 TCP 方向的首条标识行，允许此前出现提示行，单方向最多读取 `ssh-banner-bytes` 字节。`fresh.` 适合逐包丢弃或修改，避免沿用较早数据报留下的观察值。
+`origin`、`target` 是创建流时第一个包的端点；`src`、`dst` 随当前包方向变化。HTTP 只分析首个 HTTP/1 请求，TLS 分析可见的 ClientHello SNI 和 ALPN；DNS 在 TCP/UDP 端口 53 分析。SSH 读取每个 TCP 方向的首条标识行，允许此前出现提示行，单方向最多读取 `ssh-banner-bytes` 字节。`fresh.` 适合逐包丢弃或修改，避免沿用较早数据报留下的观察值。
 
 `field != value` 等价于 `!(field == value)`，因此字段缺失时也成立；需要字段实际存在时可写 `field exists && field != value`。
 
@@ -84,7 +84,7 @@ OpenVPN TCP/UDP 分析器按需处理任意端口。先看到首方向的客户�
 
 SOCKS 分析器按需检查任意 TCP 端口的首方向请求，支持 SOCKS4、SOCKS4a 域名及 SOCKS5 的 IPv4、IPv6、域名目标和用户名密码认证帧。请求完成时发布目标字段，不解析服务器应答；不会把用户名或密码放入观察字段。SOCKS4a 的版本值为 `4a`，目标端口目前按十进制字符串比较。
 
-QUIC 分析器按需检查任意 UDP 端口的 v1/v2 客户端 Initial，解开公开的 Initial 密钥保护，按 CRYPTO 偏移重组分段 TLS ClientHello，再提取可见 SNI。它在完整握手消息到达后报告一次 `quic.version`，有可见 SNI 时同时报告 `quic.sni`；每条流最多检查八个候选数据报。ECH 内层名称、非 v1/v2 版本及 Retry 后更换连接 ID 的握手暂不识别；`fresh.` 可让单包动作仅作用于报告观察值的那个包。实现依据：[RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html)、[RFC 9369](https://www.rfc-editor.org/rfc/rfc9369.html)。
+QUIC 分析器按需检查任意 UDP 端口的 v1/v2 客户端 Initial，解开公开的 Initial 密钥保护，按 CRYPTO 偏移重组分段 TLS ClientHello，再提取可见 SNI 和 ALPN。它在完整握手消息到达后报告一次 `quic.version`，有可见 SNI 或 ALPN 时同时报告对应字段；每条流最多检查八个候选数据报。ALPN 列表表示客户端提供的协议，不表示服务端最终选择；目前只将可打印 ASCII 协议 ID 写入观察字段。ECH 内层名称、非 v1/v2 版本及 Retry 后更换连接 ID 的握手暂不识别；`fresh.` 可让单包动作仅作用于报告观察值的那个包。实现依据：[RFC 7301](https://www.rfc-editor.org/rfc/rfc7301.html)、[RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html)、[RFC 9369](https://www.rfc-editor.org/rfc/rfc9369.html)。
 
 UDP 分析器拒绝数据报时，该包直接丢弃，本次不再用流内旧观察值执行表达式规则；后续数据报仍可继续检查。
 

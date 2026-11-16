@@ -154,7 +154,12 @@ impl Options {
             } else {
                 !matches!(
                     field,
-                    "http.host" | "tls.sni" | "ssh.protocol" | "ssh.software" | "ssh.banner"
+                    "http.host"
+                        | "tls.sni"
+                        | "tls.alpn"
+                        | "ssh.protocol"
+                        | "ssh.software"
+                        | "ssh.banner"
                 ) || protocol == Protocol::Tcp
             }
         };
@@ -167,7 +172,7 @@ impl Options {
                 .any(|rule| eligible(rule, Protocol::Tcp) && rule.condition.references_field(field))
         };
         let needs_http = needs_tcp_field("http.host");
-        let needs_tls = needs_tcp_field("tls.sni");
+        let needs_tls = ["tls.sni", "tls.alpn"].into_iter().any(needs_tcp_field);
         let needs_dns_tcp = needs_tcp_field("dns.qname");
         let needs_ssh = ["ssh.protocol", "ssh.software", "ssh.banner"]
             .into_iter()
@@ -234,14 +239,14 @@ impl Options {
             if self.tls_sni.is_empty() {
                 needs_tls.then(|| {
                     AnalyzerRule::observing(None, move || {
-                        Box::new(rustgfw_core::tls::TlsSni::with_buffer_limit(
+                        Box::new(rustgfw_core::tls::TlsClientHello::with_buffer_limit(
                             tls_buffer_bytes,
                         ))
                     })
                 })
             } else {
                 AnalyzerRule::exact("tls.sni", self.tls_sni, None, move || {
-                    Box::new(rustgfw_core::tls::TlsSni::with_buffer_limit(
+                    Box::new(rustgfw_core::tls::TlsClientHello::with_buffer_limit(
                         tls_buffer_bytes,
                     ))
                 })
@@ -976,6 +981,46 @@ mod tests {
         );
         assert_eq!(
             evaluate(&mut policy, &tcp(110, &request[7..])),
+            Verdict::DropFlow
+        );
+    }
+
+    #[test]
+    fn tls_alpn_expression_enables_inspection_without_sni() {
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"HTTP/2 offer","expr":"proto == tcp && fresh.tls.alpn == h2","action":"block"}]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let mut body = vec![3, 3];
+        body.extend([0; 32]);
+        body.extend([0, 0, 2, 0x13, 1, 1, 0]);
+        body.extend([0, 9, 0, 16, 0, 5, 0, 3, 2, b'h', b'2']);
+        let mut handshake = vec![1, 0, 0, body.len() as u8];
+        handshake.extend(body);
+        let mut record = vec![22, 3, 1];
+        record.extend((handshake.len() as u16).to_be_bytes());
+        record.extend(handshake);
+        let mut packet = vec![0; 40 + record.len()];
+        let length = packet.len() as u16;
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&length.to_be_bytes());
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        packet[16..20].copy_from_slice(&[198, 51, 100, 2]);
+        packet[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&443u16.to_be_bytes());
+        packet[32] = 0x50;
+        packet[33] = 0x18;
+        packet[40..].copy_from_slice(&record);
+        assert_eq!(
+            policy.evaluate(Packet {
+                bytes: &packet,
+                original_len: packet.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            }),
             Verdict::DropFlow
         );
     }

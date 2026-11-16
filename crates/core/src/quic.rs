@@ -1,14 +1,14 @@
 //! QUIC v1/v2 client Initial inspection. Initial keys are public by design.
 use crate::{
     inspect::{Observation, UdpStreamAnalysis, UdpStreamAnalyzer},
-    tls::client_hello_name,
+    tls::client_hello_metadata,
 };
 use ring::{
     aead::{self, quic},
     hkdf,
 };
 
-pub const FIELDS: &[&str] = &["quic.version", "quic.sni"];
+pub const FIELDS: &[&str] = &["quic.version", "quic.sni", "quic.alpn"];
 const V1: u32 = 1;
 const V2: u32 = 0x6b33_43cf;
 const SALT_V1: [u8; 20] = [
@@ -371,11 +371,17 @@ impl UdpStreamAnalyzer for QuicInitial {
             field: "quic.version",
             value: if version == V1 { "1" } else { "2" }.into(),
         }];
-        if let Some(name) = client_hello_name(&stream[4..4 + length]) {
-            observations.push(Observation {
-                field: "quic.sni",
-                value: name,
-            });
+        if let Some(hello) = client_hello_metadata(&stream[4..4 + length]) {
+            if let Some(value) = hello.sni {
+                observations.push(Observation {
+                    field: "quic.sni",
+                    value,
+                });
+            }
+            observations.extend(hello.alpn.into_iter().map(|value| Observation {
+                field: "quic.alpn",
+                value,
+            }));
         }
         UdpStreamAnalysis::FinalObservations(observations)
     }
@@ -406,6 +412,12 @@ mod tests {
         server_name.extend(vector(name.as_bytes()));
         let mut extension = vec![0, 0];
         extension.extend(vector(&vector(&server_name)));
+        let mut protocols = vec![2];
+        protocols.extend(b"h3");
+        protocols.push(5);
+        protocols.extend(b"h3-29");
+        extension.extend([0, 16]);
+        extension.extend(vector(&vector(&protocols)));
         let mut body = vec![3, 3];
         body.extend([0; 32]);
         body.push(0);
@@ -512,6 +524,14 @@ mod tests {
             ));
             let result = analyzer.feed(&earlier, false);
             assert_eq!(field(&result, "quic.sni"), Some("blocked.test"));
+            assert_eq!(field(&result, "quic.alpn"), Some("h3"));
+            if let UdpStreamAnalysis::FinalObservations(values) = &result {
+                assert!(
+                    values
+                        .iter()
+                        .any(|value| value.field == "quic.alpn" && value.value == "h3-29")
+                );
+            }
             assert_eq!(
                 field(&result, "quic.version"),
                 Some(if version == V1 { "1" } else { "2" })

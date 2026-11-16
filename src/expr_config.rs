@@ -57,6 +57,7 @@ pub fn compile(source: &str) -> Result<Vec<MatchRule>, String> {
                     field,
                     "http.host"
                         | "tls.sni"
+                        | "tls.alpn"
                         | "dns.qname"
                         | "ssh.protocol"
                         | "ssh.software"

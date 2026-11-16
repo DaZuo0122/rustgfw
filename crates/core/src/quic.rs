@@ -8,7 +8,13 @@ use ring::{
     hkdf,
 };
 
-pub const FIELDS: &[&str] = &["quic.version", "quic.sni", "quic.alpn"];
+pub const FIELDS: &[&str] = &[
+    "quic.version",
+    "quic.sni",
+    "quic.alpn",
+    "quic.tls_supported_version",
+    "quic.ech_extension",
+];
 const V1: u32 = 1;
 const V2: u32 = 0x6b33_43cf;
 const SALT_V1: [u8; 20] = [
@@ -382,6 +388,19 @@ impl UdpStreamAnalyzer for QuicInitial {
                 field: "quic.alpn",
                 value,
             }));
+            observations.extend(
+                hello
+                    .supported_versions
+                    .into_iter()
+                    .map(|version| Observation {
+                        field: "quic.tls_supported_version",
+                        value: format!("0x{version:04x}"),
+                    }),
+            );
+            observations.push(Observation {
+                field: "quic.ech_extension",
+                value: hello.ech_extension.to_string(),
+            });
         }
         UdpStreamAnalysis::FinalObservations(observations)
     }
@@ -418,6 +437,9 @@ mod tests {
         protocols.extend(b"h3-29");
         extension.extend([0, 16]);
         extension.extend(vector(&vector(&protocols)));
+        extension.extend([0, 43]);
+        extension.extend(vector(&[4, 3, 4, 3, 3]));
+        extension.extend([0xfe, 0x0d, 0, 1, 0]);
         let mut body = vec![3, 3];
         body.extend([0; 32]);
         body.push(0);
@@ -525,12 +547,17 @@ mod tests {
             let result = analyzer.feed(&earlier, false);
             assert_eq!(field(&result, "quic.sni"), Some("blocked.test"));
             assert_eq!(field(&result, "quic.alpn"), Some("h3"));
+            assert_eq!(field(&result, "quic.tls_supported_version"), Some("0x0304"));
+            assert_eq!(field(&result, "quic.ech_extension"), Some("true"));
             if let UdpStreamAnalysis::FinalObservations(values) = &result {
                 assert!(
                     values
                         .iter()
                         .any(|value| value.field == "quic.alpn" && value.value == "h3-29")
                 );
+                assert!(values.iter().any(|value| {
+                    value.field == "quic.tls_supported_version" && value.value == "0x0303"
+                }));
             }
             assert_eq!(
                 field(&result, "quic.version"),

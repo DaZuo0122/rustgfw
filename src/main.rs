@@ -998,7 +998,7 @@ mod tests {
     fn tls_alpn_expression_enables_inspection_without_sni() {
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"HTTP/2 offer","expr":"proto == tcp && fresh.tls.alpn == h2","action":"block"}]}"#,
+            r#"{"rules":[{"name":"HTTP/2 offer","expr":"proto == tcp && fresh.tls.alpn == h2 && tls.ech_extension == false","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -1038,7 +1038,7 @@ mod tests {
     fn tls_expression_combines_client_and_server_hello() {
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"selected TLS","expr":"proto == tcp && tls.alpn == h2 && fresh.tls.server_version == 0x0304 && tls.server_cipher == 0x1301","action":"block"}]}"#,
+            r#"{"rules":[{"name":"selected TLS","expr":"proto == tcp && tls.alpn == h2 && tls.supported_version == 0x0304 && tls.ech_extension == true && fresh.tls.server_version == 0x0304 && tls.server_cipher == 0x1301","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -1084,7 +1084,9 @@ mod tests {
         let mut client = vec![3, 3];
         client.extend([0; 32]);
         client.extend([0, 0, 2, 0x13, 1, 1, 0]);
-        client.extend([0, 9, 0, 16, 0, 5, 0, 3, 2, b'h', b'2']);
+        client.extend([0, 23, 0, 16, 0, 5, 0, 3, 2, b'h', b'2']);
+        client.extend([0, 43, 0, 5, 4, 3, 4, 3, 3]);
+        client.extend([0xfe, 0x0d, 0, 1, 0]);
         let mut server = vec![3, 3];
         server.extend([0; 32]);
         server.extend([0, 0x13, 1, 0, 0, 6, 0, 43, 0, 2, 3, 4]);

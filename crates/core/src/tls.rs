@@ -4,6 +4,8 @@ use crate::inspect::{Analysis, Observation, StreamAnalyzer};
 pub const FIELDS: &[&str] = &[
     "tls.sni",
     "tls.alpn",
+    "tls.supported_version",
+    "tls.ech_extension",
     "tls.server_version",
     "tls.server_cipher",
     "tls.server_alpn",
@@ -74,6 +76,16 @@ impl StreamAnalyzer for TlsHello {
                             field: "tls.alpn",
                             value,
                         }));
+                        observations.extend(hello.supported_versions.into_iter().map(|version| {
+                            Observation {
+                                field: "tls.supported_version",
+                                value: format!("0x{version:04x}"),
+                            }
+                        }));
+                        observations.push(Observation {
+                            field: "tls.ech_extension",
+                            value: hello.ech_extension.to_string(),
+                        });
                     } else {
                         let Some(hello) = server_hello_metadata(&h[4..4 + length]) else {
                             self.finished = true;
@@ -165,6 +177,8 @@ impl<'a> Cursor<'a> {
 pub(crate) struct ClientHelloMetadata {
     pub sni: Option<String>,
     pub alpn: Vec<String>,
+    pub supported_versions: Vec<u16>,
+    pub ech_extension: bool,
 }
 
 pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> {
@@ -191,6 +205,9 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
     let mut name = None;
     let mut alpn = Vec::new();
     let mut seen_alpn = false;
+    let mut supported_versions = Vec::new();
+    let mut seen_versions = false;
+    let mut ech_extension = false;
     while !extensions.0.is_empty() {
         let kind = extensions.word()?;
         let data = extensions.vector()?;
@@ -236,10 +253,31 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
                     }
                 }
             }
+            43 => {
+                if seen_versions {
+                    return None;
+                }
+                seen_versions = true;
+                let mut ext = Cursor(data);
+                let len = ext.byte()?;
+                let mut versions = Cursor(ext.take(len)?);
+                if !ext.0.is_empty() || versions.0.is_empty() || versions.0.len() % 2 != 0 {
+                    return None;
+                }
+                while !versions.0.is_empty() {
+                    supported_versions.push(versions.word()? as u16);
+                }
+            }
+            0xfe0d => ech_extension = true,
             _ => {}
         }
     }
-    Some(ClientHelloMetadata { sni: name, alpn })
+    Some(ClientHelloMetadata {
+        sni: name,
+        alpn,
+        supported_versions,
+        ech_extension,
+    })
 }
 
 struct ServerHelloMetadata {
@@ -359,6 +397,20 @@ mod tests {
         handshake.extend(body);
         handshake
     }
+    fn hello_with_versions_and_ech() -> Vec<u8> {
+        let mut handshake = hello();
+        let mut body = handshake.split_off(4);
+        let mut existing = body.split_off(41);
+        let mut extensions = existing.split_off(2);
+        extensions.extend([0, 43]);
+        extensions.extend(vector(&[4, 3, 4, 3, 3]));
+        extensions.extend([0xfe, 0x0d, 0, 1, 0]);
+        body.extend(vector(&extensions));
+        let len = body.len();
+        let mut handshake = vec![1, (len >> 16) as u8, (len >> 8) as u8, len as u8];
+        handshake.extend(body);
+        handshake
+    }
     fn server_hello(tls13: bool, retry: bool) -> Vec<u8> {
         let mut body = vec![3, 3];
         body.extend(if retry { HELLO_RETRY_RANDOM } else { [0; 32] });
@@ -396,10 +448,16 @@ mod tests {
             }
             assert_eq!(
                 result,
-                Analysis::FinalObservations(vec![Observation {
-                    field: "tls.sni",
-                    value: "example.com".into(),
-                }])
+                Analysis::FinalObservations(vec![
+                    Observation {
+                        field: "tls.sni",
+                        value: "example.com".into(),
+                    },
+                    Observation {
+                        field: "tls.ech_extension",
+                        value: "false".into(),
+                    },
+                ])
             );
         }
     }
@@ -455,6 +513,35 @@ mod tests {
                 .collect();
             assert_eq!(alpn, ["h2", "http/1.1"]);
         }
+    }
+    #[test]
+    fn client_hello_reports_offered_versions_and_ech_extension() {
+        let hello = hello_with_versions_and_ech();
+        let Analysis::FinalObservations(values) = TlsHello::default().feed(&record(&hello)) else {
+            panic!("expected ClientHello observations");
+        };
+        let versions: Vec<_> = values
+            .iter()
+            .filter(|item| item.field == "tls.supported_version")
+            .map(|item| item.value.as_str())
+            .collect();
+        assert_eq!(versions, ["0x0304", "0x0303"]);
+        assert!(
+            values
+                .iter()
+                .any(|item| item.field == "tls.ech_extension" && item.value == "true")
+        );
+
+        let mut malformed = hello;
+        let version_extension = malformed
+            .windows(8)
+            .position(|bytes| bytes == [0, 43, 0, 5, 4, 3, 4, 3])
+            .unwrap();
+        malformed[version_extension + 4] = 3;
+        assert_eq!(
+            TlsHello::default().feed(&record(&malformed)),
+            Analysis::Finished
+        );
     }
     #[test]
     fn server_hello_reports_selected_version_cipher_and_visible_alpn() {

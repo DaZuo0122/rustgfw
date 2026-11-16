@@ -53,6 +53,11 @@ pub trait UdpStreamAnalyzer {
 pub enum UdpStreamAnalysis {
     Pending,
     Observations(Vec<Observation>),
+    /// Replace this datagram's fields and publish the new observation batch.
+    ReplaceFields {
+        fields: Vec<&'static str>,
+        observations: Vec<Observation>,
+    },
     FinalObservations(Vec<Observation>),
     Finished,
     /// Reject only this datagram while retaining the stream state.
@@ -677,6 +682,18 @@ impl<P> Inspect<P> {
                             store_observations(&mut flow.facts, observations, &mut updated);
                         }
                     }
+                    UdpStreamAnalysis::ReplaceFields {
+                        fields,
+                        observations,
+                    } => {
+                        for field in fields {
+                            flow.facts.remove(field);
+                            updated.retain(|value| *value != field);
+                        }
+                        if !self.udp_rules.is_empty() {
+                            store_observations(&mut flow.facts, observations, &mut updated);
+                        }
+                    }
                     UdpStreamAnalysis::FinalObservations(observations) => {
                         if !self.udp_rules.is_empty() {
                             store_observations(&mut flow.facts, observations, &mut updated);
@@ -688,6 +705,7 @@ impl<P> Inspect<P> {
                     UdpStreamAnalysis::ClearFields(fields) => {
                         for field in fields {
                             flow.facts.remove(field);
+                            updated.retain(|value| *value != field);
                         }
                     }
                 }

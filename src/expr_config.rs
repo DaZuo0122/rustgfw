@@ -61,7 +61,8 @@ pub fn compile(source: &str) -> Result<Vec<MatchRule>, String> {
                         | "ssh.protocol"
                         | "ssh.software"
                         | "ssh.banner"
-                ) {
+                ) && !rustgfw_core::wireguard::FIELDS.contains(&field)
+                {
                     return Err(format!("rule {:?}: unknown observation field {field}", spec.name));
                 }
             }

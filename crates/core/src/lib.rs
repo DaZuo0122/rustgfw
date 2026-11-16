@@ -9,6 +9,7 @@ pub mod rules;
 pub mod ssh;
 pub mod tcp;
 pub mod tls;
+pub mod wireguard;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {

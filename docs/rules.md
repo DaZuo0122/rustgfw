@@ -24,6 +24,11 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
       "expr": "proto == udp && dst.port == 5353 && payload == \"old\"",
       "action": "replace_udp_payload",
       "replacement": "new"
+    },
+    {
+      "name": "drop correlated WireGuard data",
+      "expr": "proto == udp && fresh.wireguard.type == data && wireguard.receiver_matched == true",
+      "action": "drop_packet"
     }
   ]
 }
@@ -45,9 +50,12 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 | `payload_hex` | `payload_hex starts_with 0x00ff` | 当前传输层载荷中的二进制字节；十六进制数字须成对 |
 | `http.host`、`tls.sni`、`dns.qname` | `http.host ends_with ".example.com"` | 流内最近一次观察批次的任一值 |
 | `ssh.protocol`、`ssh.software`、`ssh.banner` | `fresh.ssh.software contains "OpenSSH"` | TCP 任一方向首次识别出的 SSH 标识行字段 |
+| `wireguard.type`、`wireguard.sender_index`、`wireguard.receiver_index`、`wireguard.receiver_matched`、`wireguard.counter` | `wireguard.receiver_matched == true` | UDP WireGuard 报文形状与最近的反方向索引关联；索引和计数器按十进制字符串比较 |
 | `fresh.` 加字段名 | `fresh.dns.qname == "blocked.test"` | 该字段必须由当前包更新 |
 
 `origin`、`target` 是创建流时第一个包的端点；`src`、`dst` 随当前包方向变化。HTTP 只分析首个 HTTP/1 请求，TLS 只分析可见的 ClientHello SNI；DNS 在 TCP/UDP 端口 53 分析。SSH 读取每个 TCP 方向的首条标识行，允许此前出现提示行，单方向最多读取 `ssh-banner-bytes` 字节。`fresh.` 适合逐包丢弃或修改，避免沿用较早数据报留下的观察值。
+
+WireGuard 分析器按需处理任意 UDP 端口，识别握手发起、握手响应、cookie 回复和数据包的头部形状。`wireguard.receiver_matched` 表示接收索引在同一流反方向最近六个发送索引中出现过；这只是报文关联，不验证加密真实性。每个数据报先清除上一个数据报的 WireGuard 字段，再写入本次字段；不符合形状的数据报也会清除这些字段。
 
 UDP 分析器拒绝数据报时，该包直接丢弃，本次不再用流内旧观察值执行表达式规则；后续数据报仍可继续检查。
 

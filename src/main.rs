@@ -140,10 +140,14 @@ impl Options {
         let ssh_banner_bytes = self.ssh_banner_bytes;
         let dns_names = self.dns_names;
         let field_possible = |field: &str, protocol| {
-            !matches!(
-                field,
-                "http.host" | "tls.sni" | "ssh.protocol" | "ssh.software" | "ssh.banner"
-            ) || protocol == Protocol::Tcp
+            if rustgfw_core::wireguard::FIELDS.contains(&field) {
+                protocol == Protocol::Udp
+            } else {
+                !matches!(
+                    field,
+                    "http.host" | "tls.sni" | "ssh.protocol" | "ssh.software" | "ssh.banner"
+                ) || protocol == Protocol::Tcp
+            }
         };
         let eligible = |rule: &MatchRule, protocol| {
             rule.condition.can_match_protocol(protocol, &field_possible)
@@ -161,6 +165,12 @@ impl Options {
             .any(needs_tcp_field);
         let needs_dns_udp = self.expr_rules.iter().any(|rule| {
             eligible(rule, Protocol::Udp) && rule.condition.references_field("dns.qname")
+        });
+        let needs_wireguard_udp = self.expr_rules.iter().any(|rule| {
+            eligible(rule, Protocol::Udp)
+                && rustgfw_core::wireguard::FIELDS
+                    .iter()
+                    .any(|field| rule.condition.references_field(field))
         });
         let tcp_rules: Vec<FlowRule> = self
             .expr_rules
@@ -238,13 +248,18 @@ impl Options {
         )
         .into_iter()
         .collect();
-        let udp_analyzers = if needs_dns_udp {
-            vec![UdpStreamRule::new(Some(DatagramPort::Either(53)), || {
-                Box::new(DnsUdp)
-            })]
-        } else {
-            Vec::new()
-        };
+        let udp_analyzers = [
+            needs_dns_udp
+                .then(|| UdpStreamRule::new(Some(DatagramPort::Either(53)), || Box::new(DnsUdp))),
+            needs_wireguard_udp.then(|| {
+                UdpStreamRule::new(None, || {
+                    Box::new(rustgfw_core::wireguard::WireGuard::default())
+                })
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         Inspect::with_datagrams(
             Rules::with_limits(self.rules, self.default, self.rules_limits),
             analyzers,
@@ -678,6 +693,72 @@ mod tests {
             decide(&binary),
             rustgfw_core::Decision::Verdict(Verdict::Drop)
         );
+    }
+
+    #[test]
+    fn wireguard_expression_correlates_directions_without_stale_fields() {
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[
+                {"name":"stale sender","expr":"wireguard.sender_index == 99 && wireguard.type == data","action":"block"},
+                {"name":"matched data","expr":"fresh.wireguard.receiver_matched == true && wireguard.type == data","action":"drop_packet"}
+            ]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let udp = |payload: &[u8], reverse: bool| {
+            let mut bytes = vec![0; 28 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 17;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&51820u16.to_be_bytes());
+            bytes[24..26].copy_from_slice(&(8 + payload.len() as u16).to_be_bytes());
+            bytes[28..].copy_from_slice(payload);
+            if reverse {
+                for offset in 0..4 {
+                    bytes.swap(12 + offset, 16 + offset);
+                }
+                bytes.swap(20, 22);
+                bytes.swap(21, 23);
+            }
+            bytes
+        };
+        let mut initiation = vec![0; 148];
+        initiation[0] = 1;
+        initiation[4..8].copy_from_slice(&42u32.to_le_bytes());
+        let mut response = vec![0; 92];
+        response[0] = 2;
+        response[4..8].copy_from_slice(&99u32.to_le_bytes());
+        response[8..12].copy_from_slice(&42u32.to_le_bytes());
+        let mut data = vec![0; 32];
+        data[0] = 4;
+        data[4..8].copy_from_slice(&99u32.to_le_bytes());
+        let evaluate = |policy: &mut dyn Policy, bytes: &[u8]| {
+            policy.evaluate(Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        assert_eq!(
+            evaluate(&mut policy, &udp(&initiation, false)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            evaluate(&mut policy, &udp(&response, true)),
+            Verdict::Accept
+        );
+        assert_eq!(evaluate(&mut policy, &udp(&data, false)), Verdict::Drop);
+        data[1] = 1;
+        assert_eq!(evaluate(&mut policy, &udp(&data, false)), Verdict::Accept);
+        data[1] = 0;
+        data[4..8].copy_from_slice(&123u32.to_le_bytes());
+        assert_eq!(evaluate(&mut policy, &udp(&data, false)), Verdict::Accept);
     }
 
     #[test]

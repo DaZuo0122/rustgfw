@@ -27,7 +27,7 @@ Linux NFQUEUE 的 accept 表示恢复 netfilter 遍历，并不绕过其他链�
 
 DNS：`rustgfw nfqueue 100 accept dns-name=blocked.test` 匹配标准查询的 IN 类问题，域名大小写不敏感且配置可带尾点。UDP 目的端口 53 按数据报分析，不缓存域名裁决，因此同一 socket 的后续允许查询不受先前阻断影响。TCP 任一端口 53 启用长度前缀解析，支持连续消息、TCP 分段和压缩域名；命中后阻断整个 TCP 流。UDP 畸形查询丢弃，TCP 畸形消息或超出 `dns-message-bytes` 的消息结束分析并沿用传输层结果。尚不支持 DNS 修改、DoH/DoT、非 53 端口 DNS 自动识别。
 
-TLS：`rustgfw nfqueue 100 accept tls-sni=blocked.test` 检查明文 ClientHello SNI，支持 TCP 分段和 TLS handshake record 分段。可同时指定 `http-host=`。SNI 精确匹配且忽略 ASCII 大小写；不解密 ECH 内层域名，不涵盖 QUIC。ClientHello 声明的正文长度上限 64 KiB，暂存字节预算由 `tls-buffer-bytes` 控制；超预算、无 SNI 或无法识别时结束该分析器并沿用传输层裁决。
+TLS：`rustgfw nfqueue 100 accept tls-sni=blocked.test` 检查明文 ClientHello SNI，表达式还可匹配客户端提供的 `tls.alpn`。支持 TCP 分段和 TLS handshake record 分段，可同时指定 `http-host=`。SNI 精确匹配且忽略 ASCII 大小写；不解密 ECH 内层域名，QUIC 使用单独的 Initial 分析器。ClientHello 声明的正文长度上限 64 KiB，暂存字节预算由 `tls-buffer-bytes` 控制；超预算或无法识别时结束该分析器并沿用传输层裁决。
 
 SSH：表达式可用 `ssh.protocol`、`ssh.software`、`ssh.banner` 匹配 TCP 任一方向的首次 SSH 标识行，例如 `ssh.software contains "OpenSSH"`。分析器支持分段标识行和此前的提示行，不限定端口；单方向默认读取最多 1024 字节，可用 `ssh-banner-bytes=N` 调整。无法识别或超预算时结束该方向的分析，不解析后续加密握手。
 
@@ -37,7 +37,7 @@ OpenVPN：表达式引用 `openvpn.*` 字段时按需启用双向 TCP 或 UDP �
 
 SOCKS：表达式引用 `socks.*` 字段时按需启用 TCP 首方向请求分析器，不限定端口。SOCKS4/4a/5 请求目标、命令与地址类型成为流观察值；SOCKS5 可跨分段跳过用户名密码认证帧，但凭据不进入观察值。服务器应答暂不分析。
 
-QUIC：表达式引用 `quic.*` 字段时按需启用双向 UDP 流分析器，不限定端口。它用 v1/v2 Initial 公开密钥派生和 `ring` 的首部保护、AEAD 接口验证客户端 Initial，把 CRYPTO 帧按偏移重组后复用 TLS ClientHello 的 SNI 解析。首个通过认证的客户端连接 ID 决定流内分析对象，其他连接的 Initial 不会覆盖已收集片段；完整 ClientHello 后结束分析。RFC 密钥向量、自构造加密包及 OpenGFW 只读抓包样本已在本地测试；Linux 后端只需转交 UDP 数据报，无协议专用 I/O 逻辑。
+QUIC：表达式引用 `quic.*` 字段时按需启用双向 UDP 流分析器，不限定端口。它用 v1/v2 Initial 公开密钥派生和 `ring` 的首部保护、AEAD 接口验证客户端 Initial，把 CRYPTO 帧按偏移重组后复用 TLS ClientHello 的 SNI 与 ALPN 解析。首个通过认证的客户端连接 ID 决定流内分析对象，其他连接的 Initial 不会覆盖已收集片段；完整 ClientHello 后结束分析。RFC 密钥向量、自构造加密包及 OpenGFW 只读抓包样本已在本地测试；Linux 后端只需转交 UDP 数据报，无协议专用 I/O 逻辑。
 
 HTTP/TLS/DNS TCP/SSH 通过 `AnalyzerRule` 注册，共享流表及每方向 TCP 重组。UDP DNS 通过 `DatagramRule` 注册，逐个数据报分析，不占用 TCP 流表；数据报规则可限制源端口、目的端口或任一端口，畸形结果可要求丢弃该包。WireGuard 和表达式 DNS UDP 通过 `UdpStreamRule` 注册，保留跨数据报的双向状态。两类分析器都报告带字段名的观察值，由规则回调匹配；新增同类分析器无需修改引擎中的协议匹配分支。TCP 观察结果区分完成与可继续分析，HTTP/TLS/SSH 报告后释放分析器，DNS TCP 可在同一流中报告后续查询。带端口限制的 TCP 分析器只为匹配端口的连接建立检查状态，其他 TCP 连接不占用检查流表。任一分析器匹配即阻断，其他分析器不能撤销这一决定。相同初始 SYN 重传保持状态，新的初始序号触发端点复用重建；这是被动流识别，不是内核 TCP 状态机的等价实现。
 
@@ -47,7 +47,7 @@ HTTP/TLS/DNS TCP/SSH 通过 `AnalyzerRule` 注册，共享流表及每方向 TCP
 
 TCP 重组模块 `core::tcp` 已接入 `core::inspect` 的双向分析路径，支持连续字节交付、乱序缓存、重复数据裁剪和序号回绕。缓冲区冲突重叠会阻断流；已交付字节不保留副本。
 
-`rustgfw nfqueue 100 accept http-host=blocked.test` 检查首个 HTTP/1 请求的所有 Host 头、绝对 URI 的 authority，以及 CONNECT 目标（大小写不敏感，含端口时需完整匹配）。任一值命中即阻断；无关头里的非 UTF-8 字节不妨碍 Host 识别。传输层规则先执行，Host 规则进一步阻断。识别前的包会放行；跨包分析不是代理式整请求缓冲。每方向乱序缓存及 HTTP 头默认各限 16 KiB，TCP 与可选的有状态 UDP 检查共用默认最多 16384 条流的容量，空闲 120 秒过期。双向 FIN 或未阻断流的 RST 会释放检查状态；单向 FIN 保留反向分析。容量满时只在有新完成流时扫描回收；仍满则丢弃新流的包。阻断流的 RST 不单凭包头清除用户态阻断状态。如果已完成分析的长连接继续发包，容量回收后可能再次进入首请求分析。超长或无法识别的 HTTP 头结束该分析器并沿用传输层结果；减小头预算可能让更长的阻断目标头无法被识别。不支持 keep-alive 多请求检查和 HTTP/2。
+`rustgfw nfqueue 100 accept http-host=blocked.test` 检查首个 HTTP/1 请求的所有 Host 头、绝对 URI 的 authority，以及 CONNECT 目标（大小写不敏感，含端口时需完整匹配）。表达式可读取请求方法、目标、版本及反向首个响应的状态码、版本；两方向观察值保存在同一流内。任一 Host 值命中即阻断；无关头里的非 UTF-8 字节不妨碍 Host 识别。传输层规则先执行，Host 规则进一步阻断。识别前的包会放行；跨包分析不是代理式整请求缓冲。每方向乱序缓存及 HTTP 头默认各限 16 KiB，TCP 与可选的有状态 UDP 检查共用默认最多 16384 条流的容量，空闲 120 秒过期。双向 FIN 或未阻断流的 RST 会释放检查状态；单向 FIN 保留反向分析。容量满时只在有新完成流时扫描回收；仍满则丢弃新流的包。阻断流的 RST 不单凭包头清除用户态阻断状态。如果已完成分析的长连接继续发包，容量回收后可能再次进入首请求分析。超长或无法识别的 HTTP 头结束该分析器并沿用传输层结果；减小头预算可能让更长的阻断目标头无法被识别。不支持 keep-alive 多请求检查和 HTTP/2。
 
 资源预算可由 `inspect-flows=N`、`transport-flows=N`、`flow-idle-seconds=N`、`reorder-bytes=N`、`http-header-bytes=N`、`tls-buffer-bytes=N`、`dns-message-bytes=N` 设置，Linux 和 Windows 命令使用同一组参数。例如 `rustgfw nfqueue 100 accept nft=forward inspect-flows=8192 transport-flows=131072 flow-idle-seconds=300 reorder-bytes=32768 http-header-bytes=32768 tls-buffer-bytes=131072 dns-message-bytes=65535 http-host=blocked.test`。`flow-idle-seconds` 同时作用于检查流表和传输层规则缓存；乱序预算按每方向计算。TLS 暂存预算默认 128 KiB，DNS TCP 单消息预算默认 65535 字节，UDP DNS 不受该预算影响。预算过低会使较大的匹配目标无法识别，此时使用传输层裁决。
 

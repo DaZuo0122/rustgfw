@@ -207,6 +207,12 @@ pub enum Condition {
         fresh: bool,
         operator: TextOperator,
     },
+    FieldNumber {
+        field: String,
+        value: u64,
+        fresh: bool,
+        operator: NumberOperator,
+    },
     FieldExists {
         field: String,
         fresh: bool,
@@ -246,7 +252,26 @@ impl Condition {
                 (!fresh || context.updated(field))
                     && context.values(field).is_some_and(|values| {
                         values.iter().any(|actual| {
-                            operator.matches(actual.as_bytes(), value.as_bytes(), true)
+                            let insensitive = !matches!(
+                                field.as_str(),
+                                "http.method" | "http.target" | "tls.alpn" | "quic.alpn"
+                            );
+                            operator.matches(actual.as_bytes(), value.as_bytes(), insensitive)
+                        })
+                    })
+            }
+            Self::FieldNumber {
+                field,
+                value,
+                fresh,
+                operator,
+            } => {
+                (!fresh || context.updated(field))
+                    && context.values(field).is_some_and(|values| {
+                        values.iter().any(|actual| {
+                            actual
+                                .parse::<u64>()
+                                .is_ok_and(|actual| operator.matches(actual, *value))
                         })
                     })
             }
@@ -268,9 +293,9 @@ impl Condition {
                 items.iter().any(|item| item.references_field(field))
             }
             Self::Not(item) => item.references_field(field),
-            Self::FieldMatch { field: name, .. } | Self::FieldExists { field: name, .. } => {
-                name == field
-            }
+            Self::FieldMatch { field: name, .. }
+            | Self::FieldNumber { field: name, .. }
+            | Self::FieldExists { field: name, .. } => name == field,
             _ => false,
         }
     }
@@ -289,7 +314,9 @@ impl Condition {
                 }
             }
             Self::Not(item) => item.collect_fields(fields),
-            Self::FieldMatch { field, .. } | Self::FieldExists { field, .. } => fields.push(field),
+            Self::FieldMatch { field, .. }
+            | Self::FieldNumber { field, .. }
+            | Self::FieldExists { field, .. } => fields.push(field),
             _ => {}
         }
     }
@@ -378,7 +405,9 @@ impl Condition {
                     network.contains(address.ip())
                 })
             }
-            Self::FieldMatch { field, .. } | Self::FieldExists { field, .. }
+            Self::FieldMatch { field, .. }
+            | Self::FieldNumber { field, .. }
+            | Self::FieldExists { field, .. }
                 if !field_possible(field, protocol) =>
             {
                 (true, false)
@@ -729,6 +758,20 @@ impl Parser<'_> {
                     operator,
                 })
             }
+            _ if let Some(operator) = number_operator => {
+                let (fresh, field) = field
+                    .strip_prefix("fresh.")
+                    .map_or((false, field.as_str()), |name| (true, name));
+                let value = value
+                    .parse()
+                    .map_err(|_| format!("invalid numeric observation value {value}"))?;
+                Ok(Condition::FieldNumber {
+                    field: field.to_owned(),
+                    value,
+                    fresh,
+                    operator,
+                })
+            }
             _ => Err(format!("unsupported comparison for {field}")),
         }?;
         Ok(
@@ -918,6 +961,7 @@ mod tests {
         assert!(parse_expression("src.port != 53").is_ok());
         assert!(parse_expression("src.port > many").is_err());
         assert!(parse_expression("payload.len > -1").is_err());
+        assert!(parse_expression("http.status >= many").is_err());
         assert!(parse_expression("proto exists").is_err());
         assert!(parse_expression("payload.len exists").is_err());
         assert!(parse_expression("src.ip > 10.0.0.1").is_err());

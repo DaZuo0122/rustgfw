@@ -55,14 +55,14 @@ pub fn compile(source: &str) -> Result<Vec<MatchRule>, String> {
             for field in condition.fields() {
                 if !matches!(
                     field,
-                    "http.host"
-                        | "tls.sni"
+                    "tls.sni"
                         | "tls.alpn"
                         | "dns.qname"
                         | "ssh.protocol"
                         | "ssh.software"
                         | "ssh.banner"
-                ) && !rustgfw_core::wireguard::FIELDS.contains(&field)
+                ) && !rustgfw_core::http::FIELDS.contains(&field)
+                    && !rustgfw_core::wireguard::FIELDS.contains(&field)
                     && !rustgfw_core::openvpn::FIELDS.contains(&field)
                     && !rustgfw_core::socks::FIELDS.contains(&field)
                     && !rustgfw_core::quic::FIELDS.contains(&field)

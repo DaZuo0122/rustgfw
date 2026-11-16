@@ -1,4 +1,5 @@
 //! Incremental stream analysis. Each direction shares reassembly across analyzers.
+pub use crate::http::HttpFirstMessage as HttpHost;
 use crate::{
     Decision, FlowScope, Packet, Policy, Verdict,
     packet::{self, Protocol},
@@ -79,94 +80,6 @@ impl DatagramPort {
             Self::Destination(port) => destination == port,
             Self::Either(port) => source == port || destination == port,
         }
-    }
-}
-
-/// HTTP/1 initial request headers. Subsequent keep-alive requests need a
-/// transaction parser and are deliberately not advertised by this analyzer.
-pub struct HttpHost {
-    header: Vec<u8>,
-    finished: bool,
-    limit: usize,
-}
-impl Default for HttpHost {
-    fn default() -> Self {
-        Self::with_header_limit(16384)
-    }
-}
-impl HttpHost {
-    pub fn with_header_limit(limit: usize) -> Self {
-        Self {
-            header: Vec::new(),
-            finished: false,
-            limit,
-        }
-    }
-}
-impl StreamAnalyzer for HttpHost {
-    fn feed(&mut self, bytes: &[u8]) -> Analysis {
-        if self.finished {
-            return Analysis::Finished;
-        }
-        for &byte in bytes {
-            if self.header.len() == self.limit {
-                self.finished = true;
-                return Analysis::Finished;
-            }
-            self.header.push(byte);
-            if self.header.ends_with(b"\r\n\r\n") {
-                self.finished = true;
-                let mut lines = self.header.split(|&byte| byte == b'\n');
-                let first = lines.next().unwrap_or_default();
-                let Ok(first) = std::str::from_utf8(first.strip_suffix(b"\r").unwrap_or(first))
-                else {
-                    return Analysis::Finished;
-                };
-                let mut request = first.split_ascii_whitespace();
-                let (Some(method), Some(target), Some(version)) =
-                    (request.next(), request.next(), request.next())
-                else {
-                    return Analysis::Finished;
-                };
-                if request.next().is_some() || !matches!(version, "HTTP/1.1" | "HTTP/1.0") {
-                    return Analysis::Finished;
-                }
-                let mut hosts = Vec::new();
-                let absolute = target
-                    .split_once("://")
-                    .filter(|(scheme, _)| {
-                        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
-                    })
-                    .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or_default());
-                if let Some(authority) =
-                    absolute.or_else(|| method.eq_ignore_ascii_case("CONNECT").then_some(target))
-                    && !authority.is_empty()
-                {
-                    hosts.push(Observation {
-                        field: "http.host",
-                        value: authority.to_ascii_lowercase(),
-                    });
-                }
-                for line in lines {
-                    let line = line.strip_suffix(b"\r").unwrap_or(line);
-                    if let Some(colon) = line.iter().position(|&byte| byte == b':')
-                        && line[..colon].eq_ignore_ascii_case(b"host")
-                        && let Ok(value) = std::str::from_utf8(line[colon + 1..].trim_ascii())
-                    {
-                        hosts.push(Observation {
-                            field: "http.host",
-                            value: value.to_ascii_lowercase(),
-                        });
-                    }
-                }
-                return if hosts.is_empty() {
-                    Analysis::Finished
-                } else {
-                    Analysis::FinalObservations(hosts)
-                };
-            }
-        }
-        Analysis::Pending
     }
 }
 
@@ -1009,10 +922,15 @@ mod tests {
 
         let source = "192.0.2.1:1234".parse().unwrap();
         let destination = "198.51.100.2:80".parse().unwrap();
-        let facts = HashMap::from([(
-            "http.host",
-            vec!["other.test".into(), "Api.Example.Com".into()],
-        )]);
+        let facts = HashMap::from([
+            (
+                "http.host",
+                vec!["other.test".into(), "Api.Example.Com".into()],
+            ),
+            ("http.method", vec!["GET".into()]),
+            ("http.target", vec!["/Admin".into()]),
+            ("tls.alpn", vec!["h2".into()]),
+        ]);
         let context = FlowContext {
             protocol: Protocol::Tcp,
             scope: FlowScope::default(),
@@ -1029,6 +947,9 @@ mod tests {
             "http.host ends_with .example.com",
             "fresh.http.host starts_with api.",
             "http.host contains AMPLE",
+            "http.method == GET",
+            "http.target == /Admin",
+            "tls.alpn == h2",
             "payload contains BYTES",
             "payload starts_with prefix",
             "payload ends_with suffix",
@@ -1045,6 +966,9 @@ mod tests {
             "payload contains bytes",
             "payload_hex contains 0x00ff",
             "http.host ends_with .invalid.test",
+            "http.method == get",
+            "http.target == /admin",
+            "tls.alpn == H2",
             "fresh.dns.qname contains example",
         ] {
             assert!(
@@ -1064,7 +988,13 @@ mod tests {
 
         let source = "192.0.2.1:1234".parse().unwrap();
         let destination = "198.51.100.2:51820".parse().unwrap();
-        let facts = HashMap::from([("wireguard.type", vec!["data".into()])]);
+        let facts = HashMap::from([
+            ("wireguard.type", vec!["data".into()]),
+            (
+                "wireguard.counter",
+                vec!["invalid".into(), "7".into(), "12".into()],
+            ),
+        ]);
         let context = FlowContext {
             protocol: Protocol::Udp,
             scope: FlowScope::default(),
@@ -1087,6 +1017,8 @@ mod tests {
             "fresh.wireguard.type exists",
             "proto != tcp",
             "wireguard.type != initiation",
+            "wireguard.counter > 10",
+            "wireguard.counter <= 7",
         ] {
             assert!(
                 parse_expression(expression).unwrap().matches(&context),
@@ -1100,6 +1032,8 @@ mod tests {
             "dns.qname exists",
             "fresh.dns.qname exists",
             "wireguard.type != data",
+            "wireguard.counter < 7",
+            "fresh.wireguard.counter > 10",
         ] {
             assert!(
                 !parse_expression(expression).unwrap().matches(&context),
@@ -1517,10 +1451,24 @@ mod tests {
         assert_eq!(a.feed(b"GET / HTTP/1.1\r\nHo"), Analysis::Pending);
         assert_eq!(
             a.feed(b"st: EXAMPLE.COM\r\n\r\nbody"),
-            Analysis::FinalObservations(vec![Observation {
-                field: "http.host",
-                value: "example.com".into(),
-            }])
+            Analysis::FinalObservations(vec![
+                Observation {
+                    field: "http.method",
+                    value: "GET".into()
+                },
+                Observation {
+                    field: "http.target",
+                    value: "/".into()
+                },
+                Observation {
+                    field: "http.request_version",
+                    value: "HTTP/1.1".into()
+                },
+                Observation {
+                    field: "http.host",
+                    value: "example.com".into()
+                },
+            ])
         );
         assert_eq!(a.feed(b"more"), Analysis::Finished);
     }
@@ -1532,6 +1480,9 @@ mod tests {
                 b"GET http://Blocked.Test/path HTTP/1.1\r\nHost: allowed.test\r\nHost: also-blocked.test\r\n\r\n"
             ),
             Analysis::FinalObservations(vec![
+                Observation { field: "http.method", value: "GET".into() },
+                Observation { field: "http.target", value: "http://Blocked.Test/path".into() },
+                Observation { field: "http.request_version", value: "HTTP/1.1".into() },
                 Observation {
                     field: "http.host",
                     value: "blocked.test".into(),
@@ -1549,10 +1500,24 @@ mod tests {
         let mut connect = HttpHost::default();
         assert_eq!(
             connect.feed(b"CONNECT blocked.test:443 HTTP/1.1\r\n\r\n"),
-            Analysis::FinalObservations(vec![Observation {
-                field: "http.host",
-                value: "blocked.test:443".into(),
-            }])
+            Analysis::FinalObservations(vec![
+                Observation {
+                    field: "http.method",
+                    value: "CONNECT".into()
+                },
+                Observation {
+                    field: "http.target",
+                    value: "blocked.test:443".into()
+                },
+                Observation {
+                    field: "http.request_version",
+                    value: "HTTP/1.1".into()
+                },
+                Observation {
+                    field: "http.host",
+                    value: "blocked.test:443".into()
+                },
+            ])
         );
     }
     #[test]

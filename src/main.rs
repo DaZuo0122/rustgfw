@@ -149,17 +149,14 @@ impl Options {
                 protocol == Protocol::Udp
             } else if rustgfw_core::openvpn::FIELDS.contains(&field) {
                 protocol == Protocol::Udp || rustgfw_core::openvpn::TCP_FIELDS.contains(&field)
-            } else if rustgfw_core::socks::FIELDS.contains(&field) {
+            } else if rustgfw_core::socks::FIELDS.contains(&field)
+                || rustgfw_core::http::FIELDS.contains(&field)
+            {
                 protocol == Protocol::Tcp
             } else {
                 !matches!(
                     field,
-                    "http.host"
-                        | "tls.sni"
-                        | "tls.alpn"
-                        | "ssh.protocol"
-                        | "ssh.software"
-                        | "ssh.banner"
+                    "tls.sni" | "tls.alpn" | "ssh.protocol" | "ssh.software" | "ssh.banner"
                 ) || protocol == Protocol::Tcp
             }
         };
@@ -171,7 +168,9 @@ impl Options {
                 .iter()
                 .any(|rule| eligible(rule, Protocol::Tcp) && rule.condition.references_field(field))
         };
-        let needs_http = needs_tcp_field("http.host");
+        let needs_http = rustgfw_core::http::FIELDS
+            .iter()
+            .any(|field| needs_tcp_field(field));
         let needs_tls = ["tls.sni", "tls.alpn"].into_iter().any(needs_tcp_field);
         let needs_dns_tcp = needs_tcp_field("dns.qname");
         let needs_ssh = ["ssh.protocol", "ssh.software", "ssh.banner"]
@@ -224,14 +223,14 @@ impl Options {
             if self.http_hosts.is_empty() {
                 needs_http.then(|| {
                     AnalyzerRule::observing(None, move || {
-                        Box::new(rustgfw_core::inspect::HttpHost::with_header_limit(
+                        Box::new(rustgfw_core::http::HttpFirstMessage::with_header_limit(
                             http_header_bytes,
                         ))
                     })
                 })
             } else {
                 AnalyzerRule::exact("http.host", self.http_hosts, None, move || {
-                    Box::new(rustgfw_core::inspect::HttpHost::with_header_limit(
+                    Box::new(rustgfw_core::http::HttpFirstMessage::with_header_limit(
                         http_header_bytes,
                     ))
                 })
@@ -1023,6 +1022,55 @@ mod tests {
             }),
             Verdict::DropFlow
         );
+    }
+
+    #[test]
+    fn http_expression_combines_request_and_response_fields() {
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"failed request","expr":"proto == tcp && http.method == GET && http.target == /blocked && http.status >= 400","action":"block"}]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let tcp = |sequence: u32, payload: &[u8], reverse: bool| {
+            let mut bytes = vec![0; 40 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 6;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&80u16.to_be_bytes());
+            bytes[24..28].copy_from_slice(&sequence.to_be_bytes());
+            bytes[32] = 0x50;
+            bytes[33] = 0x18;
+            bytes[40..].copy_from_slice(payload);
+            if reverse {
+                for offset in 0..4 {
+                    bytes.swap(12 + offset, 16 + offset);
+                }
+                bytes.swap(20, 22);
+                bytes.swap(21, 23);
+            }
+            bytes
+        };
+        let evaluate = |policy: &mut dyn Policy, bytes: &[u8]| {
+            policy.evaluate(Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        let request = tcp(
+            100,
+            b"GET /blocked HTTP/1.1\r\nHost: example.test\r\n\r\n",
+            false,
+        );
+        let response = tcp(500, b"HTTP/1.1 404 Not Found\r\n\r\n", true);
+        assert_eq!(evaluate(&mut policy, &request), Verdict::Accept);
+        assert_eq!(evaluate(&mut policy, &response), Verdict::DropFlow);
     }
 
     #[test]

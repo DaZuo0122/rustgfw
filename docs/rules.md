@@ -51,7 +51,7 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 
 例如 `rustgfw nfqueue 100 accept nft=forward rules-file=rules.json`。`rules-file` 可以和现有的传输层规则、资源预算参数一起使用；传输层规则先执行。当前没有规则文件热更新入口。
 
-表达式使用 `!`、`&&`、`||` 和括号，优先级依次递减。比较值可用裸词或双引号字符串；字符串支持 `\"`、`\\`、`\n`、`\r`、`\t`。观察字段、`payload` 和 `payload_hex` 支持 `==`、`!=`、`contains`、`starts_with`、`ends_with`；观察字段比较忽略 ASCII 大小写，载荷按原始字节区分大小写。端口和 `payload.len` 支持 `==`、`!=`、`<`、`<=`、`>`、`>=`；`proto`、`reverse` 和 IP 地址支持 `==`、`!=`。可比较的内容：
+表达式使用 `!`、`&&`、`||` 和括号，优先级依次递减。比较值可用裸词或双引号字符串；字符串支持 `\"`、`\\`、`\n`、`\r`、`\t`。观察字段、`payload` 和 `payload_hex` 支持 `==`、`!=`、`contains`、`starts_with`、`ends_with`；域名等观察字段比较忽略 ASCII 大小写，`http.method`、`http.target`、`tls.alpn`、`quic.alpn` 及载荷区分大小写。端口和 `payload.len` 支持 `==`、`!=`、`<`、`<=`、`>`、`>=`；`proto`、`reverse` 和 IP 地址支持 `==`、`!=`。可比较的内容：
 
 可选的 `expressions` 对象定义命名条件，在规则或其他命名条件中以 `@名称` 引用。加载时递归展开引用，并检查未知名称和循环引用；展开后的规则按正常布尔逻辑求值。命名条件只组合匹配条件，动作仍由各条规则指定。
 
@@ -64,7 +64,9 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 | `payload` | `payload contains "old"` | 当前传输层载荷中的字节片段 |
 | `payload.len` | `payload.len >= 32` | 当前包传输层载荷的字节数；TCP 按当前分段计算 |
 | `payload_hex` | `payload_hex starts_with 0x00ff` | 当前传输层载荷中的二进制字节；十六进制数字须成对 |
-| `http.host`、`tls.sni`、`tls.alpn`、`dns.qname` | `tls.alpn == h2` | 流内最近一次观察批次的任一值；`tls.alpn` 为客户端提供的协议列表 |
+| `http.host`、`http.method`、`http.target`、`http.request_version` | `http.method == CONNECT && http.target ends_with :443` | TCP 首个 HTTP/1 请求的请求行与可见 authority/Host |
+| `http.status`、`http.response_version` | `http.status >= 400` | TCP 首个 HTTP/1 响应的状态码与版本；状态码是十进制观察值 |
+| `tls.sni`、`tls.alpn`、`dns.qname` | `tls.alpn == h2` | 流内最近一次观察批次的任一值；`tls.alpn` 为客户端提供的协议列表 |
 | `ssh.protocol`、`ssh.software`、`ssh.banner` | `fresh.ssh.software contains "OpenSSH"` | TCP 任一方向首次识别出的 SSH 标识行字段 |
 | `wireguard.type`、`wireguard.sender_index`、`wireguard.receiver_index`、`wireguard.receiver_matched`、`wireguard.counter` | `wireguard.receiver_matched == true` | UDP WireGuard 报文形状与最近的反方向索引关联；索引和计数器按十进制字符串比较 |
 | `openvpn.stage`、`openvpn.client_reset`、`openvpn.server_reset` | `openvpn.stage == handshake && openvpn.server_reset == 8` | TCP/UDP OpenVPN 双向重置握手；数值字段按十进制字符串比较 |
@@ -73,10 +75,11 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 | `quic.version`、`quic.sni`、`quic.alpn` | `fresh.quic.alpn == h3` | UDP QUIC v1/v2 客户端 Initial 中的 TLS ClientHello；版本值为 `1` 或 `2`，ALPN 为客户端提供的协议列表 |
 | `fresh.` 加字段名 | `fresh.dns.qname == "blocked.test"` | 该字段必须由当前包更新 |
 | 观察字段加 `exists` | `fresh.wireguard.type exists` | 字段至少有一个值；`fresh.` 还要求当前包更新 |
+| 数值观察字段 | `fresh.openvpn.tx_packets > 10` | `>`、`>=`、`<`、`<=` 按无符号十进制整数比较；非数字值不匹配 |
 
-`origin`、`target` 是创建流时第一个包的端点；`src`、`dst` 随当前包方向变化。HTTP 只分析首个 HTTP/1 请求，TLS 分析可见的 ClientHello SNI 和 ALPN；DNS 在 TCP/UDP 端口 53 分析。SSH 读取每个 TCP 方向的首条标识行，允许此前出现提示行，单方向最多读取 `ssh-banner-bytes` 字节。`fresh.` 适合逐包丢弃或修改，避免沿用较早数据报留下的观察值。
+`origin`、`target` 是创建流时第一个包的端点；`src`、`dst` 随当前包方向变化。HTTP 在每个 TCP 方向只分析首个 HTTP/1 消息：请求字段和反向响应字段可在同一流的表达式中组合，`http.target` 保留请求目标原文。TLS 分析可见的 ClientHello SNI 和 ALPN；DNS 在 TCP/UDP 端口 53 分析。SSH 读取每个 TCP 方向的首条标识行，允许此前出现提示行，单方向最多读取 `ssh-banner-bytes` 字节。`fresh.` 适合逐包丢弃或修改，避免沿用较早数据报留下的观察值。
 
-`field != value` 等价于 `!(field == value)`，因此字段缺失时也成立；需要字段实际存在时可写 `field exists && field != value`。
+`field != value` 等价于 `!(field == value)`，因此字段缺失时也成立；需要字段实际存在时可写 `field exists && field != value`。观察字段的相等比较仍按文本处理；大小比较按无符号十进制整数处理，字段缺失时为假。
 
 WireGuard 分析器按需处理任意 UDP 端口，识别握手发起、握手响应、cookie 回复和数据包的头部形状。`wireguard.receiver_matched` 表示接收索引在同一流反方向最近六个发送索引中出现过；这只是报文关联，不验证加密真实性。每个数据报先清除上一个数据报的 WireGuard 字段，再写入本次字段；不符合形状的数据报也会清除这些字段。
 

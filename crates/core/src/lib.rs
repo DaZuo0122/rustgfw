@@ -4,6 +4,7 @@ pub mod conditions;
 pub mod dns;
 pub mod inspect;
 pub mod offload;
+pub mod openvpn;
 pub mod packet;
 pub mod rules;
 pub mod ssh;

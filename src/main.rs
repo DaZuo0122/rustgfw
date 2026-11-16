@@ -140,7 +140,9 @@ impl Options {
         let ssh_banner_bytes = self.ssh_banner_bytes;
         let dns_names = self.dns_names;
         let field_possible = |field: &str, protocol| {
-            if rustgfw_core::wireguard::FIELDS.contains(&field) {
+            if rustgfw_core::wireguard::FIELDS.contains(&field)
+                || rustgfw_core::openvpn::FIELDS.contains(&field)
+            {
                 protocol == Protocol::Udp
             } else {
                 !matches!(
@@ -169,6 +171,12 @@ impl Options {
         let needs_wireguard_udp = self.expr_rules.iter().any(|rule| {
             eligible(rule, Protocol::Udp)
                 && rustgfw_core::wireguard::FIELDS
+                    .iter()
+                    .any(|field| rule.condition.references_field(field))
+        });
+        let needs_openvpn_udp = self.expr_rules.iter().any(|rule| {
+            eligible(rule, Protocol::Udp)
+                && rustgfw_core::openvpn::FIELDS
                     .iter()
                     .any(|field| rule.condition.references_field(field))
         });
@@ -254,6 +262,11 @@ impl Options {
             needs_wireguard_udp.then(|| {
                 UdpStreamRule::new(None, || {
                     Box::new(rustgfw_core::wireguard::WireGuard::default())
+                })
+            }),
+            needs_openvpn_udp.then(|| {
+                UdpStreamRule::new(None, || {
+                    Box::new(rustgfw_core::openvpn::OpenVpnUdp::default())
                 })
             }),
         ]
@@ -758,6 +771,60 @@ mod tests {
         assert_eq!(evaluate(&mut policy, &udp(&data, false)), Verdict::Accept);
         data[1] = 0;
         data[4..8].copy_from_slice(&123u32.to_le_bytes());
+        assert_eq!(evaluate(&mut policy, &udp(&data, false)), Verdict::Accept);
+    }
+
+    #[test]
+    fn openvpn_expression_requires_reverse_reset_and_uses_current_opcode() {
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[
+                {"name":"handshake","expr":"openvpn.stage == handshake && openvpn.client_reset == 7 && openvpn.server_reset == 8","action":"drop_packet"},
+                {"name":"first client data","expr":"fresh.openvpn.opcode == 6 && openvpn.tx_packets == 1 && payload.len >= 6","action":"drop_packet"}
+            ]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let udp = |payload: &[u8], reverse: bool| {
+            let mut bytes = vec![0; 28 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 17;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&1194u16.to_be_bytes());
+            bytes[24..26].copy_from_slice(&(8 + payload.len() as u16).to_be_bytes());
+            bytes[28..].copy_from_slice(payload);
+            if reverse {
+                for offset in 0..4 {
+                    bytes.swap(12 + offset, 16 + offset);
+                }
+                bytes.swap(20, 22);
+                bytes.swap(21, 23);
+            }
+            bytes
+        };
+        let evaluate = |policy: &mut dyn Policy, bytes: &[u8]| {
+            policy.evaluate(Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        let client = [7 << 3, 1, 2, 3, 4, 5, 6, 7, 8];
+        let server = [8 << 3, 6, 7, 8, 9, 10, 11, 12, 13];
+        let data = [6 << 3, 0, 0, 0, 0, 0];
+        assert_eq!(evaluate(&mut policy, &udp(&client, false)), Verdict::Accept);
+        assert_eq!(evaluate(&mut policy, &udp(&server, false)), Verdict::Accept);
+        assert_eq!(evaluate(&mut policy, &udp(&server, true)), Verdict::Drop);
+        assert_eq!(evaluate(&mut policy, &udp(&data, false)), Verdict::Drop);
+        assert_eq!(
+            evaluate(&mut policy, &udp(&[0xff; 6], true)),
+            Verdict::Accept
+        );
         assert_eq!(evaluate(&mut policy, &udp(&data, false)), Verdict::Accept);
     }
 

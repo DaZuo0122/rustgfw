@@ -1,8 +1,9 @@
-//! DNS header and question inspection. UDP decisions apply to one datagram.
+//! DNS header, question, and selected answer inspection.
 use crate::inspect::{
     Analysis, DatagramAnalysis, DatagramAnalyzer, Observation, ObservationBatch, StreamAnalyzer,
     UdpStreamAnalysis, UdpStreamAnalyzer,
 };
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 pub const FIELDS: &[&str] = &[
     "dns.id",
@@ -11,6 +12,9 @@ pub const FIELDS: &[&str] = &[
     "dns.qname",
     "dns.qtype",
     "dns.rcode",
+    "dns.answer_ipv4",
+    "dns.answer_ipv6",
+    "dns.answer_cname",
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -81,6 +85,13 @@ struct DnsMessage {
     opcode: u8,
     rcode: u8,
     questions: Vec<(String, u16, u16)>,
+    answers: Vec<Answer>,
+}
+
+enum Answer {
+    Ipv4(Ipv4Addr),
+    Ipv6(Ipv6Addr),
+    Cname(String),
 }
 
 fn parse_message(message: &[u8]) -> Result<DnsMessage, InvalidDns> {
@@ -92,6 +103,7 @@ fn parse_message(message: &[u8]) -> Result<DnsMessage, InvalidDns> {
     let count = word(message, 4)?;
     let mut cursor = 12;
     let mut questions = Vec::new();
+    let mut answers = Vec::new();
     if opcode == 0 {
         for _ in 0..count {
             let qname = name(message, &mut cursor)?;
@@ -100,6 +112,34 @@ fn parse_message(message: &[u8]) -> Result<DnsMessage, InvalidDns> {
             cursor += 4;
             questions.push((qname, qtype, class));
         }
+        for _ in 0..word(message, 6)? {
+            name(message, &mut cursor)?;
+            let kind = word(message, cursor)?;
+            let class = word(message, cursor + 2)?;
+            let length = usize::from(word(message, cursor + 8)?);
+            cursor += 10;
+            let data = message.get(cursor..cursor + length).ok_or(InvalidDns)?;
+            if class == 1 {
+                match kind {
+                    1 => answers.push(Answer::Ipv4(Ipv4Addr::from(
+                        <[u8; 4]>::try_from(data).map_err(|_| InvalidDns)?,
+                    ))),
+                    28 => answers.push(Answer::Ipv6(Ipv6Addr::from(
+                        <[u8; 16]>::try_from(data).map_err(|_| InvalidDns)?,
+                    ))),
+                    5 => {
+                        let mut end = cursor;
+                        let target = name(message, &mut end)?;
+                        if end != cursor + length {
+                            return Err(InvalidDns);
+                        }
+                        answers.push(Answer::Cname(target));
+                    }
+                    _ => {}
+                }
+            }
+            cursor += length;
+        }
     }
     Ok(DnsMessage {
         id: word(message, 0)?,
@@ -107,6 +147,7 @@ fn parse_message(message: &[u8]) -> Result<DnsMessage, InvalidDns> {
         opcode,
         rcode: (flags & 0x0f) as u8,
         questions,
+        answers,
     })
 }
 
@@ -167,6 +208,22 @@ fn observations(message: DnsMessage) -> Vec<Observation> {
                 })
             }),
     );
+    if message.response {
+        result.extend(message.answers.into_iter().map(|answer| match answer {
+            Answer::Ipv4(address) => Observation {
+                field: "dns.answer_ipv4",
+                value: address.to_string(),
+            },
+            Answer::Ipv6(address) => Observation {
+                field: "dns.answer_ipv6",
+                value: address.to_string(),
+            },
+            Answer::Cname(name) => Observation {
+                field: "dns.answer_cname",
+                value: name,
+            },
+        }));
+    }
     result
 }
 
@@ -189,7 +246,7 @@ impl DatagramAnalyzer for DnsDatagram {
     }
 }
 
-/// Stateful UDP rule adapter; each datagram replaces the previous DNS name.
+/// Stateful UDP rule adapter; each datagram replaces the previous DNS fields.
 pub struct DnsUdp;
 impl UdpStreamAnalyzer for DnsUdp {
     fn feed(&mut self, payload: &[u8], _: bool) -> UdpStreamAnalysis {
@@ -321,6 +378,63 @@ mod tests {
         assert_eq!(field(&response_fields, "dns.qtype"), Some("28"));
         assert_eq!(field(&response_fields, "dns.rcode"), Some("3"));
         assert!(questions(&response).unwrap().is_empty());
+    }
+
+    #[test]
+    fn response_exposes_compressed_cname_and_address_answers() {
+        let mut response = query();
+        response[2] = 0x81;
+        response[3] = 0x80;
+        response[7] = 3;
+        let cname = b"\x05alias\xc0\x0c";
+        let alias_offset = response.len() + 12;
+        response.extend_from_slice(&[0xc0, 12, 0, 5, 0, 1, 0, 0, 0, 30, 0, cname.len() as u8]);
+        response.extend_from_slice(cname);
+        response.extend_from_slice(&[
+            0xc0,
+            alias_offset as u8,
+            0,
+            1,
+            0,
+            1,
+            0,
+            0,
+            0,
+            30,
+            0,
+            4,
+            203,
+            0,
+            113,
+            7,
+        ]);
+        response.extend_from_slice(&[0xc0, 12, 0, 28, 0, 1, 0, 0, 0, 30, 0, 16]);
+        response.extend_from_slice(&"2001:db8::7".parse::<Ipv6Addr>().unwrap().octets());
+        let UdpStreamAnalysis::ReplaceFields { observations, .. } = DnsUdp.feed(&response, true)
+        else {
+            panic!("expected DNS answer observations");
+        };
+        assert_eq!(field(&observations, "dns.qname"), Some("example.com"));
+        assert_eq!(
+            field(&observations, "dns.answer_cname"),
+            Some("alias.example.com")
+        );
+        assert_eq!(field(&observations, "dns.answer_ipv4"), Some("203.0.113.7"));
+        assert_eq!(field(&observations, "dns.answer_ipv6"), Some("2001:db8::7"));
+        assert!(questions(&response).unwrap().is_empty());
+
+        let mut short_a = response.clone();
+        short_a[alias_offset + cname.len() + 11] = 3;
+        assert!(matches!(
+            DnsUdp.feed(&short_a, true),
+            UdpStreamAnalysis::Drop
+        ));
+        let mut extra_cname = response;
+        extra_cname[alias_offset - 1] = (cname.len() + 1) as u8;
+        assert!(matches!(
+            DnsUdp.feed(&extra_cname, true),
+            UdpStreamAnalysis::Drop
+        ));
     }
 
     #[test]

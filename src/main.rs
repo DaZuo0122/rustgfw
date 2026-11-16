@@ -831,7 +831,7 @@ mod tests {
             bytes.extend_from_slice(payload);
             bytes
         };
-        let source = r#"{"rules":[{"name":"AAAA query","expr":"proto == udp && dns.qname == example.test && dns.qtype == 28 && fresh.dns.qr == query","action":"drop_packet"},{"name":"NXDOMAIN response","expr":"proto == udp && dns.qname == example.test && fresh.dns.rcode == 3","action":"drop_packet"}]}"#;
+        let source = r#"{"rules":[{"name":"AAAA query","expr":"proto == udp && dns.qname == example.test && dns.qtype == 28 && fresh.dns.qr == query","action":"drop_packet"},{"name":"NXDOMAIN response","expr":"proto == udp && dns.qname == example.test && fresh.dns.rcode == 3","action":"drop_packet"},{"name":"address answer","expr":"proto == udp && dns.qname == example.test && fresh.dns.answer_ipv4 in 203.0.113.0/24","action":"drop_packet"}]}"#;
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(source).unwrap();
         let mut policy = options.into_policy();
@@ -851,6 +851,14 @@ mod tests {
             evaluate(&udp(&dns("example.test", 28, false, 0), false)),
             Verdict::Drop
         );
+        assert_eq!(
+            evaluate(&udp(&dns("example.test", 28, true, 0), true)),
+            Verdict::Accept
+        );
+        let mut answer = dns("example.test", 28, true, 0);
+        answer[7] = 1;
+        answer.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 203, 0, 113, 7]);
+        assert_eq!(evaluate(&udp(&answer, true)), Verdict::Drop);
         assert_eq!(
             evaluate(&udp(&dns("example.test", 28, true, 0), true)),
             Verdict::Accept

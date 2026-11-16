@@ -68,6 +68,7 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 | `http.status`、`http.response_version` | `http.status >= 400` | TCP HTTP/1 响应的状态码与版本；状态码是十进制观察值 |
 | `tls.sni`、`tls.alpn` | `tls.alpn == h2` | 流内最近一次观察批次的任一值；`tls.alpn` 为客户端提供的协议列表 |
 | `dns.id`、`dns.qr`、`dns.opcode`、`dns.qname`、`dns.qtype`、`dns.rcode` | `dns.qname == example.test && dns.qtype == 28` | DNS 消息 ID、查询或响应、操作码、IN 类问题域名与单问题类型；`rcode` 只在响应上报告首部低四位，数值字段为十进制字符串 |
+| `dns.answer_ipv4`、`dns.answer_ipv6`、`dns.answer_cname` | `dns.qname == example.test && fresh.dns.answer_ipv4 in 203.0.113.0/24` | 响应答案段中的 IN 类 A、AAAA 地址与 CNAME 目标；一个字段可有多个值 |
 | `tls.supported_version`、`tls.ech_extension` | `tls.supported_version == 0x0304 && tls.ech_extension == true` | ClientHello 的 `supported_versions` 提供列表及 ECH 扩展是否出现；列表中的版本各产生一个观察值 |
 | `tls.server_version`、`tls.server_cipher`、`tls.server_alpn` | `tls.alpn == h2 && fresh.tls.server_version == 0x0304` | TCP ServerHello 所选版本与密码套件以四位十六进制字符串表示；明文 ServerHello 中的 ALPN 单独报告 |
 | `ssh.protocol`、`ssh.software`、`ssh.banner` | `fresh.ssh.software contains "OpenSSH"` | TCP 任一方向首次识别出的 SSH 标识行字段 |
@@ -81,10 +82,11 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 | `fresh.` 加字段名 | `fresh.dns.qname == "blocked.test"` | 该字段必须由当前包更新 |
 | 观察字段加 `exists` | `fresh.wireguard.type exists` | 字段至少有一个值；`fresh.` 还要求当前包更新 |
 | 数值观察字段 | `fresh.openvpn.tx_packets > 10` | `>`、`>=`、`<`、`<=` 按无符号十进制整数比较；非数字值不匹配 |
+| IP 观察字段 | `fresh.dns.answer_ipv6 in 2001:db8::/32` | 将观察值解析为 IP 地址并按 CIDR 匹配；非 IP 值不匹配 |
 
 `origin`、`target` 是创建流时第一个包的端点；`src`、`dst` 随当前包方向变化。HTTP 按 TCP 方向连续分析 HTTP/1 消息；同包多条消息逐条求值，新请求会原子替换旧请求字段并清除旧响应字段，`http.target` 保留请求目标原文。HTTP 流水线响应按请求顺序关联，响应求值时恢复对应请求字段；这些请求字段不计入响应事件的 `fresh.`，例如 `http.target == /one && fresh.http.status == 404` 可命中对应响应。1xx 临时响应不消耗请求，101 协议切换会消耗请求。TLS 分析可见的 ClientHello SNI、ALPN 和反向 ServerHello；DNS 在 TCP/UDP 端口 53 分析。SSH 读取每个 TCP 方向的首条标识行，允许此前出现提示行，单方向最多读取 `ssh-banner-bytes` 字节。`fresh.` 适合逐包丢弃或修改，避免沿用较早数据报留下的观察值。
 
-DNS 表达式逐个 UDP 数据报或 TCP 长度前缀消息求值；新消息替换前一条 DNS 字段。响应若带问题段，可同时匹配 `dns.qname` 与 `fresh.dns.rcode`；`dns.qtype` 仅在恰好一个 IN 类问题时报告，避免把多问题的域名和类型错配。`dns.qr` 的值为 `query` 或 `response`。DNS 首部及问题字段依据：[RFC 1035](https://www.rfc-editor.org/rfc/rfc1035.html)；TCP 可连续承载多条消息，响应顺序不作假定：[RFC 7766](https://www.rfc-editor.org/rfc/rfc7766.html)。
+DNS 表达式逐个 UDP 数据报或 TCP 长度前缀消息求值；新消息替换前一条 DNS 字段。响应若带问题段，可同时匹配 `dns.qname` 与 `fresh.dns.rcode` 或答案字段；`dns.qtype` 仅在恰好一个 IN 类问题时报告，避免把多问题的域名和类型错配。答案字段汇集该响应答案段内相应类型的所有 IN 类记录，`dns.answer_cname` 报告规范名称的目标，支持压缩名称。`dns.qr` 的值为 `query` 或 `response`。目前不解析权威段、附加段以及其他答案类型。DNS 首部、问题和答案格式依据：[RFC 1035](https://www.rfc-editor.org/rfc/rfc1035.html)、[RFC 3596](https://www.rfc-editor.org/rfc/rfc3596.html)；TCP 可连续承载多条消息，响应顺序不作假定：[RFC 7766](https://www.rfc-editor.org/rfc/rfc7766.html)。
 
 HTTP 分析器依据 `Content-Length` 跳过定长消息体，也能按最终 `Transfer-Encoding: chunked` 的块长度、扩展和 trailer 找到下一条消息；消息体中的文本不会被当成新请求。没有长度标记的请求视为无消息体。遇到同时出现 `Transfer-Encoding` 与 `Content-Length`、不一致的长度、无法识别的传输编码、`Connection: close` 或无法定界的响应体时，报告当前可见头部后停止该方向的后续解析。明文 HTTP/2 不在此分析器内。消息体长度判定依据：[RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html)。
 

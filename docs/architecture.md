@@ -25,7 +25,7 @@ Linux NFQUEUE 的 accept 表示恢复 netfilter 遍历，并不绕过其他链�
 
 ## 协议与当前限制
 
-DNS：`rustgfw nfqueue 100 accept dns-name=blocked.test` 在 UDP 上匹配标准查询的 IN 类问题；TCP 可匹配标准查询或响应中的 IN 类问题，域名大小写不敏感且配置可带尾点。UDP 目的端口 53 按数据报分析，不缓存域名裁决，因此同一 socket 的后续允许查询不受先前阻断影响。TCP 任一端口 53 启用长度前缀解析，支持连续消息、TCP 分段和压缩域名；每条消息的表达式字段独立替换，命中后阻断整个 TCP 流。表达式还可读取 DNS ID、查询/响应标记、操作码、单问题类型和响应码。目前只解析 DNS 首部与问题段：两者畸形时 UDP 丢弃该包，TCP 结束分析并沿用传输层结果；TCP 超出 `dns-message-bytes` 也结束分析。尚不支持 DNS 修改、DoH/DoT、非 53 端口 DNS 自动识别。
+DNS：`rustgfw nfqueue 100 accept dns-name=blocked.test` 在 UDP 上匹配标准查询的 IN 类问题；TCP 可匹配标准查询或响应中的 IN 类问题，域名大小写不敏感且配置可带尾点。UDP 目的端口 53 按数据报分析，不缓存域名裁决，因此同一 socket 的后续允许查询不受先前阻断影响。TCP 任一端口 53 启用长度前缀解析，支持连续消息、TCP 分段和压缩域名；每条消息的表达式字段独立替换，命中后阻断整个 TCP 流。表达式还可读取 DNS ID、查询/响应标记、操作码、单问题类型、响应码，以及答案段内 IN 类 A、AAAA 和 CNAME 值；IP 答案支持 CIDR 比较。目前解析 DNS 首部、问题段与答案段，暂不检查权威段和附加段；已解析部分畸形时 UDP 丢弃该包，TCP 结束分析并沿用传输层结果；TCP 超出 `dns-message-bytes` 也结束分析。尚不支持 DNS 修改、DoH/DoT、非 53 端口 DNS 自动识别。
 
 TLS：`rustgfw nfqueue 100 accept tls-sni=blocked.test` 检查明文 ClientHello SNI，表达式还可匹配客户端提供的 ALPN、版本列表、ECH 扩展标记，以及反向 ServerHello 的版本、密码套件和可见 ALPN。支持 TCP 分段和 TLS handshake record 分段，可同时指定 `http-host=`。SNI 精确匹配且忽略 ASCII 大小写；不解密 ECH 内层域名或 TLS 1.3 的服务端 ALPN，QUIC 使用单独的 Initial 分析器。遇到 HelloRetryRequest 时继续读取最终 ServerHello，并跳过两者之间的兼容性 ChangeCipherSpec 记录。Hello 声明的正文长度上限 64 KiB，暂存字节预算由 `tls-buffer-bytes` 控制；超预算或无法识别时结束该分析器并沿用传输层裁决。
 

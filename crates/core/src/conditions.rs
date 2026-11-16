@@ -213,6 +213,11 @@ pub enum Condition {
         fresh: bool,
         operator: NumberOperator,
     },
+    FieldIpIn {
+        field: String,
+        network: IpNetwork,
+        fresh: bool,
+    },
     FieldExists {
         field: String,
         fresh: bool,
@@ -279,6 +284,20 @@ impl Condition {
                         })
                     })
             }
+            Self::FieldIpIn {
+                field,
+                network,
+                fresh,
+            } => {
+                (!fresh || context.updated(field))
+                    && context.values(field).is_some_and(|values| {
+                        values.iter().any(|value| {
+                            value
+                                .parse::<IpAddr>()
+                                .is_ok_and(|address| network.contains(address))
+                        })
+                    })
+            }
             Self::FieldExists { field, fresh } => {
                 (!fresh || context.updated(field))
                     && context
@@ -299,6 +318,7 @@ impl Condition {
             Self::Not(item) => item.references_field(field),
             Self::FieldMatch { field: name, .. }
             | Self::FieldNumber { field: name, .. }
+            | Self::FieldIpIn { field: name, .. }
             | Self::FieldExists { field: name, .. } => name == field,
             _ => false,
         }
@@ -320,6 +340,7 @@ impl Condition {
             Self::Not(item) => item.collect_fields(fields),
             Self::FieldMatch { field, .. }
             | Self::FieldNumber { field, .. }
+            | Self::FieldIpIn { field, .. }
             | Self::FieldExists { field, .. } => fields.push(field),
             _ => {}
         }
@@ -411,6 +432,7 @@ impl Condition {
             }
             Self::FieldMatch { field, .. }
             | Self::FieldNumber { field, .. }
+            | Self::FieldIpIn { field, .. }
             | Self::FieldExists { field, .. }
                 if !field_possible(field, protocol) =>
             {
@@ -751,6 +773,16 @@ impl Parser<'_> {
             "proto" | "reverse" | "payload" | "payload_hex" | "payload.len" | "src.port"
             | "dst.port" | "origin.port" | "target.port" | "src.ip" | "dst.ip" | "origin.ip"
             | "target.ip" => Err(format!("unsupported comparison for {field}")),
+            _ if operator == Token::Word("in".into()) => {
+                let (fresh, field) = field
+                    .strip_prefix("fresh.")
+                    .map_or((false, field.as_str()), |name| (true, name));
+                Ok(Condition::FieldIpIn {
+                    field: field.to_owned(),
+                    network: value.parse()?,
+                    fresh,
+                })
+            }
             _ if let Some(operator) = text_operator => {
                 let (fresh, field) = field
                     .strip_prefix("fresh.")
@@ -888,6 +920,14 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_expression("fresh.dns.answer_ipv4 in 203.0.113.0/24").unwrap(),
+            Condition::FieldIpIn {
+                field: "dns.answer_ipv4".into(),
+                network: "203.0.113.0/24".parse().unwrap(),
+                fresh: true,
+            }
+        );
+        assert_eq!(
             parse_expression("proto == udp || proto == tcp && dst.port == 80").unwrap(),
             Condition::Any(vec![
                 Condition::Protocol(Protocol::Udp),
@@ -901,6 +941,7 @@ mod tests {
             ])
         );
         assert!(parse_expression("src.ip in 10.0.0.0/99").is_err());
+        assert!(parse_expression("dns.answer_ipv4 in 203.0.113.0/33").is_err());
         assert!(parse_expression("proto == tcp &&").is_err());
         assert!(parse_expression("(proto == udp").is_err());
         assert!(parse_expression("proto = udp").is_err());

@@ -72,6 +72,7 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 | `openvpn.stage`、`openvpn.client_reset`、`openvpn.server_reset` | `openvpn.stage == handshake && openvpn.server_reset == 8` | TCP/UDP OpenVPN 双向重置握手；数值字段按十进制字符串比较 |
 | `openvpn.opcode`、`openvpn.tx_packets`、`openvpn.rx_packets` | `openvpn.stage == data && fresh.openvpn.opcode == 6` | 仅 UDP：当前包的 opcode 与握手后的双向包数 |
 | `socks.version`、`socks.command`、`socks.target_type`、`socks.target_host`、`socks.target_port`、`socks.auth` | `socks.target_host ends_with ".example.com"` | TCP SOCKS4/4a/5 客户端请求；命令为 `connect`、`bind` 或 `udp_associate`，认证类型为 `none` 或 `userpass` |
+| `fet.candidate`、`fet.sample_len`、`fet.average_popcount_milli`、`fet.printable_per_mille`、`fet.first_six_printable`、`fet.longest_printable_run`、`fet.tls_http_prefix` | `proto == tcp && fet.candidate == true && fet.sample_len >= 32` | 首方向 TCP 载荷的 FET 启发式采样；`candidate` 只表示未命中豁免条件 |
 | `quic.version`、`quic.sni`、`quic.alpn` | `fresh.quic.alpn == h3` | UDP QUIC v1/v2 客户端 Initial 中的 TLS ClientHello；版本值为 `1` 或 `2`，ALPN 为客户端提供的协议列表 |
 | `fresh.` 加字段名 | `fresh.dns.qname == "blocked.test"` | 该字段必须由当前包更新 |
 | 观察字段加 `exists` | `fresh.wireguard.type exists` | 字段至少有一个值；`fresh.` 还要求当前包更新 |
@@ -86,6 +87,8 @@ WireGuard 分析器按需处理任意 UDP 端口，识别握手发起、握手�
 OpenVPN TCP/UDP 分析器按需处理任意端口。先看到首方向的客户端 hard reset，再看到反方向的服务端 hard reset，才报告 `openvpn.stage == handshake`。TCP 分析器读取双字节长度前缀，支持分段握手帧，确认后结束分析。UDP 后续合法控制或数据 opcode 报告 `stage == data` 并更新双向计数；`openvpn.opcode` 只描述当前数据报。分析器检查头部 opcode、首轮 key ID 与最短长度，不解密或验证会话。
 
 SOCKS 分析器按需检查任意 TCP 端口的首方向请求，支持 SOCKS4、SOCKS4a 域名及 SOCKS5 的 IPv4、IPv6、域名目标和用户名密码认证帧。请求完成时发布目标字段，不解析服务器应答；不会把用户名或密码放入观察字段。SOCKS4a 的版本值为 `4a`，目标端口目前按十进制字符串比较。
+
+FET 分析器仅在规则引用 `fet.*` 时启用，取首方向首次交付的 TCP 数据，最多检查 8192 字节。它复现 OpenGFW 的五组豁免条件：平均置位数不在 3.4～4.6、前六字节均可打印、可打印字节超过一半、最长连续可打印段超过 20 字节，或具有 TLS/HTTP 前缀。`fet.candidate == true` 表示这些豁免条件都不成立，并不证明流量已加密或属于某个代理协议；分段方式也会影响首次采样长度。`fet.average_popcount_milli` 和 `fet.printable_per_mille` 把比例乘以 1000 后截断为整数，便于用表达式与采样长度、端口及其他字段组合。依据：[OpenGFW FET 分析器](https://github.com/apernet/OpenGFW/blob/master/analyzer/tcp/fet.go)、[FET 测量论文](https://gfw.report/publications/usenixsecurity23/data/paper/paper.pdf)。
 
 QUIC 分析器按需检查任意 UDP 端口的 v1/v2 客户端 Initial，解开公开的 Initial 密钥保护，按 CRYPTO 偏移重组分段 TLS ClientHello，再提取可见 SNI 和 ALPN。它在完整握手消息到达后报告一次 `quic.version`，有可见 SNI 或 ALPN 时同时报告对应字段；每条流最多检查八个候选数据报。ALPN 列表表示客户端提供的协议，不表示服务端最终选择；目前只将可打印 ASCII 协议 ID 写入观察字段。ECH 内层名称、非 v1/v2 版本及 Retry 后更换连接 ID 的握手暂不识别；`fresh.` 可让单包动作仅作用于报告观察值的那个包。实现依据：[RFC 7301](https://www.rfc-editor.org/rfc/rfc7301.html)、[RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html)、[RFC 9369](https://www.rfc-editor.org/rfc/rfc9369.html)。
 

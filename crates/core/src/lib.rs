@@ -2,6 +2,7 @@
 use std::io;
 pub mod conditions;
 pub mod dns;
+pub mod fet;
 pub mod http;
 pub mod inspect;
 pub mod offload;

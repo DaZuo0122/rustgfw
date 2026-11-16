@@ -151,6 +151,7 @@ impl Options {
                 protocol == Protocol::Udp || rustgfw_core::openvpn::TCP_FIELDS.contains(&field)
             } else if rustgfw_core::socks::FIELDS.contains(&field)
                 || rustgfw_core::http::FIELDS.contains(&field)
+                || rustgfw_core::fet::FIELDS.contains(&field)
             {
                 protocol == Protocol::Tcp
             } else {
@@ -177,6 +178,9 @@ impl Options {
             .into_iter()
             .any(needs_tcp_field);
         let needs_socks = rustgfw_core::socks::FIELDS
+            .iter()
+            .any(|field| needs_tcp_field(field));
+        let needs_fet = rustgfw_core::fet::FIELDS
             .iter()
             .any(|field| needs_tcp_field(field));
         let needs_dns_udp = self.expr_rules.iter().any(|rule| {
@@ -321,6 +325,11 @@ impl Options {
                 needs_socks.then(|| {
                     BidirectionalAnalyzerRule::observing(None, || {
                         Box::new(rustgfw_core::socks::SocksRequest::default())
+                    })
+                }),
+                needs_fet.then(|| {
+                    BidirectionalAnalyzerRule::observing(None, || {
+                        Box::new(rustgfw_core::fet::FullyEncryptedTraffic::default())
                     })
                 }),
             ]
@@ -1071,6 +1080,41 @@ mod tests {
         let response = tcp(500, b"HTTP/1.1 404 Not Found\r\n\r\n", true);
         assert_eq!(evaluate(&mut policy, &request), Verdict::Accept);
         assert_eq!(evaluate(&mut policy, &response), Verdict::DropFlow);
+    }
+
+    #[test]
+    fn fet_observations_combine_with_sample_length_and_port() {
+        let expression = r#"{"rules":[{"name":"candidate","expr":"proto == tcp && fet.candidate == true && fet.sample_len >= 32 && dst.port == 443","action":"block"}]}"#;
+        let tcp = |payload: &[u8]| {
+            let mut bytes = vec![0; 40 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 6;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&443u16.to_be_bytes());
+            bytes[32] = 0x50;
+            bytes[33] = 0x18;
+            bytes[40..].copy_from_slice(payload);
+            bytes
+        };
+        let evaluate = |payload: &[u8]| {
+            let mut options = Options::parse("accept", &[]).unwrap();
+            options.expr_rules = expr_config::compile(expression).unwrap();
+            let mut policy = options.into_policy();
+            let packet = tcp(payload);
+            policy.evaluate(Packet {
+                bytes: &packet,
+                original_len: packet.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        assert_eq!(evaluate(&[0x0f; 64]), Verdict::DropFlow);
+        assert_eq!(evaluate(b"GET / HTTP/1.1\r\n\r\n"), Verdict::Accept);
+        assert_eq!(evaluate(&[0x0f; 8]), Verdict::Accept);
     }
 
     #[test]

@@ -3,7 +3,10 @@ use crate::{
     inspect::{FlowAction, FlowContext, FlowRule},
     packet::Protocol,
 };
-use std::{net::IpAddr, str::FromStr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    str::FromStr,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Endpoint {
@@ -21,6 +24,30 @@ impl Endpoint {
             Self::Target => context.target,
         }
     }
+
+    fn possible_addresses(
+        self,
+        source: SocketAddr,
+        destination: SocketAddr,
+    ) -> (SocketAddr, SocketAddr) {
+        match self {
+            Self::Source | Self::Destination => (source, destination),
+            Self::Origin => (source, source),
+            Self::Target => (destination, destination),
+        }
+    }
+}
+
+fn endpoint_possibilities(
+    endpoint: Endpoint,
+    source: SocketAddr,
+    destination: SocketAddr,
+    matches: impl Fn(SocketAddr) -> bool,
+) -> (bool, bool) {
+    let (first, second) = endpoint.possible_addresses(source, destination);
+    let first = matches(first);
+    let second = matches(second);
+    (!first || !second, first || second)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,7 +245,19 @@ impl Condition {
         protocol: Protocol,
         field_possible: &impl Fn(&str, Protocol) -> bool,
     ) -> bool {
-        self.possibilities(protocol, field_possible).1
+        self.possibilities(protocol, None, field_possible).1
+    }
+
+    /// Whether a rule may match this flow now or after traffic reverses.
+    /// Payloads, observations and direction are treated as unknown future values.
+    pub fn can_match_new_flow(
+        &self,
+        protocol: Protocol,
+        source: SocketAddr,
+        destination: SocketAddr,
+    ) -> bool {
+        self.possibilities(protocol, Some((source, destination)), &|_, _| true)
+            .1
     }
 
     // (false is possible, true is possible). Keeping both outcomes for
@@ -226,6 +265,7 @@ impl Condition {
     fn possibilities(
         &self,
         protocol: Protocol,
+        endpoints: Option<(SocketAddr, SocketAddr)>,
         field_possible: &impl Fn(&str, Protocol) -> bool,
     ) -> (bool, bool) {
         match self {
@@ -233,7 +273,8 @@ impl Condition {
                 let mut false_possible = false;
                 let mut true_possible = true;
                 for item in items {
-                    let (false_item, true_item) = item.possibilities(protocol, field_possible);
+                    let (false_item, true_item) =
+                        item.possibilities(protocol, endpoints, field_possible);
                     false_possible |= false_item;
                     true_possible &= true_item;
                 }
@@ -243,14 +284,16 @@ impl Condition {
                 let mut false_possible = true;
                 let mut true_possible = false;
                 for item in items {
-                    let (false_item, true_item) = item.possibilities(protocol, field_possible);
+                    let (false_item, true_item) =
+                        item.possibilities(protocol, endpoints, field_possible);
                     false_possible &= false_item;
                     true_possible |= true_item;
                 }
                 (false_possible, true_possible)
             }
             Self::Not(item) => {
-                let (false_possible, true_possible) = item.possibilities(protocol, field_possible);
+                let (false_possible, true_possible) =
+                    item.possibilities(protocol, endpoints, field_possible);
                 (true_possible, false_possible)
             }
             Self::Protocol(expected) => {
@@ -259,6 +302,16 @@ impl Condition {
                 } else {
                     (true, false)
                 }
+            }
+            Self::Port { endpoint, value } if let Some((source, destination)) = endpoints => {
+                endpoint_possibilities(*endpoint, source, destination, |address| {
+                    address.port() == *value
+                })
+            }
+            Self::IpIn { endpoint, network } if let Some((source, destination)) = endpoints => {
+                endpoint_possibilities(*endpoint, source, destination, |address| {
+                    network.contains(address.ip())
+                })
             }
             Self::FieldMatch { field, .. } if !field_possible(field, protocol) => (true, false),
             _ => (true, true),
@@ -567,7 +620,13 @@ pub struct MatchRule {
 }
 impl MatchRule {
     pub fn into_flow_rule(self) -> FlowRule {
-        FlowRule::new(move |context| self.condition.matches(context).then(|| self.action.clone()))
+        let candidate = self.condition.clone();
+        FlowRule::with_candidate(
+            move |context| self.condition.matches(context).then(|| self.action.clone()),
+            move |protocol, source, destination| {
+                candidate.can_match_new_flow(protocol, source, destination)
+            },
+        )
     }
 }
 
@@ -653,6 +712,27 @@ mod tests {
         assert!(mixed.can_match_protocol(Protocol::Udp, &field_possible));
         let absent_field = parse_expression("!(http.host == blocked.test)").unwrap();
         assert!(absent_field.can_match_protocol(Protocol::Udp, &field_possible));
+    }
+
+    #[test]
+    fn flow_candidate_keeps_future_reverse_direction_possible() {
+        let source = "10.0.0.1:1234".parse().unwrap();
+        let destination = "192.0.2.2:80".parse().unwrap();
+        let possible = |expression| {
+            parse_expression(expression).unwrap().can_match_new_flow(
+                Protocol::Tcp,
+                source,
+                destination,
+            )
+        };
+        assert!(possible("src.port == 80 && reverse == true"));
+        assert!(possible("dst.port == 80 && reverse == false"));
+        assert!(possible("src.ip in 192.0.2.0/24"));
+        assert!(possible("!(origin.port == 80)"));
+        assert!(!possible("dst.port == 443"));
+        assert!(!possible("origin.port == 80"));
+        assert!(!possible("!(target.port == 80)"));
+        assert!(!possible("proto == udp"));
     }
 
     #[test]

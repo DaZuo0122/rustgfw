@@ -33,6 +33,8 @@ HTTP/TLS/DNS TCP 通过 `AnalyzerRule` 注册，共享流表及每方向 TCP 重
 
 核心还支持 `AnalyzerRule::observing` 与 `FlowRule`：分析器只产出观察值，流级回调通过 `FlowContext` 读取同一双向 TCP 流的多个字段并组合判断，也可直接根据端点与作用域判断。`BidirectionalAnalyzerRule` 为整条 TCP 流创建一个分析器实例，两方向共用内部状态，但输入仍分别经过 TCP 重组；原有 `AnalyzerRule` 继续按方向创建实例。`FlowContext` 同时提供当前包的 `source`/`destination`、载荷 `payload` 和建流时固定的 `origin`/`target`，`reverse` 标示当前包相对建流方向是否反向。规则按注册顺序取第一个命中的 `Allow` 或 `Block`；`Allow` 结束该流的应用层检查，传输层规则仍逐包执行。`UdpStreamRule` 为双向 UDP 流创建独立分析器实例，保留跨数据报观察值并复用流级规则；`DropPacket` 只丢当前 UDP 数据报，对 TCP 则阻断整条流。原有 `DatagramRule` 继续按单个数据报执行，当前命令行的 UDP DNS 使用这一路径。每个字段保留最近一次观察批次的所有值；TCP 的新初始 SYN、空闲过期或显式清空会丢弃相关属性。平台后端提供的 `FlowScope` 参与流键，防止不同流量域复用属性。Linux 的动态内核卸载只处理 TCP `DropFlow`，UDP 阻断留在用户态逐包执行。
 
+表达式规则在新建检查流前保守判断协议和端点是否可能匹配当前或后续反向包；无关流量不会占用检查流表，也不会因为检查流表满而被误丢。已建立的检查流仍按原状态继续处理。自定义 `FlowRule` 默认视为可能匹配所有流；需要提前筛选时可提供覆盖两个方向及未来观察值的候选判断。
+
 TCP 重组模块 `core::tcp` 已接入 `core::inspect` 的双向分析路径，支持连续字节交付、乱序缓存、重复数据裁剪和序号回绕。缓冲区冲突重叠会阻断流；已交付字节不保留副本。
 
 `rustgfw nfqueue 100 accept http-host=blocked.test` 检查首个 HTTP/1 请求的所有 Host 头、绝对 URI 的 authority，以及 CONNECT 目标（大小写不敏感，含端口时需完整匹配）。任一值命中即阻断；无关头里的非 UTF-8 字节不妨碍 Host 识别。传输层规则先执行，Host 规则进一步阻断。识别前的包会放行；跨包分析不是代理式整请求缓冲。每方向乱序缓存及 HTTP 头默认各限 16 KiB，TCP 与可选的有状态 UDP 检查共用默认最多 16384 条流的容量，空闲 120 秒过期。双向 FIN 或未阻断流的 RST 会释放检查状态；单向 FIN 保留反向分析。容量满时只在有新完成流时扫描回收；仍满则丢弃新流的包。阻断流的 RST 不单凭包头清除用户态阻断状态。如果已完成分析的长连接继续发包，容量回收后可能再次进入首请求分析。超长或无法识别的 HTTP 头结束该分析器并沿用传输层结果；减小头预算可能让更长的阻断目标头无法被识别。不支持 keep-alive 多请求检查和 HTTP/2。

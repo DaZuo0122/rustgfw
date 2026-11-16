@@ -292,9 +292,11 @@ pub enum FlowAction {
 }
 
 type FlowMatch = dyn for<'a> Fn(&FlowContext<'a>) -> Option<FlowAction> + Send + Sync;
+type FlowCandidate = dyn Fn(Protocol, SocketAddr, SocketAddr) -> bool + Send + Sync;
 /// Compose facts from multiple analyzers into an ordered flow decision.
 pub struct FlowRule {
     matches: Box<FlowMatch>,
+    candidate: Option<Box<FlowCandidate>>,
 }
 impl FlowRule {
     pub fn new(
@@ -302,7 +304,26 @@ impl FlowRule {
     ) -> Self {
         Self {
             matches: Box::new(matches),
+            candidate: None,
         }
+    }
+
+    /// A conservative hint for deciding whether a new flow needs inspection.
+    /// Return true if the rule could match either direction at any later point.
+    pub fn with_candidate(
+        matches: impl for<'a> Fn(&FlowContext<'a>) -> Option<FlowAction> + Send + Sync + 'static,
+        candidate: impl Fn(Protocol, SocketAddr, SocketAddr) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            matches: Box::new(matches),
+            candidate: Some(Box::new(candidate)),
+        }
+    }
+
+    fn might_match(&self, protocol: Protocol, source: SocketAddr, destination: SocketAddr) -> bool {
+        self.candidate
+            .as_ref()
+            .is_none_or(|candidate| candidate(protocol, source, destination))
     }
 }
 
@@ -593,12 +614,14 @@ impl<P> Inspect<P> {
         {
             self.udp_flows.remove(&key);
         }
-        if self.udp_rules.is_empty()
-            && !self.udp_flows.contains_key(&key)
+        if !self.udp_flows.contains_key(&key)
             && !self.udp_analyzers.iter().any(|rule| {
                 rule.port.is_none_or(|port| {
                     port.matches(transport.source.port(), transport.destination.port())
                 })
+            })
+            && !self.udp_rules.iter().any(|rule| {
+                rule.might_match(Protocol::Udp, transport.source, transport.destination)
             })
         {
             return Verdict::Accept.into();
@@ -748,25 +771,13 @@ impl<P: Policy> Policy for Inspect<P> {
         {
             return transport_decision;
         }
-        if self.flow_rules.is_empty()
-            && !self.analyzers.iter().any(|a| {
-                a.port
-                    .is_none_or(|port| t.source.port() == port || t.destination.port() == port)
-            })
-            && !self.bidirectional_analyzers.iter().any(|a| {
-                a.port
-                    .is_none_or(|port| t.source.port() == port || t.destination.port() == port)
-            })
-        {
-            return transport_decision;
-        }
-        let now = Instant::now();
-        self.expire_idle_flows(now);
         let (key, direction) = if t.source <= t.destination {
             ((packet.scope, t.source, t.destination), 0)
         } else {
             ((packet.scope, t.destination, t.source), 1)
         };
+        let now = Instant::now();
+        self.expire_idle_flows(now);
         let initial_syn = (t.tcp_flags & 0x12 == 2).then_some((direction, t.tcp_sequence.unwrap()));
         if self
             .flows
@@ -782,6 +793,22 @@ impl<P: Policy> Policy for Inspect<P> {
                 .is_some_and(|f| f.initial_syn != Some(syn))
         {
             self.flows.remove(&key);
+        }
+        if !self.flows.contains_key(&key)
+            && !self
+                .flow_rules
+                .iter()
+                .any(|rule| rule.might_match(Protocol::Tcp, t.source, t.destination))
+            && !self.analyzers.iter().any(|a| {
+                a.port
+                    .is_none_or(|port| t.source.port() == port || t.destination.port() == port)
+            })
+            && !self.bidirectional_analyzers.iter().any(|a| {
+                a.port
+                    .is_none_or(|port| t.source.port() == port || t.destination.port() == port)
+            })
+        {
+            return transport_decision;
         }
         if self.flows.len() + self.udp_flows.len() >= self.limits.max_flows
             && !self.flows.contains_key(&key)
@@ -1896,6 +1923,92 @@ mod tests {
         }
         b
     }
+
+    #[test]
+    fn expression_candidates_skip_unrelated_flows_at_capacity() {
+        use crate::conditions::{MatchRule, parse_expression};
+
+        let limits = InspectLimits {
+            max_flows: 0,
+            ..InspectLimits::default()
+        };
+        let mut udp_policy = Inspect::with_datagrams(
+            crate::ConstantPolicy(Verdict::Accept),
+            Vec::new(),
+            Vec::new(),
+            limits,
+        )
+        .with_udp_streams(
+            Vec::new(),
+            vec![
+                MatchRule {
+                    condition: parse_expression("dst.port == 53").unwrap(),
+                    action: FlowAction::Block,
+                }
+                .into_flow_rule(),
+            ],
+        );
+        let mut unrelated_udp = udp(b"other", false);
+        unrelated_udp[22..24].copy_from_slice(&9999u16.to_be_bytes());
+        let related_udp = udp(b"query", false);
+        let evaluate = |policy: &mut dyn Policy, bytes: &[u8]| {
+            policy.evaluate(Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        assert_eq!(evaluate(&mut udp_policy, &unrelated_udp), Verdict::Accept);
+        assert_eq!(evaluate(&mut udp_policy, &related_udp), Verdict::Drop);
+
+        let mut tcp_policy = Inspect::with_datagrams(
+            crate::ConstantPolicy(Verdict::Accept),
+            Vec::new(),
+            Vec::new(),
+            limits,
+        )
+        .with_flow_rules(vec![
+            MatchRule {
+                condition: parse_expression("dst.port == 80").unwrap(),
+                action: FlowAction::Block,
+            }
+            .into_flow_rule(),
+        ]);
+        let mut unrelated_tcp = tcp(100, 2, b"", false);
+        unrelated_tcp[22..24].copy_from_slice(&443u16.to_be_bytes());
+        let related_tcp = tcp(100, 2, b"", false);
+        assert_eq!(evaluate(&mut tcp_policy, &unrelated_tcp), Verdict::Accept);
+        assert_eq!(evaluate(&mut tcp_policy, &related_tcp), Verdict::Drop);
+    }
+
+    #[test]
+    fn expression_candidate_keeps_reverse_packet_rule_state() {
+        use crate::conditions::{MatchRule, parse_expression};
+
+        let mut policy =
+            Inspect::with_analyzers(crate::ConstantPolicy(Verdict::Accept), Vec::new())
+                .with_udp_streams(
+                    Vec::new(),
+                    vec![
+                        MatchRule {
+                            condition: parse_expression("src.port == 53 && reverse == true")
+                                .unwrap(),
+                            action: FlowAction::Block,
+                        }
+                        .into_flow_rule(),
+                    ],
+                );
+        assert_eq!(
+            evaluate_udp(&mut policy, 0, b"query", false),
+            Verdict::Accept
+        );
+        assert_eq!(
+            evaluate_udp(&mut policy, 0, b"reply", true),
+            Verdict::DropFlow
+        );
+    }
+
     #[test]
     fn policy_reassembles_then_blocks_both_directions() {
         let mut p = Inspect::http_hosts(

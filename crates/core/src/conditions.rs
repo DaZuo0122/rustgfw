@@ -261,6 +261,8 @@ impl Condition {
                                 field.as_str(),
                                 "http.method"
                                     | "http.target"
+                                    | "http2.method"
+                                    | "http2.path"
                                     | "tls.alpn"
                                     | "tls.server_alpn"
                                     | "quic.alpn"

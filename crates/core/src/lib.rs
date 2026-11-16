@@ -4,6 +4,7 @@ pub mod conditions;
 pub mod dns;
 pub mod fet;
 pub mod http;
+pub mod http2;
 pub mod inspect;
 pub mod offload;
 pub mod openvpn;

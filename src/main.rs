@@ -23,6 +23,7 @@ fn observation_field_possible(field: &str, protocol: Protocol) -> bool {
         protocol == Protocol::Udp || rustgfw_core::openvpn::TCP_FIELDS.contains(&field)
     } else if rustgfw_core::socks::FIELDS.contains(&field)
         || rustgfw_core::http::FIELDS.contains(&field)
+        || rustgfw_core::http2::FIELDS.contains(&field)
         || rustgfw_core::fet::FIELDS.contains(&field)
         || rustgfw_core::tls::FIELDS.contains(&field)
         || rustgfw_core::trojan::FIELDS.contains(&field)
@@ -196,6 +197,9 @@ impl Options {
         let needs_http = rustgfw_core::http::FIELDS
             .iter()
             .any(|field| needs_tcp_field(field));
+        let needs_http2 = rustgfw_core::http2::FIELDS
+            .iter()
+            .any(|field| needs_tcp_field(field));
         let needs_tls = rustgfw_core::tls::FIELDS
             .iter()
             .any(|field| needs_tcp_field(field));
@@ -359,6 +363,11 @@ impl Options {
                 needs_openvpn_tcp.then(|| {
                     BidirectionalAnalyzerRule::observing(None, || {
                         Box::new(rustgfw_core::openvpn::OpenVpnTcp::default())
+                    })
+                }),
+                needs_http2.then(|| {
+                    BidirectionalAnalyzerRule::observing(None, || {
+                        Box::<rustgfw_core::http2::Http2Conversation>::default()
                     })
                 }),
                 needs_socks.then(|| {
@@ -1196,6 +1205,75 @@ mod tests {
         );
         assert_eq!(
             evaluate(&mut policy, &tcp(110, &request[7..])),
+            Verdict::DropFlow
+        );
+    }
+
+    #[test]
+    fn http2_expression_correlates_interleaved_streams() {
+        fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+            let mut bytes = vec![0, 0, payload.len() as u8, kind, flags];
+            bytes.extend(stream.to_be_bytes());
+            bytes.extend(payload);
+            bytes
+        }
+        fn tcp(sequence: u32, payload: &[u8], reverse: bool) -> Vec<u8> {
+            let mut bytes = vec![0; 40 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 6;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&80u16.to_be_bytes());
+            bytes[24..28].copy_from_slice(&sequence.to_be_bytes());
+            bytes[32] = 0x50;
+            bytes[33] = 0x18;
+            bytes[40..].copy_from_slice(payload);
+            if reverse {
+                for offset in 0..4 {
+                    bytes.swap(12 + offset, 16 + offset);
+                }
+                bytes.swap(20, 22);
+                bytes.swap(21, 23);
+            }
+            bytes
+        }
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"h2 stream","expr":"http2.path == /two && fresh.http2.status == 404","action":"block"}]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let mut client = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        client.extend(frame(4, 0, 0, &[]));
+        for (stream, path) in [(1, b"/one".as_slice()), (3, b"/two".as_slice())] {
+            let mut header = vec![0x82, 0x04, path.len() as u8];
+            header.extend(path);
+            client.extend(frame(1, 4, stream, &header));
+        }
+        let mut server = frame(4, 0, 0, &[]);
+        server.extend(frame(1, 5, 1, &[0x8d]));
+        let last = frame(1, 5, 3, &[0x8d]);
+        let evaluate = |policy: &mut dyn Policy, bytes: &[u8]| {
+            policy.evaluate(Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        assert_eq!(
+            evaluate(&mut policy, &tcp(100, &client, false)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            evaluate(&mut policy, &tcp(500, &server, true)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            evaluate(&mut policy, &tcp(500 + server.len() as u32, &last, true)),
             Verdict::DropFlow
         );
     }

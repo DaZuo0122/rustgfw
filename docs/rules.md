@@ -66,6 +66,7 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 | `payload_hex` | `payload_hex starts_with 0x00ff` | 当前传输层载荷中的二进制字节；十六进制数字须成对 |
 | `http.host`、`http.method`、`http.target`、`http.request_version` | `http.method == CONNECT && http.target ends_with :443` | TCP HTTP/1 请求的请求行与可见 authority/Host |
 | `http.status`、`http.response_version` | `http.status >= 400` | TCP HTTP/1 响应的状态码与版本；状态码是十进制观察值 |
+| `http2.stream_id`、`http2.method`、`http2.path`、`http2.authority`、`http2.status` | `http2.path == /blocked && fresh.http2.status == 404` | 明文 HTTP/2 的流 ID、请求伪头部与响应状态；响应按 stream ID 恢复对应请求字段 |
 | `tls.sni`、`tls.alpn` | `tls.alpn == h2` | 流内最近一次观察批次的任一值；`tls.alpn` 为客户端提供的协议列表 |
 | `dns.id`、`dns.qr`、`dns.opcode`、`dns.qname`、`dns.qtype`、`dns.rcode` | `dns.qname == example.test && dns.qtype == 28` | DNS 消息 ID、查询或响应、操作码、IN 类问题域名与单问题类型；`rcode` 只在响应上报告首部低四位，数值字段为十进制字符串 |
 | `dns.answer_ipv4`、`dns.answer_ipv6`、`dns.answer_cname` | `dns.qname == example.test && fresh.dns.answer_ipv4 in 203.0.113.0/24` | 响应答案段中的 IN 类 A、AAAA 地址与 CNAME 目标；一个字段可有多个值 |
@@ -89,6 +90,8 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 DNS 表达式逐个 UDP 数据报或 TCP 长度前缀消息求值；新消息替换前一条 DNS 字段。响应若带问题段，可同时匹配 `dns.qname` 与 `fresh.dns.rcode` 或答案字段；`dns.qtype` 仅在恰好一个 IN 类问题时报告，避免把多问题的域名和类型错配。答案字段汇集该响应答案段内相应类型的所有 IN 类记录，`dns.answer_cname` 报告规范名称的目标，支持压缩名称。`dns.qr` 的值为 `query` 或 `response`。目前不解析权威段、附加段以及其他答案类型。DNS 首部、问题和答案格式依据：[RFC 1035](https://www.rfc-editor.org/rfc/rfc1035.html)、[RFC 3596](https://www.rfc-editor.org/rfc/rfc3596.html)；TCP 可连续承载多条消息，响应顺序不作假定：[RFC 7766](https://www.rfc-editor.org/rfc/rfc7766.html)。
 
 HTTP 分析器依据 `Content-Length` 跳过定长消息体，也能按最终 `Transfer-Encoding: chunked` 的块长度、扩展和 trailer 找到下一条消息；消息体中的文本不会被当成新请求。没有长度标记的请求视为无消息体。遇到同时出现 `Transfer-Encoding` 与 `Content-Length`、不一致的长度、无法识别的传输编码、`Connection: close` 或无法定界的响应体时，报告当前可见头部后停止该方向的后续解析。明文 HTTP/2 不在此分析器内。消息体长度判定依据：[RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html)。
+
+HTTP/2 分析器识别直接发送连接前言的明文 h2c 连接，按 TCP 双向重组后的帧解析 HEADERS/CONTINUATION 和 HPACK 字段。请求以 stream ID 保存；同一连接内请求与响应交错时，响应规则可结合对应的 `http2.path` 与 `fresh.http2.status`。它不解析 HTTP/1.1 Upgrade 切换、TLS 加密后的 h2 载荷、服务端推送或 HTTP/2 DATA 内容；仅凭客户端 TLS ALPN 提供 `h2` 也不能确认服务端最终选择。帧和流语义依据：[RFC 9113](https://www.rfc-editor.org/rfc/rfc9113.html)，头部压缩使用 [httlib-hpack](https://docs.rs/httlib-hpack/latest/httlib_hpack/) 解码。
 
 `tls.server_version` 优先取 ServerHello 的 `supported_versions` 扩展，若无该扩展则取旧版版本字段。TLS 1.3 的服务端 ALPN 位于加密的 EncryptedExtensions，因而不会产生 `tls.server_alpn`；TLS 1.2 的明文 ServerHello 可报告该字段。分析器识别 HelloRetryRequest 后等待最终 ServerHello，允许两者间的兼容性 ChangeCipherSpec 记录；重试请求本身不产生最终选择字段。字段反映可见握手内容，不验证完整连接是否成功。依据：[RFC 8446](https://www.rfc-editor.org/rfc/rfc8446.html)、[RFC 7301](https://www.rfc-editor.org/rfc/rfc7301.html)。
 

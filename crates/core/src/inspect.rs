@@ -192,13 +192,14 @@ struct UdpFlow {
     seen: Instant,
 }
 impl UdpFlow {
-    fn finished(&self) -> bool {
-        !self.allowed && !self.blocked && self.analyzers.iter().all(Option::is_none)
+    fn finished(&self, has_rules: bool) -> bool {
+        !has_rules && !self.allowed && !self.blocked && self.analyzers.iter().all(Option::is_none)
     }
 }
 impl Flow {
-    fn finished(&self) -> bool {
-        !self.blocked
+    fn finished(&self, has_rules: bool) -> bool {
+        !has_rules
+            && !self.blocked
             && !self.allowed
             && self.bidirectional.iter().all(Option::is_none)
             && self
@@ -559,8 +560,11 @@ impl<P> Inspect<P> {
 
     fn compact_completed_flows(&mut self) {
         if self.completed_since_compaction {
-            self.flows.retain(|_, flow| !flow.finished());
-            self.udp_flows.retain(|_, flow| !flow.finished());
+            let tcp_has_rules = !self.flow_rules.is_empty();
+            let udp_has_rules = !self.udp_rules.is_empty();
+            self.flows.retain(|_, flow| !flow.finished(tcp_has_rules));
+            self.udp_flows
+                .retain(|_, flow| !flow.finished(udp_has_rules));
             self.completed_since_compaction = false;
         }
     }
@@ -715,7 +719,7 @@ impl<P> Inspect<P> {
                 }
             }
         }
-        self.completed_since_compaction |= flow.finished();
+        self.completed_since_compaction |= flow.finished(!self.udp_rules.is_empty());
         if flow.blocked {
             Verdict::DropFlow.into()
         } else if drop_packet {
@@ -960,7 +964,7 @@ impl<P: Policy> Policy for Inspect<P> {
         } else {
             verdict
         };
-        self.completed_since_compaction |= flow.finished();
+        self.completed_since_compaction |= flow.finished(!self.flow_rules.is_empty());
         // A half-close leaves the other direction active. Blocked flows retain
         // their verdict until timeout or a new initial SYN replaces them.
         if t.tcp_flags & 1 != 0 {
@@ -1058,6 +1062,15 @@ mod tests {
             original_len: bytes.len(),
             checksum_ready: true,
             scope: FlowScope(scope),
+        })
+    }
+
+    fn evaluate_bytes(policy: &mut dyn Policy, bytes: &[u8]) -> Verdict {
+        policy.evaluate(Packet {
+            bytes,
+            original_len: bytes.len(),
+            checksum_ready: true,
+            scope: FlowScope::default(),
         })
     }
 
@@ -1951,16 +1964,11 @@ mod tests {
         let mut unrelated_udp = udp(b"other", false);
         unrelated_udp[22..24].copy_from_slice(&9999u16.to_be_bytes());
         let related_udp = udp(b"query", false);
-        let evaluate = |policy: &mut dyn Policy, bytes: &[u8]| {
-            policy.evaluate(Packet {
-                bytes,
-                original_len: bytes.len(),
-                checksum_ready: true,
-                scope: FlowScope::default(),
-            })
-        };
-        assert_eq!(evaluate(&mut udp_policy, &unrelated_udp), Verdict::Accept);
-        assert_eq!(evaluate(&mut udp_policy, &related_udp), Verdict::Drop);
+        assert_eq!(
+            evaluate_bytes(&mut udp_policy, &unrelated_udp),
+            Verdict::Accept
+        );
+        assert_eq!(evaluate_bytes(&mut udp_policy, &related_udp), Verdict::Drop);
 
         let mut tcp_policy = Inspect::with_datagrams(
             crate::ConstantPolicy(Verdict::Accept),
@@ -1978,8 +1986,11 @@ mod tests {
         let mut unrelated_tcp = tcp(100, 2, b"", false);
         unrelated_tcp[22..24].copy_from_slice(&443u16.to_be_bytes());
         let related_tcp = tcp(100, 2, b"", false);
-        assert_eq!(evaluate(&mut tcp_policy, &unrelated_tcp), Verdict::Accept);
-        assert_eq!(evaluate(&mut tcp_policy, &related_tcp), Verdict::Drop);
+        assert_eq!(
+            evaluate_bytes(&mut tcp_policy, &unrelated_tcp),
+            Verdict::Accept
+        );
+        assert_eq!(evaluate_bytes(&mut tcp_policy, &related_tcp), Verdict::Drop);
     }
 
     #[test]
@@ -2005,6 +2016,58 @@ mod tests {
         );
         assert_eq!(
             evaluate_udp(&mut policy, 0, b"reply", true),
+            Verdict::DropFlow
+        );
+    }
+
+    #[test]
+    fn rule_only_flows_survive_capacity_compaction_until_reverse_packet() {
+        use crate::conditions::{MatchRule, parse_expression};
+
+        let limits = InspectLimits {
+            max_flows: 1,
+            ..InspectLimits::default()
+        };
+        let rule = || {
+            MatchRule {
+                condition: parse_expression("reverse == true").unwrap(),
+                action: FlowAction::Block,
+            }
+            .into_flow_rule()
+        };
+        let mut udp_policy = Inspect::with_datagrams(
+            crate::ConstantPolicy(Verdict::Accept),
+            Vec::new(),
+            Vec::new(),
+            limits,
+        )
+        .with_udp_streams(Vec::new(), vec![rule()]);
+        let first_udp = udp(b"query", false);
+        let mut second_udp = udp(b"query", false);
+        second_udp[20..22].copy_from_slice(&12346u16.to_be_bytes());
+        let reply_udp = udp(b"reply", true);
+        assert_eq!(evaluate_bytes(&mut udp_policy, &first_udp), Verdict::Accept);
+        assert_eq!(evaluate_bytes(&mut udp_policy, &second_udp), Verdict::Drop);
+        assert_eq!(
+            evaluate_bytes(&mut udp_policy, &reply_udp),
+            Verdict::DropFlow
+        );
+
+        let mut tcp_policy = Inspect::with_datagrams(
+            crate::ConstantPolicy(Verdict::Accept),
+            Vec::new(),
+            Vec::new(),
+            limits,
+        )
+        .with_flow_rules(vec![rule()]);
+        let first_tcp = tcp(100, 2, b"", false);
+        let mut second_tcp = tcp(200, 2, b"", false);
+        second_tcp[20..22].copy_from_slice(&12346u16.to_be_bytes());
+        let reply_tcp = tcp(500, 0x12, b"", true);
+        assert_eq!(evaluate_bytes(&mut tcp_policy, &first_tcp), Verdict::Accept);
+        assert_eq!(evaluate_bytes(&mut tcp_policy, &second_tcp), Verdict::Drop);
+        assert_eq!(
+            evaluate_bytes(&mut tcp_policy, &reply_tcp),
             Verdict::DropFlow
         );
     }

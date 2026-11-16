@@ -117,8 +117,10 @@ pub fn parse_hex_bytes(value: &str) -> Result<Vec<u8>, String> {
         .as_chunks::<2>()
         .0
         .iter()
-        .map(|pair| {
-            let pair = std::str::from_utf8(pair).unwrap();
+        .enumerate()
+        .map(|(index, pair)| {
+            let pair = std::str::from_utf8(pair)
+                .map_err(|_| format!("invalid hex byte at offset {}", index * 2))?;
             u8::from_str_radix(pair, 16).map_err(|_| format!("invalid hex byte {pair}"))
         })
         .collect()

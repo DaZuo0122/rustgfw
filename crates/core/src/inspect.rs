@@ -1006,6 +1006,7 @@ mod tests {
         assert!(parse_expression("src.port contains 1234").is_err());
         assert!(parse_expression("payload_hex == 0x0").is_err());
         assert!(parse_expression("payload_hex == 0xzz").is_err());
+        assert!(parse_expression("payload_hex == 0x€€").is_err());
     }
 
     fn udp(payload: &[u8], reverse: bool) -> Vec<u8> {

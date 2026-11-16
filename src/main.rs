@@ -14,6 +14,26 @@ mod expr_config;
 
 type Error = Box<dyn std::error::Error>;
 
+fn observation_field_possible(field: &str, protocol: Protocol) -> bool {
+    if rustgfw_core::wireguard::FIELDS.contains(&field)
+        || rustgfw_core::quic::FIELDS.contains(&field)
+    {
+        protocol == Protocol::Udp
+    } else if rustgfw_core::openvpn::FIELDS.contains(&field) {
+        protocol == Protocol::Udp || rustgfw_core::openvpn::TCP_FIELDS.contains(&field)
+    } else if rustgfw_core::socks::FIELDS.contains(&field)
+        || rustgfw_core::http::FIELDS.contains(&field)
+        || rustgfw_core::fet::FIELDS.contains(&field)
+        || rustgfw_core::tls::FIELDS.contains(&field)
+        || rustgfw_core::trojan::FIELDS.contains(&field)
+    {
+        protocol == Protocol::Tcp
+    } else {
+        !matches!(field, "ssh.protocol" | "ssh.software" | "ssh.banner")
+            || protocol == Protocol::Tcp
+    }
+}
+
 fn main() -> Result<(), Error> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match args.first().map(String::as_str) {
@@ -131,6 +151,28 @@ impl Options {
         Ok(options)
     }
 
+    #[cfg(target_os = "windows")]
+    fn needs_wfp_flow_offload(&self) -> bool {
+        use rustgfw_core::inspect::FlowAction;
+
+        !self.http_hosts.is_empty()
+            || !self.tls_sni.is_empty()
+            || !self.dns_names.is_empty()
+            || self.expr_rules.iter().any(|rule| match rule.action {
+                FlowAction::Block => {
+                    rule.condition
+                        .can_match_protocol(Protocol::Tcp, &observation_field_possible)
+                        || rule
+                            .condition
+                            .can_match_protocol(Protocol::Udp, &observation_field_possible)
+                }
+                FlowAction::DropPacket => rule
+                    .condition
+                    .can_match_protocol(Protocol::Tcp, &observation_field_possible),
+                FlowAction::Allow | FlowAction::ReplaceUdpPayload(_) => false,
+            })
+    }
+
     fn into_policy(self) -> impl rustgfw_core::Policy {
         use rustgfw_core::{
             dns::{DnsDatagram, DnsUdp},
@@ -142,27 +184,9 @@ impl Options {
         let dns_message_bytes = self.dns_message_bytes;
         let ssh_banner_bytes = self.ssh_banner_bytes;
         let dns_names = self.dns_names;
-        let field_possible = |field: &str, protocol| {
-            if rustgfw_core::wireguard::FIELDS.contains(&field)
-                || rustgfw_core::quic::FIELDS.contains(&field)
-            {
-                protocol == Protocol::Udp
-            } else if rustgfw_core::openvpn::FIELDS.contains(&field) {
-                protocol == Protocol::Udp || rustgfw_core::openvpn::TCP_FIELDS.contains(&field)
-            } else if rustgfw_core::socks::FIELDS.contains(&field)
-                || rustgfw_core::http::FIELDS.contains(&field)
-                || rustgfw_core::fet::FIELDS.contains(&field)
-                || rustgfw_core::tls::FIELDS.contains(&field)
-                || rustgfw_core::trojan::FIELDS.contains(&field)
-            {
-                protocol == Protocol::Tcp
-            } else {
-                !matches!(field, "ssh.protocol" | "ssh.software" | "ssh.banner")
-                    || protocol == Protocol::Tcp
-            }
-        };
         let eligible = |rule: &MatchRule, protocol| {
-            rule.condition.can_match_protocol(protocol, &field_possible)
+            rule.condition
+                .can_match_protocol(protocol, &observation_field_possible)
         };
         let needs_tcp_field = |field| {
             self.expr_rules
@@ -492,11 +516,7 @@ fn run_windivert(args: &[String]) -> Result<(), Error> {
     } else {
         "true"
     };
-    let dynamic = if matches!(layer, Layer::Network)
-        && (!options.http_hosts.is_empty()
-            || !options.tls_sni.is_empty()
-            || !options.dns_names.is_empty())
-    {
+    let dynamic = if matches!(layer, Layer::Network) && options.needs_wfp_flow_offload() {
         match FlowBlocker::start(&args[0]) {
             Ok(blocker) => Some(blocker),
             Err(error) => {
@@ -588,6 +608,30 @@ fn parse_rule(text: &str) -> Result<Rule, Error> {
 mod tests {
     use super::*;
     use rustgfw_core::{FlowScope, Packet, Policy};
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn expression_only_flow_blocks_enable_wfp_offload() {
+        let mut options = Options::parse("accept", &[]).unwrap();
+        assert!(!options.needs_wfp_flow_offload());
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"TLS block","expr":"proto == tcp && tls.sni == blocked.test","action":"block"}]}"#,
+        )
+        .unwrap();
+        assert!(options.needs_wfp_flow_offload());
+
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"UDP packet drop","expr":"proto == udp && dns.qname == blocked.test","action":"drop_packet"}]}"#,
+        )
+        .unwrap();
+        assert!(!options.needs_wfp_flow_offload());
+
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"TCP packet drop","expr":"proto == tcp && http.host == blocked.test","action":"drop_packet"}]}"#,
+        )
+        .unwrap();
+        assert!(options.needs_wfp_flow_offload());
+    }
 
     #[test]
     fn cli_resource_limits_reach_shared_http_policy() {

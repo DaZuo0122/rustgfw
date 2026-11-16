@@ -712,7 +712,8 @@ impl<P: Policy> Policy for Inspect<P> {
     }
 
     fn decide(&mut self, packet: Packet<'_>) -> Decision {
-        let verdict = self.transport.evaluate(packet);
+        let transport_decision = self.transport.decide(packet);
+        let verdict = transport_decision.verdict();
         if verdict != Verdict::Accept
             || (self.analyzers.is_empty()
                 && self.bidirectional_analyzers.is_empty()
@@ -721,19 +722,31 @@ impl<P: Policy> Policy for Inspect<P> {
                 && self.udp_analyzers.is_empty()
                 && self.udp_rules.is_empty())
         {
-            return verdict.into();
+            return transport_decision;
         }
+        let packet = match &transport_decision {
+            Decision::Verdict(_) => packet,
+            Decision::Replace(replacement) => Packet {
+                bytes: replacement,
+                original_len: replacement.len(),
+                checksum_ready: true,
+                scope: packet.scope,
+            },
+        };
         let Ok(t) = packet::parse(packet.bytes) else {
-            return verdict.into();
+            return transport_decision;
         };
         if t.protocol == Protocol::Udp {
-            return self.inspect_udp(packet, &t);
+            return match self.inspect_udp(packet, &t) {
+                Decision::Verdict(Verdict::Accept) => transport_decision,
+                other => other,
+            };
         }
         if self.analyzers.is_empty()
             && self.bidirectional_analyzers.is_empty()
             && self.flow_rules.is_empty()
         {
-            return verdict.into();
+            return transport_decision;
         }
         if self.flow_rules.is_empty()
             && !self.analyzers.iter().any(|a| {
@@ -745,7 +758,7 @@ impl<P: Policy> Policy for Inspect<P> {
                     .is_none_or(|port| t.source.port() == port || t.destination.port() == port)
             })
         {
-            return verdict.into();
+            return transport_decision;
         }
         let now = Instant::now();
         self.expire_idle_flows(now);
@@ -929,7 +942,11 @@ impl<P: Policy> Policy for Inspect<P> {
         if !flow.blocked && (t.tcp_flags & 4 != 0 || flow.fin_seen == [true, true]) {
             self.flows.remove(&key);
         }
-        result.into()
+        if result == Verdict::Accept {
+            transport_decision
+        } else {
+            result.into()
+        }
     }
 }
 
@@ -1093,6 +1110,53 @@ mod tests {
             }),
             Decision::Verdict(Verdict::Accept)
         );
+    }
+
+    #[test]
+    fn layered_policies_inspect_and_preserve_replaced_packets() {
+        let inner = || {
+            Inspect::with_analyzers(crate::ConstantPolicy(Verdict::Accept), Vec::new())
+                .with_udp_streams(
+                    Vec::new(),
+                    vec![FlowRule::new(|context| {
+                        (context.payload == b"old")
+                            .then(|| FlowAction::ReplaceUdpPayload(b"inner".to_vec()))
+                    })],
+                )
+        };
+        let original = udp(b"old", false);
+        let packet = Packet {
+            bytes: &original,
+            original_len: original.len(),
+            checksum_ready: true,
+            scope: FlowScope::default(),
+        };
+
+        let mut passthrough = Inspect::with_analyzers(inner(), Vec::new());
+        let Decision::Replace(output) = passthrough.decide(packet) else {
+            panic!("inner replacement was lost");
+        };
+        assert_eq!(packet::parse(&output).unwrap().payload, b"inner");
+
+        let mut rewrite = Inspect::with_analyzers(inner(), Vec::new()).with_udp_streams(
+            Vec::new(),
+            vec![FlowRule::new(|context| {
+                (context.payload == b"inner")
+                    .then(|| FlowAction::ReplaceUdpPayload(b"outer".to_vec()))
+            })],
+        );
+        let Decision::Replace(output) = rewrite.decide(packet) else {
+            panic!("outer replacement was lost");
+        };
+        assert_eq!(packet::parse(&output).unwrap().payload, b"outer");
+
+        let mut block = Inspect::with_analyzers(inner(), Vec::new()).with_udp_streams(
+            Vec::new(),
+            vec![FlowRule::new(|context| {
+                (context.payload == b"inner").then_some(FlowAction::Block)
+            })],
+        );
+        assert_eq!(block.decide(packet), Decision::Verdict(Verdict::DropFlow));
     }
 
     #[test]

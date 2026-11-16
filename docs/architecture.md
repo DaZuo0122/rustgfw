@@ -13,7 +13,7 @@
 
 `Engine::replace_policy` 可在两次逐包处理之间替换整个用户态策略；新实例不会继承旧实例的流缓存。它没有自动修改内核规则。完整热更新需要先停止旧的异步卸载写入，再按后端语义切换内核静态规则并清理旧的动态裁决，最后替换用户态策略。Linux ID 集合可随 nft 表替换而清空；`ctmark=` 写在既存 conntrack 条目中，单个预留 bit 无法区分新旧规则版本，目前不能安全地沿用该位做无中断热更新。Windows WFP 和 WinDivert 的规则生命周期也需要单独编排。当前命令行没有热更新入口。
 
-`Policy::decide` 可返回完整 IP 包替换裁决；Linux NFQUEUE 将替换包与 ACCEPT verdict 一起提交，Windows WinDivert 使用捕获时的地址重新注入替换包。`FlowAction::ReplaceUdpPayload` 让 UDP 流规则基于当前载荷生成新载荷，核心重建 IP/UDP 长度及校验和；过长或无法解析的替换结果丢弃当前包。TCP 流规则忽略此动作。直接调用 `Policy::evaluate` 只得到放行或丢弃结果，包修改需要通过 `decide`/`PacketIo` 路径。有序表达式规则通过 `rules-file=path` 配置，语法见 [表达式规则](rules.md)。
+`Policy::decide` 可返回完整 IP 包替换裁决；Linux NFQUEUE 将替换包与 ACCEPT verdict 一起提交，Windows WinDivert 使用捕获时的地址重新注入替换包。`FlowAction::ReplaceUdpPayload` 让 UDP 流规则基于当前载荷生成新载荷，核心重建 IP/UDP 长度及校验和；过长或无法解析的替换结果丢弃当前包。TCP 流规则忽略此动作。多层 `Inspect` 策略按顺序检查前一层的替换包；后一层的丢弃或再次替换覆盖前一层结果。直接调用 `Policy::evaluate` 只得到放行或丢弃结果，包修改需要通过 `decide`/`PacketIo` 路径。有序表达式规则通过 `rules-file=path` 配置，语法见 [表达式规则](rules.md)。
 
 Linux NFQUEUE 的 accept 表示恢复 netfilter 遍历，并不绕过其他链；Windows WinDivert 放行需要重新注入捕获的包，WFP 过滤规则的优先级与终止行为也不能映射成 Linux mark。用户提到的 wpf 在这里按 Windows Filtering Platform（WFP）理解。Windows 后端的当前边界见 [windows-backend.md](windows-backend.md)。
 

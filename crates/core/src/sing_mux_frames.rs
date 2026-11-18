@@ -1,12 +1,10 @@
 //! Framing and first request metadata for visible sing-mux smux/yamux sessions.
-use std::{
-    collections::HashMap,
-    net::{Ipv4Addr, Ipv6Addr},
-};
+use std::collections::HashMap;
 
 use crate::{
     inspect::{Analysis, BidirectionalStreamAnalyzer, Observation, ObservationBatch},
     sing_mux::{Padding, Selector},
+    sing_mux_request::StreamRequest,
 };
 
 pub const FIELDS: &[&str] = &[
@@ -18,7 +16,6 @@ pub const FIELDS: &[&str] = &[
 ];
 
 const MAX_YAMUX_DATA: usize = 1024 * 1024;
-const MAX_REQUEST: usize = 261;
 
 struct Frame {
     stream_id: u32,
@@ -111,52 +108,6 @@ impl Framing {
     }
 }
 
-#[derive(Clone)]
-struct Request {
-    network: &'static str,
-    host: String,
-    port: u16,
-}
-
-fn request(bytes: &[u8]) -> Result<Option<Request>, ()> {
-    if bytes.len() < 3 {
-        return Ok(None);
-    }
-    let flags = u16::from_be_bytes([bytes[0], bytes[1]]);
-    let (host, end) = match bytes[2] {
-        1 if bytes.len() >= 7 => (
-            Ipv4Addr::from(<[u8; 4]>::try_from(&bytes[3..7]).unwrap()).to_string(),
-            7,
-        ),
-        4 if bytes.len() >= 19 => (
-            Ipv6Addr::from(<[u8; 16]>::try_from(&bytes[3..19]).unwrap()).to_string(),
-            19,
-        ),
-        3 if bytes.len() >= 4 && bytes.len() >= 4 + bytes[3] as usize => {
-            let end = 4 + bytes[3] as usize;
-            let host = String::from_utf8_lossy(&bytes[4..end]).into_owned();
-            (host, end)
-        }
-        1 | 3 | 4 => return Ok(None),
-        _ => return Err(()),
-    };
-    if bytes.len() < end + 2 {
-        return Ok(None);
-    }
-    let port = u16::from_be_bytes([bytes[end], bytes[end + 1]]);
-    Ok(Some(Request {
-        network: if flags & 1 == 0 { "tcp" } else { "udp" },
-        host,
-        port,
-    }))
-}
-
-#[derive(Default)]
-struct Stream {
-    request_bytes: Vec<u8>,
-    request: Option<Request>,
-}
-
 fn observation(field: &'static str, value: impl Into<String>) -> Observation {
     Observation {
         field,
@@ -164,20 +115,12 @@ fn observation(field: &'static str, value: impl Into<String>) -> Observation {
     }
 }
 
-fn target(request: &Request) -> Vec<Observation> {
-    vec![
-        observation("sing_mux.network", request.network),
-        observation("sing_mux.host", request.host.clone()),
-        observation("sing_mux.port", request.port.to_string()),
-    ]
-}
-
 #[derive(Default)]
 pub struct SingMuxFrames {
     selector: Selector,
     padded: [Padding; 2],
     framing: [Framing; 2],
-    streams: HashMap<u32, Stream>,
+    streams: HashMap<u32, StreamRequest>,
     announced: bool,
     finished: bool,
 }
@@ -212,18 +155,12 @@ impl SingMuxFrames {
         }
         let mut context = Vec::new();
         if let Some(stream) = self.streams.get_mut(&frame.stream_id) {
-            if !reverse && frame.request_data && stream.request.is_none() {
-                let remaining = MAX_REQUEST.saturating_sub(stream.request_bytes.len());
-                stream
-                    .request_bytes
-                    .extend_from_slice(&frame.data[..frame.data.len().min(remaining)]);
-                if let Ok(Some(parsed)) = request(&stream.request_bytes) {
-                    observations.extend(target(&parsed));
-                    stream.request = Some(parsed);
-                    stream.request_bytes.clear();
+            if !reverse && frame.request_data && stream.target().is_none() {
+                if let Ok(Some(parsed)) = stream.feed(&frame.data) {
+                    observations.extend(parsed.observations());
                 }
-            } else if let Some(request) = &stream.request {
-                context = target(request);
+            } else if let Some(target) = stream.target() {
+                context = target.observations();
             }
         }
         ObservationBatch {

@@ -13,6 +13,7 @@ pub mod quic;
 pub mod rules;
 pub mod sing_mux;
 pub mod sing_mux_frames;
+pub(crate) mod sing_mux_request;
 pub mod socks;
 pub mod ssh;
 pub mod tcp;

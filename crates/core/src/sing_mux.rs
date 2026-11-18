@@ -1,11 +1,26 @@
 //! Visible sing-mux h2mux selector and padding wrapper.
+use std::collections::HashMap;
+
 use crate::{
-    http2::Http2Conversation,
+    http2::{DataEvent, Http2Conversation},
     inspect::{Analysis, BidirectionalStreamAnalyzer, Observation, ObservationBatch},
+    sing_mux_request::StreamRequest,
 };
 
 pub const FIELDS: &[&str] = &["sing_mux.version", "sing_mux.protocol", "sing_mux.padding"];
 const PADDED_WRITES: u8 = 16;
+const H2_STREAM_FIELDS: &[&str] = &[
+    "http2.stream_id",
+    "http2.method",
+    "http2.path",
+    "http2.authority",
+    "http2.status",
+    "sing_mux.stream_id",
+    "sing_mux.frame",
+    "sing_mux.network",
+    "sing_mux.host",
+    "sing_mux.port",
+];
 
 #[derive(Default)]
 pub(crate) struct Padding {
@@ -86,12 +101,33 @@ impl Selector {
 }
 
 #[derive(Default)]
+struct H2Stream {
+    headers: Vec<Observation>,
+    request: StreamRequest,
+}
+
 pub struct SingMuxH2 {
     selector: Selector,
     padded: [Padding; 2],
     http2: Http2Conversation,
+    streams: HashMap<u32, H2Stream>,
     announced: bool,
     finished: bool,
+}
+
+impl Default for SingMuxH2 {
+    fn default() -> Self {
+        let mut http2 = Http2Conversation::default();
+        http2.capture_data();
+        Self {
+            selector: Selector::default(),
+            padded: Default::default(),
+            http2,
+            streams: HashMap::new(),
+            announced: false,
+            finished: false,
+        }
+    }
 }
 
 impl SingMuxH2 {
@@ -114,6 +150,68 @@ impl SingMuxH2 {
                 },
             ],
         }
+    }
+
+    fn header(&mut self, mut batch: ObservationBatch) -> ObservationBatch {
+        let stream = batch
+            .observations
+            .iter()
+            .find(|item| item.field == "http2.stream_id")
+            .and_then(|item| item.value.parse::<u32>().ok());
+        if let Some(stream) = stream {
+            let connect = batch
+                .observations
+                .iter()
+                .any(|item| item.field == "http2.method" && item.value == "CONNECT")
+                && batch
+                    .observations
+                    .iter()
+                    .any(|item| item.field == "http2.authority" && item.value == "localhost");
+            if connect {
+                self.streams.insert(
+                    stream,
+                    H2Stream {
+                        headers: batch.observations.clone(),
+                        request: StreamRequest::default(),
+                    },
+                );
+            }
+            if batch
+                .observations
+                .iter()
+                .any(|item| item.field == "http2.status")
+                && let Some(target) = self
+                    .streams
+                    .get(&stream)
+                    .and_then(|state| state.request.target())
+            {
+                batch.context.extend(target.observations());
+            }
+            batch.observations.push(Observation {
+                field: "sing_mux.stream_id",
+                value: stream.to_string(),
+            });
+        }
+        batch.clear_fields = H2_STREAM_FIELDS;
+        batch
+    }
+
+    fn data(&mut self, event: DataEvent) -> Option<ObservationBatch> {
+        if event.reverse {
+            return None;
+        }
+        let state = self.streams.get_mut(&event.stream)?;
+        let target = state.request.feed(&event.bytes).ok()??;
+        let mut observations = target.observations();
+        observations.push(Observation {
+            field: "sing_mux.stream_id",
+            value: event.stream.to_string(),
+        });
+        Some(ObservationBatch {
+            clear_fields: H2_STREAM_FIELDS,
+            context: state.headers.clone(),
+            observations,
+        })
     }
 }
 
@@ -148,6 +246,8 @@ impl BidirectionalStreamAnalyzer for SingMuxH2 {
             input
         };
         let result = self.http2.feed(&input, reverse);
+        let data_events = self.http2.take_data_events();
+        let finished_streams = self.http2.take_finished_streams();
         let mut batches = Vec::new();
         if self.http2.recognized() && !self.announced && !matches!(result, Analysis::Finished) {
             batches.push(self.metadata());
@@ -158,12 +258,34 @@ impl BidirectionalStreamAnalyzer for SingMuxH2 {
                 batches: headers,
                 finished,
             } => {
-                batches.extend(headers);
+                let mut data = data_events.into_iter().peekable();
+                for (index, header) in headers.into_iter().enumerate() {
+                    while data.peek().is_some_and(|event| event.before_batch == index) {
+                        if let Some(batch) = self.data(data.next().unwrap()) {
+                            batches.push(batch);
+                        }
+                    }
+                    batches.push(self.header(header));
+                }
+                for event in data {
+                    if let Some(batch) = self.data(event) {
+                        batches.push(batch);
+                    }
+                }
                 self.finished = finished;
             }
             Analysis::Finished => self.finished = true,
-            Analysis::Pending => {}
+            Analysis::Pending => {
+                for event in data_events {
+                    if let Some(batch) = self.data(event) {
+                        batches.push(batch);
+                    }
+                }
+            }
             Analysis::Observations(_) | Analysis::FinalObservations(_) => unreachable!(),
+        }
+        for stream in finished_streams {
+            self.streams.remove(&stream);
         }
         if batches.is_empty() {
             if self.finished {
@@ -197,6 +319,13 @@ mod tests {
         block.extend([0x01, 9]);
         block.extend(b"localhost");
         block
+    }
+
+    fn target_request(host: &str) -> Vec<u8> {
+        let mut bytes = vec![0, 0, 3, host.len() as u8];
+        bytes.extend(host.as_bytes());
+        bytes.extend(443u16.to_be_bytes());
+        bytes
     }
 
     fn client() -> Vec<u8> {
@@ -276,5 +405,75 @@ mod tests {
             Analysis::Pending
         ));
         assert!(!analyzer.announced);
+    }
+
+    #[test]
+    fn h2_data_request_restores_the_right_stream_target() {
+        let mut analyzer = SingMuxH2::default();
+        let mut bytes = vec![0, 2];
+        bytes.extend(client());
+        bytes.extend(frame(1, 4, 3, &request()));
+        let opening = batches(analyzer.feed(&bytes, false));
+        assert_eq!(opening.len(), 3);
+
+        let target_one = target_request("example.org");
+        let mut padded_first = vec![2];
+        padded_first.extend(&target_one[..5]);
+        padded_first.extend([9, 10]);
+        assert!(matches!(
+            analyzer.feed(&frame(0, 8, 1, &padded_first), false),
+            Analysis::Pending
+        ));
+
+        let other = batches(analyzer.feed(&frame(0, 0, 3, &target_request("other.test")), false));
+        assert_eq!(value(&other[0], "sing_mux.host"), Some("other.test"));
+        let matched = batches(analyzer.feed(&frame(0, 0, 1, &target_one[5..]), false));
+        assert_eq!(value(&matched[0], "sing_mux.host"), Some("example.org"));
+        assert_eq!(value(&matched[0], "sing_mux.stream_id"), Some("1"));
+        assert_eq!(
+            matched[0]
+                .context
+                .iter()
+                .find(|item| item.field == "http2.method")
+                .map(|item| item.value.as_str()),
+            Some("CONNECT")
+        );
+
+        let mut response = frame(4, 0, 0, &[]);
+        response.extend(frame(1, 5, 3, &[0x88]));
+        response.extend(frame(1, 5, 1, &[0x8d]));
+        let reply = batches(analyzer.feed(&response, true));
+        assert_eq!(
+            reply[0]
+                .context
+                .iter()
+                .find(|item| item.field == "sing_mux.host")
+                .map(|item| item.value.as_str()),
+            Some("other.test")
+        );
+        assert_eq!(
+            reply[1]
+                .context
+                .iter()
+                .find(|item| item.field == "sing_mux.host")
+                .map(|item| item.value.as_str()),
+            Some("example.org")
+        );
+    }
+
+    #[test]
+    fn h2_headers_and_data_keep_wire_order_within_one_tcp_chunk() {
+        let mut analyzer = SingMuxH2::default();
+        let mut input = vec![0, 2];
+        input.extend(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        input.extend(frame(4, 0, 0, &[]));
+        input.extend(frame(1, 4, 1, &request()));
+        input.extend(frame(0, 0, 1, &target_request("one.test")));
+        input.extend(frame(1, 4, 3, &request()));
+        input.extend(frame(0, 0, 3, &target_request("two.test")));
+        let events = batches(analyzer.feed(&input, false));
+        assert_eq!(events.len(), 5);
+        assert_eq!(value(&events[2], "sing_mux.host"), Some("one.test"));
+        assert_eq!(value(&events[4], "sing_mux.host"), Some("two.test"));
     }
 }

@@ -1297,7 +1297,7 @@ mod tests {
     }
 
     #[test]
-    fn sing_mux_h2_selector_enables_http2_expression() {
+    fn sing_mux_h2_target_expression_uses_http2_context() {
         fn tcp(sequence: u32, payload: &[u8]) -> Vec<u8> {
             let mut bytes = vec![0; 40 + payload.len()];
             let length = bytes.len() as u16;
@@ -1316,7 +1316,7 @@ mod tests {
         }
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"mux h2","expr":"sing_mux.protocol == h2mux && fresh.http2.method == CONNECT && http2.authority == localhost","action":"block"}]}"#,
+            r#"{"rules":[{"name":"mux h2 target","expr":"sing_mux.protocol == h2mux && fresh.sing_mux.host == example.org && http2.method == CONNECT && http2.authority == localhost","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -1335,7 +1335,16 @@ mod tests {
         h2.extend(b"CONNECT");
         h2.extend([0x01, 9]);
         h2.extend(b"localhost");
-        assert_eq!(evaluate(&mut policy, &tcp(102, &h2)), Verdict::DropFlow);
+        assert_eq!(evaluate(&mut policy, &tcp(102, &h2)), Verdict::Accept);
+        let mut request = vec![0, 0, 3, 11];
+        request.extend(b"example.org");
+        request.extend(443u16.to_be_bytes());
+        let mut data = vec![0, 0, request.len() as u8, 0, 0, 0, 0, 0, 1];
+        data.extend(request);
+        assert_eq!(
+            evaluate(&mut policy, &tcp(102 + h2.len() as u32, &data)),
+            Verdict::DropFlow
+        );
     }
 
     #[test]

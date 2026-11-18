@@ -21,6 +21,13 @@ struct HeaderBlock {
     end_stream: bool,
 }
 
+pub(crate) struct DataEvent {
+    pub before_batch: usize,
+    pub stream: u32,
+    pub reverse: bool,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Default)]
 struct Direction {
     bytes: Vec<u8>,
@@ -34,6 +41,9 @@ pub struct Http2Conversation {
     directions: [Direction; 2],
     client: Option<usize>,
     requests: HashMap<u32, Vec<Observation>>,
+    capture_data: bool,
+    data_events: Vec<DataEvent>,
+    finished_streams: Vec<u32>,
     finished: bool,
 }
 
@@ -44,7 +54,30 @@ fn observation(field: &'static str, value: impl Into<String>) -> Observation {
     }
 }
 
+fn data_payload(flags: u8, payload: &[u8]) -> Result<&[u8], ()> {
+    if flags & 8 == 0 {
+        return Ok(payload);
+    }
+    let padding = usize::from(*payload.first().ok_or(())?);
+    if padding + 1 > payload.len() {
+        return Err(());
+    }
+    Ok(&payload[1..payload.len() - padding])
+}
+
 impl Http2Conversation {
+    pub(crate) fn capture_data(&mut self) {
+        self.capture_data = true;
+    }
+
+    pub(crate) fn take_data_events(&mut self) -> Vec<DataEvent> {
+        std::mem::take(&mut self.data_events)
+    }
+
+    pub(crate) fn take_finished_streams(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.finished_streams)
+    }
+
     pub(crate) fn recognized(&self) -> bool {
         self.client
             .is_some_and(|direction| self.directions[direction].first_frame)
@@ -93,6 +126,7 @@ impl Http2Conversation {
         };
         if block.end_stream && self.client != Some(direction) {
             self.requests.remove(&block.stream);
+            self.finished_streams.push(block.stream);
         }
         Ok((is_request || is_response).then_some(ObservationBatch {
             clear_fields: FIELDS,
@@ -126,8 +160,10 @@ impl Http2Conversation {
                 if stream == 0 {
                     return Err(());
                 }
+                data_payload(flags, payload)?;
                 if flags & 1 != 0 && self.client != Some(direction) {
                     self.requests.remove(&stream);
+                    self.finished_streams.push(stream);
                 }
                 Ok(None)
             }
@@ -178,6 +214,7 @@ impl Http2Conversation {
                     return Err(());
                 }
                 self.requests.remove(&stream);
+                self.finished_streams.push(stream);
                 Ok(None)
             }
             4 => {
@@ -229,7 +266,16 @@ impl Http2Conversation {
             let stream = u32::from_be_bytes(bytes[5..9].try_into().unwrap()) & 0x7fff_ffff;
             let payload = bytes[9..9 + length].to_vec();
             self.directions[direction].bytes.drain(..9 + length);
-            if let Some(batch) = self.frame(direction, kind, flags, stream, &payload)? {
+            let batch = self.frame(direction, kind, flags, stream, &payload)?;
+            if self.capture_data && kind == 0 {
+                self.data_events.push(DataEvent {
+                    before_batch: batches.len(),
+                    stream,
+                    reverse: self.client != Some(direction),
+                    bytes: data_payload(flags, &payload)?.to_vec(),
+                });
+            }
+            if let Some(batch) = batch {
                 batches.push(batch);
             }
         }
@@ -241,6 +287,8 @@ impl BidirectionalStreamAnalyzer for Http2Conversation {
         if self.finished {
             return Analysis::Finished;
         }
+        self.data_events.clear();
+        self.finished_streams.clear();
         let direction = usize::from(reverse);
         self.directions[direction].bytes.extend_from_slice(bytes);
         let mut batches = Vec::new();

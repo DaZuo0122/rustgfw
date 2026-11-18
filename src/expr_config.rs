@@ -67,6 +67,7 @@ pub fn compile(source: &str) -> Result<Vec<MatchRule>, String> {
                     && !rustgfw_core::wireguard::FIELDS.contains(&field)
                     && !rustgfw_core::openvpn::FIELDS.contains(&field)
                     && !rustgfw_core::socks::FIELDS.contains(&field)
+                    && !rustgfw_core::sing_mux::FIELDS.contains(&field)
                     && !rustgfw_core::quic::FIELDS.contains(&field)
                 {
                     return Err(format!("rule {:?}: unknown observation field {field}", spec.name));

@@ -67,6 +67,7 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 | `http.host`、`http.method`、`http.target`、`http.request_version` | `http.method == CONNECT && http.target ends_with :443` | TCP HTTP/1 请求的请求行与可见 authority/Host |
 | `http.status`、`http.response_version` | `http.status >= 400` | TCP HTTP/1 响应的状态码与版本；状态码是十进制观察值 |
 | `http2.stream_id`、`http2.method`、`http2.path`、`http2.authority`、`http2.status` | `http2.path == /blocked && fresh.http2.status == 404` | 明文 HTTP/2 的流 ID、请求伪头部与响应状态；响应按 stream ID 恢复对应请求字段 |
+| `sing_mux.version`、`sing_mux.protocol`、`sing_mux.padding` | `sing_mux.protocol == h2mux && fresh.http2.method == CONNECT` | 明文 sing-mux 版本、承载协议及 padding 标志；当前确认 `h2mux` 并将其 HTTP/2 帧交给 `http2.*` 分析器 |
 | `tls.sni`、`tls.alpn` | `tls.alpn == h2` | 流内最近一次观察批次的任一值；`tls.alpn` 为客户端提供的协议列表 |
 | `dns.id`、`dns.qr`、`dns.opcode`、`dns.qname`、`dns.qtype`、`dns.rcode` | `dns.qname == example.test && dns.qtype == 28` | DNS 消息 ID、查询或响应、操作码、IN 类问题域名与单问题类型；`rcode` 只在响应上报告首部低四位，数值字段为十进制字符串 |
 | `dns.answer_ipv4`、`dns.answer_ipv6`、`dns.answer_cname` | `dns.qname == example.test && fresh.dns.answer_ipv4 in 203.0.113.0/24` | 响应答案段中的 IN 类 A、AAAA 地址与 CNAME 目标；一个字段可有多个值 |
@@ -92,6 +93,8 @@ DNS 表达式逐个 UDP 数据报或 TCP 长度前缀消息求值；新消息替
 HTTP 分析器依据 `Content-Length` 跳过定长消息体，也能按最终 `Transfer-Encoding: chunked` 的块长度、扩展和 trailer 找到下一条消息；消息体中的文本不会被当成新请求。没有长度标记的请求视为无消息体。遇到同时出现 `Transfer-Encoding` 与 `Content-Length`、不一致的长度、无法识别的传输编码、`Connection: close` 或无法定界的响应体时，报告当前可见头部后停止该方向的后续解析。明文 HTTP/2 不在此分析器内。消息体长度判定依据：[RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html)。
 
 HTTP/2 分析器识别直接发送连接前言的明文 h2c 连接，按 TCP 双向重组后的帧解析 HEADERS/CONTINUATION 和 HPACK 字段。请求以 stream ID 保存；同一连接内请求与响应交错时，响应规则可结合对应的 `http2.path` 与 `fresh.http2.status`。它不解析 HTTP/1.1 Upgrade 切换、TLS 加密后的 h2 载荷、服务端推送或 HTTP/2 DATA 内容；仅凭客户端 TLS ALPN 提供 `h2` 也不能确认服务端最终选择。帧和流语义依据：[RFC 9113](https://www.rfc-editor.org/rfc/rfc9113.html)，头部压缩使用 [httlib-hpack](https://docs.rs/httlib-hpack/latest/httlib_hpack/) 解码。
+
+sing-mux 分析器先读取版本与 `h2mux` 选择头；版本 1 开启 padding 时，剥离后续每个方向前 16 次写入的长度和填充封装，再验证 HTTP/2 前言及 SETTINGS。只有验证成功才报告 `sing_mux.*`；其中的 `http2.method == CONNECT`、`http2.authority == localhost` 描述复用载体，不代表其中代理请求的真实目标。它不解密外层代理传输，也尚未解析 `smux`/`yamux` 承载及 HTTP/2 DATA 内的 sing-mux 子流请求。[sing-mux 协议头](https://github.com/SagerNet/sing-mux/blob/main/protocol.go)、[padding 格式](https://github.com/SagerNet/sing-mux/blob/main/padding.go)、[h2mux 客户端](https://github.com/SagerNet/sing-mux/blob/main/h2mux.go)。
 
 `tls.server_version` 优先取 ServerHello 的 `supported_versions` 扩展，若无该扩展则取旧版版本字段。TLS 1.3 的服务端 ALPN 位于加密的 EncryptedExtensions，因而不会产生 `tls.server_alpn`；TLS 1.2 的明文 ServerHello 可报告该字段。分析器识别 HelloRetryRequest 后等待最终 ServerHello，允许两者间的兼容性 ChangeCipherSpec 记录；重试请求本身不产生最终选择字段。字段反映可见握手内容，不验证完整连接是否成功。依据：[RFC 8446](https://www.rfc-editor.org/rfc/rfc8446.html)、[RFC 7301](https://www.rfc-editor.org/rfc/rfc7301.html)。
 

@@ -45,6 +45,11 @@ fn observation(field: &'static str, value: impl Into<String>) -> Observation {
 }
 
 impl Http2Conversation {
+    pub(crate) fn recognized(&self) -> bool {
+        self.client
+            .is_some_and(|direction| self.directions[direction].first_frame)
+    }
+
     fn headers(
         &mut self,
         direction: usize,

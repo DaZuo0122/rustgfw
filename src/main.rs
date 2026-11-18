@@ -24,6 +24,7 @@ fn observation_field_possible(field: &str, protocol: Protocol) -> bool {
     } else if rustgfw_core::socks::FIELDS.contains(&field)
         || rustgfw_core::http::FIELDS.contains(&field)
         || rustgfw_core::http2::FIELDS.contains(&field)
+        || rustgfw_core::sing_mux::FIELDS.contains(&field)
         || rustgfw_core::fet::FIELDS.contains(&field)
         || rustgfw_core::tls::FIELDS.contains(&field)
         || rustgfw_core::trojan::FIELDS.contains(&field)
@@ -200,6 +201,10 @@ impl Options {
         let needs_http2 = rustgfw_core::http2::FIELDS
             .iter()
             .any(|field| needs_tcp_field(field));
+        let needs_sing_mux = needs_http2
+            || rustgfw_core::sing_mux::FIELDS
+                .iter()
+                .any(|field| needs_tcp_field(field));
         let needs_tls = rustgfw_core::tls::FIELDS
             .iter()
             .any(|field| needs_tcp_field(field));
@@ -368,6 +373,11 @@ impl Options {
                 needs_http2.then(|| {
                     BidirectionalAnalyzerRule::observing(None, || {
                         Box::<rustgfw_core::http2::Http2Conversation>::default()
+                    })
+                }),
+                needs_sing_mux.then(|| {
+                    BidirectionalAnalyzerRule::observing(None, || {
+                        Box::<rustgfw_core::sing_mux::SingMuxH2>::default()
                     })
                 }),
                 needs_socks.then(|| {
@@ -1276,6 +1286,48 @@ mod tests {
             evaluate(&mut policy, &tcp(500 + server.len() as u32, &last, true)),
             Verdict::DropFlow
         );
+    }
+
+    #[test]
+    fn sing_mux_h2_selector_enables_http2_expression() {
+        fn tcp(sequence: u32, payload: &[u8]) -> Vec<u8> {
+            let mut bytes = vec![0; 40 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 6;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&443u16.to_be_bytes());
+            bytes[24..28].copy_from_slice(&sequence.to_be_bytes());
+            bytes[32] = 0x50;
+            bytes[33] = 0x18;
+            bytes[40..].copy_from_slice(payload);
+            bytes
+        }
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"mux h2","expr":"sing_mux.protocol == h2mux && fresh.http2.method == CONNECT && http2.authority == localhost","action":"block"}]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let evaluate = |policy: &mut dyn Policy, bytes: &[u8]| {
+            policy.evaluate(Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        assert_eq!(evaluate(&mut policy, &tcp(100, &[0, 2])), Verdict::Accept);
+        let mut h2 = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        h2.extend([0, 0, 0, 4, 0, 0, 0, 0, 0]);
+        h2.extend([0, 0, 20, 1, 4, 0, 0, 0, 1, 0x02, 7]);
+        h2.extend(b"CONNECT");
+        h2.extend([0x01, 9]);
+        h2.extend(b"localhost");
+        assert_eq!(evaluate(&mut policy, &tcp(102, &h2)), Verdict::DropFlow);
     }
 
     #[test]

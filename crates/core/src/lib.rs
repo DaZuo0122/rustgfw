@@ -11,6 +11,7 @@ pub mod openvpn;
 pub mod packet;
 pub mod quic;
 pub mod rules;
+pub mod sing_mux;
 pub mod socks;
 pub mod ssh;
 pub mod tcp;

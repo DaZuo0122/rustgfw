@@ -25,6 +25,7 @@ fn observation_field_possible(field: &str, protocol: Protocol) -> bool {
         || rustgfw_core::http::FIELDS.contains(&field)
         || rustgfw_core::http2::FIELDS.contains(&field)
         || rustgfw_core::sing_mux::FIELDS.contains(&field)
+        || rustgfw_core::sing_mux_frames::FIELDS.contains(&field)
         || rustgfw_core::fet::FIELDS.contains(&field)
         || rustgfw_core::tls::FIELDS.contains(&field)
         || rustgfw_core::trojan::FIELDS.contains(&field)
@@ -201,8 +202,10 @@ impl Options {
         let needs_http2 = rustgfw_core::http2::FIELDS
             .iter()
             .any(|field| needs_tcp_field(field));
-        let needs_sing_mux = needs_http2
-            || rustgfw_core::sing_mux::FIELDS
+        let needs_sing_mux = rustgfw_core::sing_mux::FIELDS
+            .iter()
+            .any(|field| needs_tcp_field(field))
+            || rustgfw_core::sing_mux_frames::FIELDS
                 .iter()
                 .any(|field| needs_tcp_field(field));
         let needs_tls = rustgfw_core::tls::FIELDS
@@ -375,9 +378,14 @@ impl Options {
                         Box::<rustgfw_core::http2::Http2Conversation>::default()
                     })
                 }),
-                needs_sing_mux.then(|| {
+                (needs_sing_mux || needs_http2).then(|| {
                     BidirectionalAnalyzerRule::observing(None, || {
                         Box::<rustgfw_core::sing_mux::SingMuxH2>::default()
+                    })
+                }),
+                needs_sing_mux.then(|| {
+                    BidirectionalAnalyzerRule::observing(None, || {
+                        Box::<rustgfw_core::sing_mux_frames::SingMuxFrames>::default()
                     })
                 }),
                 needs_socks.then(|| {
@@ -1328,6 +1336,63 @@ mod tests {
         h2.extend([0x01, 9]);
         h2.extend(b"localhost");
         assert_eq!(evaluate(&mut policy, &tcp(102, &h2)), Verdict::DropFlow);
+    }
+
+    #[test]
+    fn sing_mux_smux_rule_matches_the_correct_substream_request() {
+        fn tcp(sequence: u32, payload: &[u8]) -> Vec<u8> {
+            let mut bytes = vec![0; 40 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 6;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&443u16.to_be_bytes());
+            bytes[24..28].copy_from_slice(&sequence.to_be_bytes());
+            bytes[32] = 0x50;
+            bytes[33] = 0x18;
+            bytes[40..].copy_from_slice(payload);
+            bytes
+        }
+        fn smux(command: u8, stream: u32, data: &[u8]) -> Vec<u8> {
+            let mut frame = vec![2, command];
+            frame.extend((data.len() as u16).to_le_bytes());
+            frame.extend(stream.to_le_bytes());
+            frame.extend(data);
+            frame
+        }
+        fn request(host: &str) -> Vec<u8> {
+            let mut bytes = vec![0, 0, 3, host.len() as u8];
+            bytes.extend(host.as_bytes());
+            bytes.extend(443u16.to_be_bytes());
+            bytes
+        }
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"mux target","expr":"sing_mux.protocol == smux && fresh.sing_mux.host == example.org && sing_mux.port == 443","action":"block"}]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let evaluate = |policy: &mut dyn Policy, bytes: &[u8]| {
+            policy.evaluate(Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        let mut first = vec![0, 0];
+        first.extend(smux(0, 1, &[]));
+        first.extend(smux(2, 1, &request("other.test")));
+        assert_eq!(evaluate(&mut policy, &tcp(100, &first)), Verdict::Accept);
+        let mut second = smux(0, 3, &[]);
+        second.extend(smux(2, 3, &request("example.org")));
+        assert_eq!(
+            evaluate(&mut policy, &tcp(100 + first.len() as u32, &second)),
+            Verdict::DropFlow
+        );
     }
 
     #[test]

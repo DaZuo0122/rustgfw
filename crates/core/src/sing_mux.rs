@@ -8,13 +8,13 @@ pub const FIELDS: &[&str] = &["sing_mux.version", "sing_mux.protocol", "sing_mux
 const PADDED_WRITES: u8 = 16;
 
 #[derive(Default)]
-struct Padding {
+pub(crate) struct Padding {
     buffer: Vec<u8>,
     writes: u8,
 }
 
 impl Padding {
-    fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
         self.buffer.extend_from_slice(bytes);
         let mut output = Vec::new();
         while self.writes < PADDED_WRITES && self.buffer.len() >= 4 {
@@ -36,34 +36,32 @@ impl Padding {
 }
 
 #[derive(Default)]
-pub struct SingMuxH2 {
-    selector: Vec<u8>,
-    selected: bool,
-    version: u8,
-    padding: bool,
-    padded: [Padding; 2],
-    http2: Http2Conversation,
-    announced: bool,
-    finished: bool,
+pub(crate) struct Selector {
+    buffer: Vec<u8>,
+    pub(crate) selected: bool,
+    pub(crate) version: u8,
+    pub(crate) protocol: u8,
+    pub(crate) padding: bool,
+    pub(crate) finished: bool,
 }
 
-impl SingMuxH2 {
-    fn select(&mut self, bytes: &[u8]) -> Option<Vec<u8>> {
-        self.selector.extend_from_slice(bytes);
-        let version = *self.selector.first()?;
+impl Selector {
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Option<Vec<u8>> {
+        self.buffer.extend_from_slice(bytes);
+        let version = *self.buffer.first()?;
         if version > 1 {
             self.finished = true;
             return None;
         }
-        let protocol = *self.selector.get(1)?;
-        if protocol != 2 {
+        let protocol = *self.buffer.get(1)?;
+        if protocol > 2 {
             self.finished = true;
             return None;
         }
         let (header, padding) = if version == 0 {
             (2, false)
         } else {
-            let flag = *self.selector.get(2)?;
+            let flag = *self.buffer.get(2)?;
             if flag > 1 {
                 self.finished = true;
                 return None;
@@ -72,19 +70,31 @@ impl SingMuxH2 {
                 (3, false)
             } else {
                 let length =
-                    u16::from_be_bytes([*self.selector.get(3)?, *self.selector.get(4)?]) as usize;
+                    u16::from_be_bytes([*self.buffer.get(3)?, *self.buffer.get(4)?]) as usize;
                 (5 + length, true)
             }
         };
-        if self.selector.len() < header {
+        if self.buffer.len() < header {
             return None;
         }
         self.selected = true;
         self.version = version;
+        self.protocol = protocol;
         self.padding = padding;
-        Some(std::mem::take(&mut self.selector).split_off(header))
+        Some(std::mem::take(&mut self.buffer).split_off(header))
     }
+}
 
+#[derive(Default)]
+pub struct SingMuxH2 {
+    selector: Selector,
+    padded: [Padding; 2],
+    http2: Http2Conversation,
+    announced: bool,
+    finished: bool,
+}
+
+impl SingMuxH2 {
     fn metadata(&self) -> ObservationBatch {
         ObservationBatch {
             clear_fields: &[],
@@ -92,7 +102,7 @@ impl SingMuxH2 {
             observations: vec![
                 Observation {
                     field: "sing_mux.version",
-                    value: self.version.to_string(),
+                    value: self.selector.version.to_string(),
                 },
                 Observation {
                     field: "sing_mux.protocol",
@@ -100,7 +110,7 @@ impl SingMuxH2 {
                 },
                 Observation {
                     field: "sing_mux.padding",
-                    value: self.padding.to_string(),
+                    value: self.selector.padding.to_string(),
                 },
             ],
         }
@@ -112,15 +122,15 @@ impl BidirectionalStreamAnalyzer for SingMuxH2 {
         if self.finished {
             return Analysis::Finished;
         }
-        let input = if self.selected {
+        let input = if self.selector.selected {
             bytes.to_vec()
         } else if reverse {
             return Analysis::Pending;
         } else {
-            match self.select(bytes) {
+            match self.selector.feed(bytes) {
                 Some(bytes) => bytes,
                 None => {
-                    return if self.finished {
+                    return if self.selector.finished {
                         Analysis::Finished
                     } else {
                         Analysis::Pending
@@ -128,7 +138,11 @@ impl BidirectionalStreamAnalyzer for SingMuxH2 {
                 }
             }
         };
-        let input = if self.padding {
+        if self.selector.protocol != 2 {
+            self.finished = true;
+            return Analysis::Finished;
+        }
+        let input = if self.selector.padding {
             self.padded[usize::from(reverse)].feed(&input)
         } else {
             input

@@ -1,0 +1,9 @@
+{
+  "rules": [
+    {
+      "name": "block selected HTTP/3 authority",
+      "expr": "http3.authority == blocked.test && fresh.http3.method == GET",
+      "action": "block"
+    }
+  ]
+}

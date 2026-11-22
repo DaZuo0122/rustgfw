@@ -55,6 +55,8 @@ TCP 重组模块 `core::tcp` 已接入 `core::inspect` 的双向分析路径，�
 
 HTTP/3 的解码流使用 `Inspect::feed_http3`：连接状态按 `FlowScope` 隔离，QPACK 编码器流与请求 HEADERS 共享动态表，请求和响应按 QUIC stream ID 关联。每条请求流独立运行 UDP 表达式规则；返回的 `DecodedVerdict` 携带被裁决的请求流 ID，以处理 QPACK 更新触发的延迟头部事件。调用方需要验证协商的 HTTP/3 ALPN，并提供已解密、按流有序的 QUIC 字节。当前 Linux NFQUEUE 后端尚无这种适配器，因此逐包规则只能使用 QUIC Initial 的可见字段。
 
+命令行的 `decoded-http3` 模式把已解密流事件接入这条核心路径，并按流输出裁决；输入格式见 [已解密流输入](decoded-streams.md)。它不接管 UDP socket 或 NFQUEUE，便于在 Linux 上独立验证规则与 QPACK 状态。
+
 引擎核心通过 `tracing` 发布结构化裁决与诊断事件，输出由调用方配置。命令行默认写入标准错误，级别和格式见 [引擎日志](logging.md)。
 
 `rustgfw nfqueue 100 accept http-host=blocked.test` 连续检查 HTTP/1 请求的所有 Host 头、绝对 URI 的 authority，以及 CONNECT 目标（大小写不敏感，含端口时需完整匹配）。表达式可读取请求方法、目标、版本及反向响应的状态码、版本；两方向观察值保存在同一流内。同包多条消息依次求值，上一条请求的字段不会与下一条请求的 Host 混用。流水线响应按请求顺序关联，临时 1xx 响应保留待决请求；HEAD 响应没有消息体，其声明的 `Content-Length` 不会挡住后续响应。任一 Host 值命中即阻断；无关头里的非 UTF-8 字节不妨碍 Host 识别。传输层规则先执行，Host 规则进一步阻断。识别前的包会放行；跨包分析不是代理式整请求缓冲。每方向乱序缓存及 HTTP 头默认各限 16 KiB，TCP 与可选的有状态 UDP 检查共用默认最多 16384 条流的容量，空闲 120 秒过期。双向 FIN 或未阻断流的 RST 会释放检查状态；单向 FIN 保留反向分析。容量满时只在有新完成流时扫描回收；仍满则丢弃新流的包。阻断流的 RST 不单凭包头清除用户态阻断状态。`Content-Length` 消息体按声明长度跳过；最终采用 chunked 传输编码时，解析块边界和 trailer 后继续检查下一条消息。无法定界的响应体、含糊的长度声明、超长或无法识别的 HTTP 头会结束该方向分析并沿用传输层结果；减小头预算可能让更长的阻断目标头无法被识别。成功 CONNECT 和 101 协议切换后的流不再按 HTTP 消息分析。HTTP/1 分析器不解析 HTTP/2；独立的明文 h2c 分析器按 stream ID 关联交错的请求和响应，详见 [表达式规则](rules.md)。

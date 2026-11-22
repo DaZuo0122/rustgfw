@@ -10,6 +10,7 @@ use rustgfw_core::{
 };
 use std::time::Duration;
 
+mod decoded_http3;
 mod expr_config;
 
 type Error = Box<dyn std::error::Error>;
@@ -45,7 +46,8 @@ fn main() -> Result<(), Error> {
     match args.first().map(String::as_str) {
         Some("nfqueue") => run_nfqueue(&args[1..]),
         Some("windivert") => run_windivert(&args[1..]),
-        _ => Err("usage: rustgfw nfqueue <queue> <accept|drop> [rules...] [nft=input|output|forward] [ctmark=0x80000000] | rustgfw windivert <dll> <network|forward> <accept|drop> [rules...]; shared options: rules-file=path inspect-flows=N transport-flows=N flow-idle-seconds=N reorder-bytes=N http-header-bytes=N tls-buffer-bytes=N dns-message-bytes=N ssh-banner-bytes=N".into()),
+        Some("decoded-http3") => decoded_http3::run(&args[1..]),
+        _ => Err("usage: rustgfw nfqueue <queue> <accept|drop> [rules...] [nft=input|output|forward] [ctmark=0x80000000] | rustgfw windivert <dll> <network|forward> <accept|drop> [rules...] | rustgfw decoded-http3 rules-file=path; shared options: inspect-flows=N transport-flows=N flow-idle-seconds=N reorder-bytes=N http-header-bytes=N tls-buffer-bytes=N dns-message-bytes=N ssh-banner-bytes=N".into()),
     }
 }
 
@@ -203,7 +205,7 @@ impl Options {
             })
     }
 
-    fn into_policy(self) -> impl rustgfw_core::Policy {
+    fn into_policy(self) -> rustgfw_core::inspect::Inspect<rustgfw_core::rules::Rules> {
         use rustgfw_core::{
             dns::{DnsDatagram, DnsUdp},
             inspect::{FlowRule, Inspect},

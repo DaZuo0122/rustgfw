@@ -81,6 +81,7 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 | `openvpn.stage`、`openvpn.client_reset`、`openvpn.server_reset` | `openvpn.stage == handshake && openvpn.server_reset == 8` | TCP/UDP OpenVPN 双向重置握手；数值字段按十进制字符串比较 |
 | `openvpn.opcode`、`openvpn.tx_packets`、`openvpn.rx_packets` | `openvpn.stage == data && fresh.openvpn.opcode == 6` | 仅 UDP：当前包的 opcode 与握手后的双向包数 |
 | `socks.version`、`socks.command`、`socks.target_type`、`socks.target_host`、`socks.target_port`、`socks.auth` | `socks.target_host ends_with ".example.com"` | TCP SOCKS4/4a/5 客户端请求；命令为 `connect`、`bind` 或 `udp_associate`，认证类型为 `none` 或 `userpass` |
+| `vless.candidate`、`vless.command`、`vless.target_type`、`vless.target_host`、`vless.target_port`、`vless.addons_length` | `proto == tcp && vless.candidate == true && vless.target_host == blocked.test` | 裸 VLESS v0 客户端请求头的结构匹配；不验证 UUID 或加密身份，`mux`/`rvs` 无目标地址 |
 | `fet.candidate`、`fet.sample_len`、`fet.average_popcount_milli`、`fet.printable_per_mille`、`fet.first_six_printable`、`fet.longest_printable_run`、`fet.tls_http_prefix` | `proto == tcp && fet.candidate == true && fet.sample_len >= 32` | 首方向 TCP 载荷的 FET 启发式采样；`candidate` 只表示未命中豁免条件 |
 | `trojan.candidate`、`trojan.seq1`～`trojan.seq4` | `proto == tcp && trojan.candidate == true && trojan.seq1 >= 200` | 客户端 ChangeCipherSpec 后前四段交替方向的 TCP 字节数及长度模型的候选结果 |
 | `quic.version`、`quic.sni`、`quic.alpn`、`quic.tls_supported_version`、`quic.ech_extension`、`quic.transport_parameters`、`quic.datagram_max_size` | `fresh.quic.alpn == h3 && quic.datagram_max_size > 0` | UDP QUIC v1/v2 客户端 Initial 中的 TLS ClientHello；ALPN 为客户端提供的列表，`transport_parameters` 表示扩展号 `0x0039` 是否出现；`datagram_max_size` 是客户端声明愿意接收的最大 DATAGRAM 帧长 |
@@ -112,6 +113,8 @@ WireGuard 分析器按需处理任意 UDP 端口，识别握手发起、握手�
 OpenVPN TCP/UDP 分析器按需处理任意端口。先看到首方向的客户端 hard reset，再看到反方向的服务端 hard reset，才报告 `openvpn.stage == handshake`。TCP 分析器读取双字节长度前缀，支持分段握手帧，确认后结束分析。UDP 后续合法控制或数据 opcode 报告 `stage == data` 并更新双向计数；`openvpn.opcode` 只描述当前数据报。分析器检查头部 opcode、首轮 key ID 与最短长度，不解密或验证会话。
 
 SOCKS 分析器按需检查任意 TCP 端口的首方向请求，支持 SOCKS4、SOCKS4a 域名及 SOCKS5 的 IPv4、IPv6、域名目标和用户名密码认证帧。请求完成时发布目标字段，不解析服务器应答；不会把用户名或密码放入观察字段。SOCKS4a 的版本值为 `4a`，目标端口目前按十进制字符串比较。
+
+VLESS 分析器按需检查首方向的明文 v0 请求头，支持 TCP、UDP、Mux 和 Rvs 命令，以及 IPv4、IPv6、域名目标。它按 TCP 分段累积到完整头部后发布字段，不记录 UUID，也不检查服务端是否接受该 UUID。`vless.candidate` 是结构候选，不能单独证明连接已通过认证；TLS、REALITY、VLESS Encryption 或其他外层加密时看不到这个头部。依据：[VLESS 格式](https://xtls.github.io/en/development/protocols/vless.html)、[Xray 编码实现](https://github.com/XTLS/Xray-core/blob/main/proxy/vless/encoding/encoding.go)。
 
 FET 分析器仅在规则引用 `fet.*` 时启用，取首方向首次交付的 TCP 数据，最多检查 8192 字节。它复现 OpenGFW 的五组豁免条件：平均置位数不在 3.4～4.6、前六字节均可打印、可打印字节超过一半、最长连续可打印段超过 20 字节，或具有 TLS/HTTP 前缀。`fet.candidate == true` 表示这些豁免条件都不成立，并不证明流量已加密或属于某个代理协议；分段方式也会影响首次采样长度。`fet.average_popcount_milli` 和 `fet.printable_per_mille` 把比例乘以 1000 后截断为整数，便于用表达式与采样长度、端口及其他字段组合。依据：[OpenGFW FET 分析器](https://github.com/apernet/OpenGFW/blob/master/analyzer/tcp/fet.go)、[FET 测量论文](https://gfw.report/publications/usenixsecurity23/data/paper/paper.pdf)。
 

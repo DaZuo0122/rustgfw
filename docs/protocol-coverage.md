@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | 明文 HTTP 代理、SOCKS4/5、SSH、普通 WireGuard、OpenVPN | HTTP 请求与 CONNECT 目标、SOCKS 请求、SSH banner；WireGuard 固定报文形状和双向索引；OpenVPN 双向 reset 顺序 | 已有对应分析器。WireGuard 和 OpenVPN 是结构/顺序识别，不验证加密身份；HTTP/SSH 不证明载荷是代理用途。见[架构说明](architecture.md)。 |
 | 明文 h2c、sing-mux、Xray Mux.Cool | 能解析明文 HTTP/2 帧与子流，关联目标 | 已有解析器；承载在 TLS、VMess 等密文中时逐包路径看不到。见[多路复用](multiplexing.md)。 |
-| VLESS `raw` 且未启用 TLS/REALITY/自身加密 | 理论上能直接解析请求头 | 尚无 VLESS 分析器；这是可补的明文缺口。Xray 对公开网络上的无保护 VLESS 有明确使用限制。[VLESS 配置](https://xtls.github.io/en/config/outbounds/vless.html)。 |
+| VLESS `raw` 且未启用 TLS/REALITY/自身加密 | 可解析 v0 请求的命令、目标地址和端口；不记录 UUID | 已有结构候选分析器，不能验证服务端认证；Mux/Rvs 命令不带目标地址。Xray 对公开网络上的无保护 VLESS 有明确使用限制。[VLESS 配置](https://xtls.github.io/en/config/outbounds/vless.html)。 |
 | Trojan、VLESS/VMess 走 TLS 或 REALITY、AnyTLS、ShadowTLS、Naive、TrustTunnel H2、gRPC/WebSocket/XHTTP 走 TLS | TLS ClientHello 的可见 SNI、ALPN、版本与部分扩展；Trojan 首段方向/长度启发式 | 只能识别外层 TLS 或候选统计特征，不能确认内层是哪种代理。AnyTLS 的认证和帧在 TLS 握手后，REALITY 未认证连接会转发到伪装目标；ShadowTLS 也借用真实 TLS 握手。[AnyTLS 协议](https://github.com/anytls/anytls-go/blob/main/docs/protocol.md)、[REALITY 配置](https://xtls.github.io/en/config/transports/reality.html)、[ShadowTLS v3](https://github.com/ihciah/shadow-tls/blob/master/docs/protocol-v3-en.md)、[TrustTunnel 规范](https://github.com/TrustTunnel/TrustTunnel/blob/master/PROTOCOL.md)。 |
 | Hysteria/Hysteria2、TUIC、ShadowQUIC、MASQUE H3、TrustTunnel H3、XHTTP H3 等 QUIC 载体 | 标准 v1/v2 Client Initial 中可见的 SNI、ALPN、ECH 扩展标记、DATAGRAM 接收上限 | 能确认部分 QUIC 握手声明，不能从 `h3` 或 DATAGRAM 声明确认具体代理；认证、目标和 DATAGRAM 载荷受后续密钥保护。Hysteria2 的 Salamander/Gecko 还会遮住标准 QUIC Initial。[Hysteria2 协议](https://v2.hysteria.network/docs/developers/Protocol/)、[TUIC 规范](https://github.com/tuic-protocol/tuic/blob/master/SPEC.md)、[RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html)、[RFC 9312](https://www.rfc-editor.org/rfc/rfc9312.html)、[Hysteria2 研究](hysteria2-quic.md)。 |
 | Shadowsocks AEAD/2022、VMess 原生加密、VLESS Encryption 的随机外观、ShadowsocksR、Mieru、Sudoku 等加密/混淆载体 | TCP 首段可用 FET 统计候选；UDP 只有端点、长度和时间等外层元数据 | 没有可靠的具体协议识别。Shadowsocks 2022 使用预共享密钥加密头部，随机 salt 不能当固定魔数；现有 FET 只适用于 TCP 首段，不能直接套到 UDP。[SIP022](https://shadowsocks.org/doc/sip022.html)、[VLESS Encryption 配置](https://xtls.github.io/en/config/outbounds/vless.html)、[FET 研究](https://gfw.report/publications/usenixsecurity23/en/)。 |
@@ -19,7 +19,7 @@ Xray 的代理协议、传输和安全层可自由组合；“支持 VLESS”不
 
 ## 下一步
 
-1. 先补**真实可见**且有稳定格式的缺口：明文 VLESS 请求头，以及 HTTP/1 WebSocket/HTTPUpgrade 握手中的载体字段。两者应分别标为“协议头已解析”和“只识别传输升级”；不能因为 `Upgrade: websocket` 就判定代理。用 Xray、sing-box、mihomo 的实际客户端样本验证分段、异常输入和误报。
+1. 对已补上的明文 VLESS 结构候选采集 Xray、sing-box、mihomo 客户端样本，验证不同实现与误报。接着补 HTTP/1 WebSocket/HTTPUpgrade 握手中的载体字段，并标为“只识别传输升级”；不能因为 `Upgrade: websocket` 就判定代理。
 2. 对 QUIC 家族采集标注流量：普通 H3、WebTransport/MASQUE、Hysteria2 默认与混淆、TUIC、ShadowQUIC。先评估已有 Initial 字段是否有区分力，再决定是否值得增加连接级时序/长度候选模型；不同客户端、拥塞控制和迁移路径要分开验证。没有对照样本时不写“协议命中”规则。
 3. 保持“载体事实”和“具体代理候选”分层。Shadowsocks/VMess 等没有密钥时不承诺确定识别；FET 与 Trojan 长度模型在规则中保留候选含义。
 

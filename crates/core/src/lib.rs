@@ -21,6 +21,7 @@ pub mod ssh;
 pub mod tcp;
 pub mod tls;
 pub mod trojan;
+pub mod vless;
 pub mod wireguard;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

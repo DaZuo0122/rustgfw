@@ -24,6 +24,7 @@ fn observation_field_possible(field: &str, protocol: Protocol) -> bool {
     } else if rustgfw_core::openvpn::FIELDS.contains(&field) {
         protocol == Protocol::Udp || rustgfw_core::openvpn::TCP_FIELDS.contains(&field)
     } else if rustgfw_core::socks::FIELDS.contains(&field)
+        || rustgfw_core::vless::FIELDS.contains(&field)
         || rustgfw_core::http::FIELDS.contains(&field)
         || rustgfw_core::http2::FIELDS.contains(&field)
         || rustgfw_core::mux_cool::FIELDS.contains(&field)
@@ -252,6 +253,9 @@ impl Options {
         let needs_socks = rustgfw_core::socks::FIELDS
             .iter()
             .any(|field| needs_tcp_field(field));
+        let needs_vless = rustgfw_core::vless::FIELDS
+            .iter()
+            .any(|field| needs_tcp_field(field));
         let needs_fet = rustgfw_core::fet::FIELDS
             .iter()
             .any(|field| needs_tcp_field(field));
@@ -428,6 +432,11 @@ impl Options {
                 needs_socks.then(|| {
                     BidirectionalAnalyzerRule::observing(None, || {
                         Box::new(rustgfw_core::socks::SocksRequest::default())
+                    })
+                }),
+                needs_vless.then(|| {
+                    BidirectionalAnalyzerRule::observing(None, || {
+                        Box::new(rustgfw_core::vless::VlessRequest::default())
                     })
                 }),
                 needs_fet.then(|| {
@@ -1710,6 +1719,49 @@ mod tests {
             ),
             Verdict::DropFlow
         );
+    }
+
+    #[test]
+    fn vless_expression_matches_fragmented_raw_request() {
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"raw VLESS target","expr":"proto == tcp && vless.candidate == true && vless.command == tcp && vless.target_host == blocked.test && vless.target_port == 443","action":"block"}]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let tcp = |sequence: u32, payload: &[u8]| {
+            let mut bytes = vec![0; 40 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 6;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&443u16.to_be_bytes());
+            bytes[24..28].copy_from_slice(&sequence.to_be_bytes());
+            bytes[32] = 0x50;
+            bytes[33] = 0x18;
+            bytes[40..].copy_from_slice(payload);
+            bytes
+        };
+        let mut request = vec![0];
+        request.extend([0x42; 16]);
+        request.extend([0, 1, 1, 187, 2, 12]);
+        request.extend(b"blocked.test");
+        let split = 20;
+        let first = tcp(100, &request[..split]);
+        let second = tcp(100 + split as u32, &request[split..]);
+        let evaluate = |policy: &mut dyn rustgfw_core::Policy, bytes: &[u8]| {
+            policy.evaluate(rustgfw_core::Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: rustgfw_core::FlowScope::default(),
+            })
+        };
+        assert_eq!(evaluate(&mut policy, &first), Verdict::Accept);
+        assert_eq!(evaluate(&mut policy, &second), Verdict::DropFlow);
     }
 
     #[test]

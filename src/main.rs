@@ -25,6 +25,7 @@ fn observation_field_possible(field: &str, protocol: Protocol) -> bool {
     } else if rustgfw_core::socks::FIELDS.contains(&field)
         || rustgfw_core::http::FIELDS.contains(&field)
         || rustgfw_core::http2::FIELDS.contains(&field)
+        || rustgfw_core::mux_cool::FIELDS.contains(&field)
         || rustgfw_core::sing_mux::FIELDS.contains(&field)
         || rustgfw_core::sing_mux_frames::FIELDS.contains(&field)
         || rustgfw_core::fet::FIELDS.contains(&field)
@@ -203,6 +204,9 @@ impl Options {
         let needs_http2 = rustgfw_core::http2::FIELDS
             .iter()
             .any(|field| needs_tcp_field(field));
+        let needs_mux_cool = rustgfw_core::mux_cool::FIELDS
+            .iter()
+            .any(|field| needs_tcp_field(field));
         let needs_sing_mux = rustgfw_core::sing_mux::FIELDS
             .iter()
             .any(|field| needs_tcp_field(field))
@@ -377,6 +381,11 @@ impl Options {
                 needs_http2.then(|| {
                     BidirectionalAnalyzerRule::observing(None, || {
                         Box::<rustgfw_core::http2::Http2Conversation>::default()
+                    })
+                }),
+                needs_mux_cool.then(|| {
+                    BidirectionalAnalyzerRule::observing(None, || {
+                        Box::<rustgfw_core::mux_cool::MuxCool>::default()
                     })
                 }),
                 (needs_sing_mux || needs_http2).then(|| {

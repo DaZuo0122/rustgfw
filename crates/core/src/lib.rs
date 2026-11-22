@@ -7,6 +7,7 @@ pub mod http;
 pub mod http2;
 pub mod http3;
 pub mod inspect;
+pub mod mux_cool;
 pub mod offload;
 pub mod openvpn;
 pub mod packet;

@@ -23,6 +23,14 @@ struct Frame {
     data: Vec<u8>,
     request_data: bool,
     opens: bool,
+    fin: bool,
+    reset: bool,
+}
+
+#[derive(Default)]
+struct StreamState {
+    request: StreamRequest,
+    fin_seen: [bool; 2],
 }
 
 #[derive(Default)]
@@ -39,7 +47,7 @@ impl Framing {
             if self.buffer.len() < header {
                 return Ok(frames);
             }
-            let (stream_id, kind, data_len, request_data, opens) = if protocol == 0 {
+            let (stream_id, kind, data_len, request_data, opens, fin, reset) = if protocol == 0 {
                 let version = self.buffer[0];
                 let cmd = self.buffer[1];
                 if !(1..=2).contains(&version) || cmd > 4 || (version == 1 && cmd == 4) {
@@ -54,7 +62,7 @@ impl Framing {
                     3 => "noop",
                     _ => "window",
                 };
-                (stream, name, length, cmd == 2, cmd == 0)
+                (stream, name, length, cmd == 2, cmd == 0, cmd == 1, false)
             } else {
                 let version = self.buffer[0];
                 let kind = self.buffer[1];
@@ -90,6 +98,8 @@ impl Framing {
                     if kind == 0 { length } else { 0 },
                     kind == 0,
                     (kind == 0 || kind == 1) && flags & 0x01 != 0,
+                    (kind == 0 || kind == 1) && flags & 0x04 != 0,
+                    (kind == 0 || kind == 1) && flags & 0x08 != 0,
                 )
             };
             let total = header + data_len;
@@ -102,6 +112,8 @@ impl Framing {
                 data: self.buffer[header..total].to_vec(),
                 request_data,
                 opens,
+                fin,
+                reset,
             });
             self.buffer.drain(..total);
         }
@@ -120,7 +132,7 @@ pub struct SingMuxFrames {
     selector: Selector,
     padded: [Padding; 2],
     framing: [Framing; 2],
-    streams: HashMap<u32, StreamRequest>,
+    streams: HashMap<u32, StreamState>,
     announced: bool,
     finished: bool,
 }
@@ -151,17 +163,25 @@ impl SingMuxFrames {
             observation("sing_mux.frame", frame.kind),
         ];
         if frame.opens && !reverse && frame.stream_id != 0 {
-            self.streams.entry(frame.stream_id).or_default();
+            self.streams.insert(frame.stream_id, StreamState::default());
         }
         let mut context = Vec::new();
+        let mut closed = false;
         if let Some(stream) = self.streams.get_mut(&frame.stream_id) {
-            if !reverse && frame.request_data && stream.target().is_none() {
-                if let Ok(Some(parsed)) = stream.feed(&frame.data) {
+            if !reverse && frame.request_data && stream.request.target().is_none() {
+                if let Ok(Some(parsed)) = stream.request.feed(&frame.data) {
                     observations.extend(parsed.observations());
                 }
-            } else if let Some(target) = stream.target() {
+            } else if let Some(target) = stream.request.target() {
                 context = target.observations();
             }
+            if frame.fin {
+                stream.fin_seen[usize::from(reverse)] = true;
+            }
+            closed = frame.reset || stream.fin_seen == [true, true];
+        }
+        if closed {
+            self.streams.remove(&frame.stream_id);
         }
         ObservationBatch {
             clear_fields: FIELDS,
@@ -246,11 +266,15 @@ mod tests {
             .map(|item| item.value.as_str())
     }
 
-    fn request() -> Vec<u8> {
-        let mut bytes = vec![0, 0, 3, 11];
-        bytes.extend(b"example.org");
+    fn request_for(host: &str) -> Vec<u8> {
+        let mut bytes = vec![0, 0, 3, host.len() as u8];
+        bytes.extend(host.as_bytes());
         bytes.extend(443u16.to_be_bytes());
         bytes
+    }
+
+    fn request() -> Vec<u8> {
+        request_for("example.org")
     }
 
     fn smux(cmd: u8, id: u32, payload: &[u8]) -> Vec<u8> {
@@ -289,6 +313,31 @@ mod tests {
     }
 
     #[test]
+    fn smux_releases_target_after_both_fin_directions() {
+        let mut analyzer = SingMuxFrames::default();
+        let mut opening = vec![0, 0];
+        opening.extend(smux(0, 1, &[]));
+        opening.extend(smux(2, 1, &request()));
+        let opened = batches(analyzer.feed(&opening, false));
+        assert_eq!(value(&opened[2], "sing_mux.host"), Some("example.org"));
+
+        let client_fin = batches(analyzer.feed(&smux(1, 1, &[]), false));
+        assert_eq!(value(&client_fin[0], "sing_mux.host"), Some("example.org"));
+        assert!(analyzer.streams.contains_key(&1));
+        let reply = batches(analyzer.feed(&smux(2, 1, b"reply"), true));
+        assert_eq!(value(&reply[0], "sing_mux.host"), Some("example.org"));
+        let server_fin = batches(analyzer.feed(&smux(1, 1, &[]), true));
+        assert_eq!(value(&server_fin[0], "sing_mux.host"), Some("example.org"));
+        assert!(!analyzer.streams.contains_key(&1));
+
+        let mut reopened = smux(0, 1, &[]);
+        reopened.extend(smux(2, 1, &request_for("new.test")));
+        let fresh = batches(analyzer.feed(&reopened, false));
+        assert_eq!(value(&fresh[0], "sing_mux.host"), None);
+        assert_eq!(value(&fresh[1], "sing_mux.host"), Some("new.test"));
+    }
+
+    #[test]
     fn yamux_syn_data_exposes_destination() {
         let mut analyzer = SingMuxFrames::default();
         let mut input = vec![0, 1];
@@ -314,6 +363,26 @@ mod tests {
         assert_eq!(value(&opened[1], "sing_mux.frame"), Some("open"));
         let data = batches(analyzer.feed(&yamux(0, 1, &request()), false));
         assert_eq!(value(&data[0], "sing_mux.host"), Some("example.org"));
+    }
+
+    #[test]
+    fn yamux_fin_is_half_close_and_reset_releases_stream() {
+        let mut analyzer = SingMuxFrames::default();
+        let mut opening = vec![0, 1];
+        opening.extend(yamux(1, 1, &request()));
+        batches(analyzer.feed(&opening, false));
+        let client_fin = batches(analyzer.feed(&yamux(4, 1, &[]), false));
+        assert_eq!(value(&client_fin[0], "sing_mux.host"), Some("example.org"));
+        assert!(analyzer.streams.contains_key(&1));
+        let server_fin = batches(analyzer.feed(&yamux(4, 1, &[]), true));
+        assert_eq!(value(&server_fin[0], "sing_mux.host"), Some("example.org"));
+        assert!(!analyzer.streams.contains_key(&1));
+
+        let opened = batches(analyzer.feed(&yamux(1, 3, &request()), false));
+        assert_eq!(value(&opened[0], "sing_mux.host"), Some("example.org"));
+        let reset = batches(analyzer.feed(&yamux(8, 3, &[]), true));
+        assert_eq!(value(&reset[0], "sing_mux.host"), Some("example.org"));
+        assert!(!analyzer.streams.contains_key(&3));
     }
 
     #[test]

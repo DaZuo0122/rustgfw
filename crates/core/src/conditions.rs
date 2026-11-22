@@ -263,6 +263,8 @@ impl Condition {
                                     | "http.target"
                                     | "http2.method"
                                     | "http2.path"
+                                    | "http3.method"
+                                    | "http3.path"
                                     | "tls.alpn"
                                     | "tls.server_alpn"
                                     | "quic.alpn"

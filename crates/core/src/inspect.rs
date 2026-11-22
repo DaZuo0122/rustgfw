@@ -2,6 +2,7 @@
 pub use crate::http::HttpFirstMessage as HttpHost;
 use crate::{
     Decision, FlowScope, Packet, Policy, Verdict,
+    http3::Http3Conversation,
     packet::{self, Protocol},
     tcp::Reassembler,
 };
@@ -122,6 +123,18 @@ struct UdpFlow {
     blocked: bool,
     seen: Instant,
 }
+struct Http3Flow {
+    origin: SocketAddr,
+    target: SocketAddr,
+    facts: HashMap<&'static str, Vec<String>>,
+    allowed: bool,
+    blocked: bool,
+    seen: Instant,
+}
+struct Http3Connection {
+    analyzer: Http3Conversation,
+    seen: Instant,
+}
 impl UdpFlow {
     fn finished(&self, has_rules: bool) -> bool {
         !has_rules && !self.allowed && !self.blocked && self.analyzers.iter().all(Option::is_none)
@@ -186,6 +199,14 @@ pub struct DecodedStream<'a> {
     pub target: SocketAddr,
     pub reverse: bool,
     pub bytes: &'a [u8],
+}
+
+/// Verdict for an HTTP/3 request stream. A QPACK update can yield a verdict
+/// for a request stream other than the stream carrying the current input.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DecodedVerdict {
+    pub stream_id: u64,
+    pub verdict: Verdict,
 }
 
 pub struct AnalyzerRule {
@@ -633,6 +654,8 @@ pub struct Inspect<P> {
     udp_rules: Vec<FlowRule>,
     flows: HashMap<Key, Flow>,
     decoded_flows: HashMap<DecodedKey, Flow>,
+    http3_connections: HashMap<FlowScope, Http3Connection>,
+    http3_flows: HashMap<DecodedKey, Http3Flow>,
     udp_flows: HashMap<Key, UdpFlow>,
     completed_since_compaction: bool,
     sweep: Instant,
@@ -670,6 +693,8 @@ impl<P> Inspect<P> {
             udp_rules: Vec::new(),
             flows: HashMap::new(),
             decoded_flows: HashMap::new(),
+            http3_connections: HashMap::new(),
+            http3_flows: HashMap::new(),
             udp_flows: HashMap::new(),
             completed_since_compaction: false,
             sweep: Instant::now(),
@@ -679,6 +704,8 @@ impl<P> Inspect<P> {
     pub fn clear_flows(&mut self) {
         self.flows.clear();
         self.decoded_flows.clear();
+        self.http3_connections.clear();
+        self.http3_flows.clear();
         self.udp_flows.clear();
         self.completed_since_compaction = false;
     }
@@ -711,6 +738,10 @@ impl<P> Inspect<P> {
                 .retain(|_, flow| now.duration_since(flow.seen) < self.limits.idle);
             self.decoded_flows
                 .retain(|_, flow| now.duration_since(flow.seen) < self.limits.idle);
+            self.http3_connections
+                .retain(|_, connection| now.duration_since(connection.seen) < self.limits.idle);
+            self.http3_flows
+                .retain(|_, flow| now.duration_since(flow.seen) < self.limits.idle);
             self.udp_flows
                 .retain(|_, flow| now.duration_since(flow.seen) < self.limits.idle);
             self.sweep = now + Duration::from_secs(1);
@@ -726,6 +757,14 @@ impl<P> Inspect<P> {
                 .retain(|_, flow| !flow.finished(udp_has_rules));
             self.completed_since_compaction = false;
         }
+    }
+
+    fn active_count(&self) -> usize {
+        self.flows.len()
+            + self.udp_flows.len()
+            + self.decoded_flows.len()
+            + self.http3_connections.len()
+            + self.http3_flows.len()
     }
 
     /// Inspect ordered bytes supplied by a decoder outside the packet I/O path.
@@ -757,14 +796,9 @@ impl<P> Inspect<P> {
         {
             return Verdict::Accept;
         }
-        if !self.decoded_flows.contains_key(&key)
-            && self.flows.len() + self.udp_flows.len() + self.decoded_flows.len()
-                >= self.limits.max_flows
-        {
+        if !self.decoded_flows.contains_key(&key) && self.active_count() >= self.limits.max_flows {
             self.compact_completed_flows();
-            if self.flows.len() + self.udp_flows.len() + self.decoded_flows.len()
-                >= self.limits.max_flows
-            {
+            if self.active_count() >= self.limits.max_flows {
                 return Verdict::DropFlow;
             }
         }
@@ -822,6 +856,123 @@ impl<P> Inspect<P> {
     /// Release all analyzers and facts for one decoded logical stream.
     pub fn close_decoded(&mut self, scope: FlowScope, stream_id: u64) {
         self.decoded_flows.remove(&(scope, stream_id));
+    }
+
+    /// Inspect decrypted, ordered HTTP/3 QUIC stream bytes. The caller must
+    /// verify ALPN and handle QUIC decryption/reassembly. Returned verdicts
+    /// apply to request streams, including those released by QPACK updates.
+    pub fn feed_http3(&mut self, input: DecodedStream<'_>) -> Vec<DecodedVerdict> {
+        let now = Instant::now();
+        self.expire_idle_flows(now);
+        if !self.http3_connections.contains_key(&input.scope)
+            && self.active_count() >= self.limits.max_flows
+        {
+            return vec![DecodedVerdict {
+                stream_id: input.stream_id,
+                verdict: Verdict::DropFlow,
+            }];
+        }
+        let connection = self
+            .http3_connections
+            .entry(input.scope)
+            .or_insert_with(|| Http3Connection {
+                analyzer: Http3Conversation::default(),
+                seen: now,
+            });
+        connection.seen = now;
+        let events = connection
+            .analyzer
+            .feed_events(input.stream_id, input.reverse, input.bytes);
+        let mut decisions = Vec::new();
+        for event in events {
+            let key = (input.scope, event.stream_id);
+            if !self.http3_flows.contains_key(&key) && self.active_count() >= self.limits.max_flows
+            {
+                decisions.push(DecodedVerdict {
+                    stream_id: event.stream_id,
+                    verdict: Verdict::DropFlow,
+                });
+                continue;
+            }
+            let flow = self.http3_flows.entry(key).or_insert_with(|| Http3Flow {
+                origin: input.origin,
+                target: input.target,
+                facts: HashMap::new(),
+                allowed: false,
+                blocked: false,
+                seen: now,
+            });
+            flow.seen = now;
+            if !flow.blocked && !flow.allowed {
+                let mut updated = Vec::new();
+                for field in event.batch.clear_fields {
+                    flow.facts.remove(field);
+                }
+                store_observations(&mut flow.facts, event.batch.context, &mut Vec::new());
+                store_observations(&mut flow.facts, event.batch.observations, &mut updated);
+                let (source, destination) = if event.reverse {
+                    (flow.target, flow.origin)
+                } else {
+                    (flow.origin, flow.target)
+                };
+                let context = FlowContext {
+                    protocol: Protocol::Udp,
+                    scope: input.scope,
+                    source,
+                    destination,
+                    origin: flow.origin,
+                    target: flow.target,
+                    reverse: event.reverse,
+                    payload: &[],
+                    facts: &flow.facts,
+                    updated: &updated,
+                };
+                for rule in &self.udp_rules {
+                    let Some(action) = (rule.matches)(&context) else {
+                        continue;
+                    };
+                    match action {
+                        FlowAction::Allow => flow.allowed = true,
+                        FlowAction::Block | FlowAction::DropPacket => flow.blocked = true,
+                        FlowAction::ReplaceUdpPayload(_) => continue,
+                    }
+                    break;
+                }
+            }
+            decisions.push(DecodedVerdict {
+                stream_id: event.stream_id,
+                verdict: if flow.blocked {
+                    Verdict::DropFlow
+                } else {
+                    Verdict::Accept
+                },
+            });
+        }
+        if decisions.is_empty()
+            && self
+                .http3_flows
+                .get(&(input.scope, input.stream_id))
+                .is_some_and(|flow| flow.blocked)
+        {
+            decisions.push(DecodedVerdict {
+                stream_id: input.stream_id,
+                verdict: Verdict::DropFlow,
+            });
+        }
+        decisions
+    }
+
+    pub fn close_http3_stream(&mut self, scope: FlowScope, stream_id: u64) {
+        self.http3_flows.remove(&(scope, stream_id));
+        if let Some(connection) = self.http3_connections.get_mut(&scope) {
+            connection.analyzer.close_stream(stream_id);
+        }
+    }
+
+    pub fn close_http3_connection(&mut self, scope: FlowScope) {
+        self.http3_connections.remove(&scope);
+        self.http3_flows
+            .retain(|(item_scope, _), _| *item_scope != scope);
     }
 
     fn inspect_udp(&mut self, packet: Packet<'_>, transport: &packet::Transport<'_>) -> Decision {
@@ -885,14 +1036,9 @@ impl<P> Inspect<P> {
         {
             return Verdict::Accept.into();
         }
-        if !self.udp_flows.contains_key(&key)
-            && self.flows.len() + self.udp_flows.len() + self.decoded_flows.len()
-                >= self.limits.max_flows
-        {
+        if !self.udp_flows.contains_key(&key) && self.active_count() >= self.limits.max_flows {
             self.compact_completed_flows();
-            if self.flows.len() + self.udp_flows.len() + self.decoded_flows.len()
-                >= self.limits.max_flows
-            {
+            if self.active_count() >= self.limits.max_flows {
                 return Verdict::Drop.into();
             }
         }
@@ -1085,14 +1231,9 @@ impl<P: Policy> Policy for Inspect<P> {
         {
             return transport_decision;
         }
-        if self.flows.len() + self.udp_flows.len() + self.decoded_flows.len()
-            >= self.limits.max_flows
-            && !self.flows.contains_key(&key)
-        {
+        if self.active_count() >= self.limits.max_flows && !self.flows.contains_key(&key) {
             self.compact_completed_flows();
-            if self.flows.len() + self.udp_flows.len() + self.decoded_flows.len()
-                >= self.limits.max_flows
-            {
+            if self.active_count() >= self.limits.max_flows {
                 // Active inspection cannot be silently bypassed at capacity.
                 return Verdict::Drop.into();
             }
@@ -1177,6 +1318,121 @@ impl<P: Policy> Policy for Inspect<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http3_rules_evaluate_the_matching_request_stream() {
+        use compcol::{hpack::HeaderField, qpack::QpackEncoder};
+
+        let mut inspect = Inspect::with_analyzers((), Vec::new()).with_udp_streams(
+            Vec::new(),
+            vec![FlowRule::new(|context| {
+                (context.updated("http3.status")
+                    && context.get("http3.status") == Some("404")
+                    && context.get("http3.path") == Some("/two"))
+                .then_some(FlowAction::Block)
+            })],
+        );
+        let mut encoder = QpackEncoder::new();
+        let origin = "192.0.2.1:12345".parse().unwrap();
+        let target = "198.51.100.2:443".parse().unwrap();
+        let feed = |inspect: &mut Inspect<()>, stream_id, reverse, bytes: &[u8]| {
+            inspect.feed_http3(DecodedStream {
+                scope: FlowScope(91),
+                stream_id,
+                origin,
+                target,
+                reverse,
+                bytes,
+            })
+        };
+        for (stream_id, path) in [(0, "/one"), (4, "/two")] {
+            let block = encoder.encode_field_section(&[
+                HeaderField::new(b":method", b"GET"),
+                HeaderField::new(b":path", path.as_bytes()),
+            ]);
+            let mut frame = vec![1, block.len() as u8];
+            frame.extend(block);
+            assert_eq!(
+                feed(&mut inspect, stream_id, false, &frame),
+                vec![DecodedVerdict {
+                    stream_id,
+                    verdict: Verdict::Accept,
+                }]
+            );
+        }
+        let block = encoder.encode_field_section(&[HeaderField::new(b":status", b"404")]);
+        let mut frame = vec![1, block.len() as u8];
+        frame.extend(block);
+        assert_eq!(
+            feed(&mut inspect, 0, true, &frame),
+            vec![DecodedVerdict {
+                stream_id: 0,
+                verdict: Verdict::Accept,
+            }]
+        );
+        assert_eq!(
+            feed(&mut inspect, 4, true, &frame),
+            vec![DecodedVerdict {
+                stream_id: 4,
+                verdict: Verdict::DropFlow,
+            }]
+        );
+        assert_eq!(
+            feed(&mut inspect, 4, true, &[0, 1, b'x']),
+            vec![DecodedVerdict {
+                stream_id: 4,
+                verdict: Verdict::DropFlow,
+            }]
+        );
+        inspect.close_http3_stream(FlowScope(91), 4);
+        inspect.close_http3_connection(FlowScope(91));
+        assert!(inspect.http3_flows.is_empty());
+        assert!(inspect.http3_connections.is_empty());
+    }
+
+    #[test]
+    fn http3_qpack_update_reports_the_unblocked_request_stream() {
+        use compcol::{hpack::HeaderField, qpack::QpackEncoder};
+
+        let mut inspect = Inspect::with_analyzers((), Vec::new()).with_udp_streams(
+            Vec::new(),
+            vec![FlowRule::new(|context| {
+                (context.updated("http3.authority")
+                    && context.get("http3.authority") == Some("blocked.test"))
+                .then_some(FlowAction::Block)
+            })],
+        );
+        let mut encoder = QpackEncoder::with_dynamic_table(512);
+        let encoded = encoder.encode(&[
+            HeaderField::new(b":method", b"GET"),
+            HeaderField::new(b":authority", b"blocked.test"),
+        ]);
+        assert!(!encoded.encoder_stream.is_empty());
+        let origin = "192.0.2.1:12345".parse().unwrap();
+        let target = "198.51.100.2:443".parse().unwrap();
+        let feed = |inspect: &mut Inspect<()>, stream_id, bytes: &[u8]| {
+            inspect.feed_http3(DecodedStream {
+                scope: FlowScope(92),
+                stream_id,
+                origin,
+                target,
+                reverse: false,
+                bytes,
+            })
+        };
+        let mut request = vec![1, encoded.field_section.len() as u8];
+        request.extend(encoded.field_section);
+        assert!(feed(&mut inspect, 0, &request).is_empty());
+        let mut updates = vec![2];
+        updates.extend(encoded.encoder_stream);
+        assert_eq!(
+            feed(&mut inspect, 2, &updates),
+            vec![DecodedVerdict {
+                stream_id: 0,
+                verdict: Verdict::DropFlow,
+            }]
+        );
+    }
 
     fn request_batch(observations: Vec<Observation>, finished: bool) -> Analysis {
         Analysis::Batches {

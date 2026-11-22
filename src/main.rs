@@ -17,6 +17,7 @@ type Error = Box<dyn std::error::Error>;
 fn observation_field_possible(field: &str, protocol: Protocol) -> bool {
     if rustgfw_core::wireguard::FIELDS.contains(&field)
         || rustgfw_core::quic::FIELDS.contains(&field)
+        || rustgfw_core::http3::FIELDS.contains(&field)
     {
         protocol == Protocol::Udp
     } else if rustgfw_core::openvpn::FIELDS.contains(&field) {

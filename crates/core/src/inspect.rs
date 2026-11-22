@@ -128,6 +128,40 @@ impl UdpFlow {
     }
 }
 impl Flow {
+    fn new(
+        origin: SocketAddr,
+        target: SocketAddr,
+        initial_syn: Option<(usize, u32)>,
+        analyzers: &[AnalyzerRule],
+        bidirectional: &[BidirectionalAnalyzerRule],
+        reorder_bytes: usize,
+        now: Instant,
+    ) -> Self {
+        let port_matches =
+            |port: Option<u16>| port.is_none_or(|p| origin.port() == p || target.port() == p);
+        Self {
+            directions: std::array::from_fn(|_| Direction {
+                reassembly: Reassembler::new(reorder_bytes),
+                analyzers: analyzers
+                    .iter()
+                    .map(|rule| port_matches(rule.port).then(|| (rule.factory)()))
+                    .collect(),
+            }),
+            origin,
+            target,
+            bidirectional: bidirectional
+                .iter()
+                .map(|rule| port_matches(rule.port).then(|| (rule.factory)()))
+                .collect(),
+            facts: HashMap::new(),
+            allowed: false,
+            blocked: false,
+            seen: now,
+            initial_syn,
+            fin_seen: [false; 2],
+        }
+    }
+
     fn finished(&self, has_rules: bool) -> bool {
         !has_rules
             && !self.blocked
@@ -140,6 +174,19 @@ impl Flow {
     }
 }
 type Key = (FlowScope, SocketAddr, SocketAddr);
+type DecodedKey = (FlowScope, u64);
+
+/// Bytes already decoded from a transport or proxy connection.
+/// `scope` identifies the outer connection and `stream_id` identifies one
+/// logical stream within it. The caller supplies bytes in order per direction.
+pub struct DecodedStream<'a> {
+    pub scope: FlowScope,
+    pub stream_id: u64,
+    pub origin: SocketAddr,
+    pub target: SocketAddr,
+    pub reverse: bool,
+    pub bytes: &'a [u8],
+}
 
 pub struct AnalyzerRule {
     pub port: Option<u16>,
@@ -210,6 +257,147 @@ fn match_tcp_observations(
         store_observations(facts, observations, updated);
     }
     blocked
+}
+
+fn collect_tcp_analysis(
+    analysis: Analysis,
+    matcher: &dyn Fn(&Observation) -> bool,
+    facts: &mut HashMap<&'static str, Vec<String>>,
+    blocked: &mut bool,
+    updated: &mut Vec<&'static str>,
+    batches: &mut Vec<ObservationBatch>,
+    has_rules: bool,
+) -> bool {
+    match analysis {
+        Analysis::Finished => true,
+        Analysis::Observations(observations) => {
+            *blocked |= match_tcp_observations(facts, observations, matcher, has_rules, updated);
+            false
+        }
+        Analysis::FinalObservations(observations) => {
+            *blocked |= match_tcp_observations(facts, observations, matcher, has_rules, updated);
+            true
+        }
+        Analysis::Batches {
+            batches: messages,
+            finished,
+        } => {
+            *blocked |= messages
+                .iter()
+                .any(|message| message.observations.iter().any(matcher));
+            if has_rules {
+                batches.extend(messages);
+            }
+            finished
+        }
+        Analysis::Pending => false,
+    }
+}
+
+#[derive(Default)]
+struct TcpAnalysis {
+    updated: Vec<&'static str>,
+    batches: Vec<ObservationBatch>,
+}
+
+struct TcpEvent<'a> {
+    scope: FlowScope,
+    source: SocketAddr,
+    destination: SocketAddr,
+    payload: &'a [u8],
+}
+
+fn analyze_tcp_bytes(
+    flow: &mut Flow,
+    bytes: &[u8],
+    direction: usize,
+    reverse: bool,
+    analyzers: &[AnalyzerRule],
+    bidirectional: &[BidirectionalAnalyzerRule],
+    has_rules: bool,
+) -> TcpAnalysis {
+    let mut output = TcpAnalysis::default();
+    for (slot, rule) in flow.directions[direction]
+        .analyzers
+        .iter_mut()
+        .zip(analyzers)
+    {
+        let Some(analyzer) = slot else {
+            continue;
+        };
+        if collect_tcp_analysis(
+            analyzer.feed(bytes),
+            rule.matches.as_ref(),
+            &mut flow.facts,
+            &mut flow.blocked,
+            &mut output.updated,
+            &mut output.batches,
+            has_rules,
+        ) {
+            *slot = None;
+        }
+    }
+    for (slot, rule) in flow.bidirectional.iter_mut().zip(bidirectional) {
+        let Some(analyzer) = slot else {
+            continue;
+        };
+        if collect_tcp_analysis(
+            analyzer.feed(bytes, reverse),
+            rule.matches.as_ref(),
+            &mut flow.facts,
+            &mut flow.blocked,
+            &mut output.updated,
+            &mut output.batches,
+            has_rules,
+        ) {
+            *slot = None;
+        }
+    }
+    output
+}
+
+fn evaluate_tcp_batches(
+    flow: &mut Flow,
+    rules: &[FlowRule],
+    event: TcpEvent<'_>,
+    analysis: TcpAnalysis,
+) {
+    if flow.blocked || flow.allowed || rules.is_empty() {
+        return;
+    }
+    if analysis.batches.is_empty() {
+        apply_tcp_flow_rules(
+            flow,
+            rules,
+            event.scope,
+            event.source,
+            event.destination,
+            event.payload,
+            &analysis.updated,
+        );
+        return;
+    }
+    for batch in analysis.batches {
+        let mut batch_updated = analysis.updated.clone();
+        for field in batch.clear_fields {
+            flow.facts.remove(field);
+            batch_updated.retain(|item| item != field);
+        }
+        store_observations(&mut flow.facts, batch.context, &mut Vec::new());
+        store_observations(&mut flow.facts, batch.observations, &mut batch_updated);
+        apply_tcp_flow_rules(
+            flow,
+            rules,
+            event.scope,
+            event.source,
+            event.destination,
+            event.payload,
+            &batch_updated,
+        );
+        if flow.allowed || flow.blocked {
+            break;
+        }
+    }
 }
 
 fn apply_tcp_flow_rules(
@@ -444,6 +632,7 @@ pub struct Inspect<P> {
     udp_analyzers: Vec<UdpStreamRule>,
     udp_rules: Vec<FlowRule>,
     flows: HashMap<Key, Flow>,
+    decoded_flows: HashMap<DecodedKey, Flow>,
     udp_flows: HashMap<Key, UdpFlow>,
     completed_since_compaction: bool,
     sweep: Instant,
@@ -480,6 +669,7 @@ impl<P> Inspect<P> {
             udp_analyzers: Vec::new(),
             udp_rules: Vec::new(),
             flows: HashMap::new(),
+            decoded_flows: HashMap::new(),
             udp_flows: HashMap::new(),
             completed_since_compaction: false,
             sweep: Instant::now(),
@@ -488,6 +678,7 @@ impl<P> Inspect<P> {
     }
     pub fn clear_flows(&mut self) {
         self.flows.clear();
+        self.decoded_flows.clear();
         self.udp_flows.clear();
         self.completed_since_compaction = false;
     }
@@ -518,6 +709,8 @@ impl<P> Inspect<P> {
         if now >= self.sweep {
             self.flows
                 .retain(|_, flow| now.duration_since(flow.seen) < self.limits.idle);
+            self.decoded_flows
+                .retain(|_, flow| now.duration_since(flow.seen) < self.limits.idle);
             self.udp_flows
                 .retain(|_, flow| now.duration_since(flow.seen) < self.limits.idle);
             self.sweep = now + Duration::from_secs(1);
@@ -533,6 +726,102 @@ impl<P> Inspect<P> {
                 .retain(|_, flow| !flow.finished(udp_has_rules));
             self.completed_since_compaction = false;
         }
+    }
+
+    /// Inspect ordered bytes supplied by a decoder outside the packet I/O path.
+    /// The verdict applies to this logical stream; the caller decides how to
+    /// enforce it. Call `close_decoded` when the stream ends.
+    pub fn feed_decoded(&mut self, input: DecodedStream<'_>) -> Verdict {
+        if self.analyzers.is_empty()
+            && self.bidirectional_analyzers.is_empty()
+            && self.flow_rules.is_empty()
+        {
+            return Verdict::Accept;
+        }
+        let now = Instant::now();
+        self.expire_idle_flows(now);
+        let key = (input.scope, input.stream_id);
+        if !self.decoded_flows.contains_key(&key)
+            && !self
+                .flow_rules
+                .iter()
+                .any(|rule| rule.might_match(Protocol::Tcp, input.origin, input.target))
+            && !self.analyzers.iter().any(|rule| {
+                rule.port
+                    .is_none_or(|p| input.origin.port() == p || input.target.port() == p)
+            })
+            && !self.bidirectional_analyzers.iter().any(|rule| {
+                rule.port
+                    .is_none_or(|p| input.origin.port() == p || input.target.port() == p)
+            })
+        {
+            return Verdict::Accept;
+        }
+        if !self.decoded_flows.contains_key(&key)
+            && self.flows.len() + self.udp_flows.len() + self.decoded_flows.len()
+                >= self.limits.max_flows
+        {
+            self.compact_completed_flows();
+            if self.flows.len() + self.udp_flows.len() + self.decoded_flows.len()
+                >= self.limits.max_flows
+            {
+                return Verdict::DropFlow;
+            }
+        }
+        let flow = self.decoded_flows.entry(key).or_insert_with(|| {
+            Flow::new(
+                input.origin,
+                input.target,
+                None,
+                &self.analyzers,
+                &self.bidirectional_analyzers,
+                self.limits.reorder_bytes,
+                now,
+            )
+        });
+        flow.seen = now;
+        if flow.blocked {
+            return Verdict::DropFlow;
+        }
+        let (source, destination) = if input.reverse {
+            (flow.target, flow.origin)
+        } else {
+            (flow.origin, flow.target)
+        };
+        let analysis = if !flow.allowed {
+            analyze_tcp_bytes(
+                flow,
+                input.bytes,
+                usize::from(input.reverse),
+                input.reverse,
+                &self.analyzers,
+                &self.bidirectional_analyzers,
+                !self.flow_rules.is_empty(),
+            )
+        } else {
+            TcpAnalysis::default()
+        };
+        evaluate_tcp_batches(
+            flow,
+            &self.flow_rules,
+            TcpEvent {
+                scope: input.scope,
+                source,
+                destination,
+                payload: input.bytes,
+            },
+            analysis,
+        );
+        if flow.blocked {
+            Verdict::DropFlow
+        } else {
+            Verdict::Accept
+        }
+    }
+
+    /// Release all analyzers and facts for one decoded logical stream.
+    pub fn close_decoded(&mut self, scope: FlowScope, stream_id: u64) {
+        self.decoded_flows.remove(&(scope, stream_id));
     }
 
     fn inspect_udp(&mut self, packet: Packet<'_>, transport: &packet::Transport<'_>) -> Decision {
@@ -597,10 +886,13 @@ impl<P> Inspect<P> {
             return Verdict::Accept.into();
         }
         if !self.udp_flows.contains_key(&key)
-            && self.flows.len() + self.udp_flows.len() >= self.limits.max_flows
+            && self.flows.len() + self.udp_flows.len() + self.decoded_flows.len()
+                >= self.limits.max_flows
         {
             self.compact_completed_flows();
-            if self.flows.len() + self.udp_flows.len() >= self.limits.max_flows {
+            if self.flows.len() + self.udp_flows.len() + self.decoded_flows.len()
+                >= self.limits.max_flows
+            {
                 return Verdict::Drop.into();
             }
         }
@@ -793,190 +1085,73 @@ impl<P: Policy> Policy for Inspect<P> {
         {
             return transport_decision;
         }
-        if self.flows.len() + self.udp_flows.len() >= self.limits.max_flows
+        if self.flows.len() + self.udp_flows.len() + self.decoded_flows.len()
+            >= self.limits.max_flows
             && !self.flows.contains_key(&key)
         {
             self.compact_completed_flows();
-            if self.flows.len() + self.udp_flows.len() >= self.limits.max_flows {
+            if self.flows.len() + self.udp_flows.len() + self.decoded_flows.len()
+                >= self.limits.max_flows
+            {
                 // Active inspection cannot be silently bypassed at capacity.
                 return Verdict::Drop.into();
             }
         }
-        let flow = self.flows.entry(key).or_insert_with(|| Flow {
-            directions: std::array::from_fn(|_| Direction {
-                reassembly: Reassembler::new(self.limits.reorder_bytes),
-                analyzers: self
-                    .analyzers
-                    .iter()
-                    .map(|a| {
-                        a.port
-                            .is_none_or(|p| key.1.port() == p || key.2.port() == p)
-                            .then(|| (a.factory)())
-                    })
-                    .collect(),
-            }),
-            origin: t.source,
-            target: t.destination,
-            bidirectional: self
-                .bidirectional_analyzers
-                .iter()
-                .map(|a| {
-                    a.port
-                        .is_none_or(|p| key.1.port() == p || key.2.port() == p)
-                        .then(|| (a.factory)())
-                })
-                .collect(),
-            facts: HashMap::new(),
-            allowed: false,
-            blocked: false,
-            seen: now,
-            initial_syn,
-            fin_seen: [false; 2],
+        let flow = self.flows.entry(key).or_insert_with(|| {
+            Flow::new(
+                t.source,
+                t.destination,
+                initial_syn,
+                &self.analyzers,
+                &self.bidirectional_analyzers,
+                self.limits.reorder_bytes,
+                now,
+            )
         });
         flow.seen = now;
         if flow.blocked {
             return Verdict::DropFlow.into();
         }
-        let mut updated = Vec::new();
-        let mut batches = Vec::new();
+        let mut analysis = TcpAnalysis::default();
         if !flow.allowed {
-            let d = &mut flow.directions[direction];
-            if d.analyzers.iter().any(Option::is_some)
-                || flow.bidirectional.iter().any(Option::is_some)
-            {
-                match d
-                    .reassembly
-                    .feed(t.tcp_sequence.unwrap(), t.tcp_flags & 2 != 0, t.payload)
-                {
+            let has_analyzers = flow.directions[direction]
+                .analyzers
+                .iter()
+                .any(Option::is_some)
+                || flow.bidirectional.iter().any(Option::is_some);
+            if has_analyzers {
+                match flow.directions[direction].reassembly.feed(
+                    t.tcp_sequence.unwrap(),
+                    t.tcp_flags & 2 != 0,
+                    t.payload,
+                ) {
                     Ok(bytes) => {
-                        for (slot, rule) in d.analyzers.iter_mut().zip(&self.analyzers) {
-                            let Some(analyzer) = slot else {
-                                continue;
-                            };
-                            match analyzer.feed(&bytes) {
-                                Analysis::Finished => *slot = None,
-                                Analysis::Observations(observations) => {
-                                    flow.blocked |= match_tcp_observations(
-                                        &mut flow.facts,
-                                        observations,
-                                        rule.matches.as_ref(),
-                                        !self.flow_rules.is_empty(),
-                                        &mut updated,
-                                    );
-                                }
-                                Analysis::FinalObservations(observations) => {
-                                    flow.blocked |= match_tcp_observations(
-                                        &mut flow.facts,
-                                        observations,
-                                        rule.matches.as_ref(),
-                                        !self.flow_rules.is_empty(),
-                                        &mut updated,
-                                    );
-                                    *slot = None;
-                                }
-                                Analysis::Batches {
-                                    batches: messages,
-                                    finished,
-                                } => {
-                                    flow.blocked |= messages.iter().any(|message| {
-                                        message.observations.iter().any(rule.matches.as_ref())
-                                    });
-                                    if !self.flow_rules.is_empty() {
-                                        batches.extend(messages);
-                                    }
-                                    if finished {
-                                        *slot = None;
-                                    }
-                                }
-                                Analysis::Pending => {}
-                            }
-                        }
-                        for (slot, rule) in flow
-                            .bidirectional
-                            .iter_mut()
-                            .zip(&self.bidirectional_analyzers)
-                        {
-                            let Some(analyzer) = slot else {
-                                continue;
-                            };
-                            match analyzer.feed(&bytes, t.source != flow.origin) {
-                                Analysis::Finished => *slot = None,
-                                Analysis::Observations(observations) => {
-                                    flow.blocked |= match_tcp_observations(
-                                        &mut flow.facts,
-                                        observations,
-                                        rule.matches.as_ref(),
-                                        !self.flow_rules.is_empty(),
-                                        &mut updated,
-                                    );
-                                }
-                                Analysis::FinalObservations(observations) => {
-                                    flow.blocked |= match_tcp_observations(
-                                        &mut flow.facts,
-                                        observations,
-                                        rule.matches.as_ref(),
-                                        !self.flow_rules.is_empty(),
-                                        &mut updated,
-                                    );
-                                    *slot = None;
-                                }
-                                Analysis::Batches {
-                                    batches: messages,
-                                    finished,
-                                } => {
-                                    flow.blocked |= messages.iter().any(|message| {
-                                        message.observations.iter().any(rule.matches.as_ref())
-                                    });
-                                    if !self.flow_rules.is_empty() {
-                                        batches.extend(messages);
-                                    }
-                                    if finished {
-                                        *slot = None;
-                                    }
-                                }
-                                Analysis::Pending => {}
-                            }
-                        }
+                        let reverse = t.source != flow.origin;
+                        analysis = analyze_tcp_bytes(
+                            flow,
+                            &bytes,
+                            direction,
+                            reverse,
+                            &self.analyzers,
+                            &self.bidirectional_analyzers,
+                            !self.flow_rules.is_empty(),
+                        );
                     }
                     Err(_) => flow.blocked = true,
                 }
             }
         }
-        if !flow.blocked && !flow.allowed && !self.flow_rules.is_empty() {
-            if batches.is_empty() {
-                apply_tcp_flow_rules(
-                    flow,
-                    &self.flow_rules,
-                    packet.scope,
-                    t.source,
-                    t.destination,
-                    t.payload,
-                    &updated,
-                );
-            } else {
-                for batch in batches {
-                    let mut batch_updated = updated.clone();
-                    for field in batch.clear_fields {
-                        flow.facts.remove(field);
-                        batch_updated.retain(|item| item != field);
-                    }
-                    store_observations(&mut flow.facts, batch.context, &mut Vec::new());
-                    store_observations(&mut flow.facts, batch.observations, &mut batch_updated);
-                    apply_tcp_flow_rules(
-                        flow,
-                        &self.flow_rules,
-                        packet.scope,
-                        t.source,
-                        t.destination,
-                        t.payload,
-                        &batch_updated,
-                    );
-                    if flow.allowed || flow.blocked {
-                        break;
-                    }
-                }
-            }
-        }
+        evaluate_tcp_batches(
+            flow,
+            &self.flow_rules,
+            TcpEvent {
+                scope: packet.scope,
+                source: t.source,
+                destination: t.destination,
+                payload: t.payload,
+            },
+            analysis,
+        );
         let result = if flow.blocked {
             Verdict::DropFlow
         } else {
@@ -2517,6 +2692,152 @@ mod tests {
                 b"GET / HTTP/1.1\r\nHost: blocked.test\r\n\r\n",
                 false
             ),
+            Verdict::DropFlow
+        );
+    }
+
+    #[test]
+    fn decoded_streams_share_rules_but_keep_independent_context() {
+        fn feed(
+            policy: &mut Inspect<crate::ConstantPolicy>,
+            scope: u128,
+            stream_id: u64,
+            reverse: bool,
+            bytes: &[u8],
+        ) -> Verdict {
+            policy.feed_decoded(DecodedStream {
+                scope: FlowScope(scope),
+                stream_id,
+                origin: "192.0.2.1:12345".parse().unwrap(),
+                target: "198.51.100.2:443".parse().unwrap(),
+                reverse,
+                bytes,
+            })
+        }
+        let mut policy =
+            Inspect::with_analyzers(crate::ConstantPolicy(Verdict::Accept), Vec::new())
+                .with_bidirectional_analyzers(vec![BidirectionalAnalyzerRule::observing(
+                    None,
+                    || Box::<crate::http::HttpConversation>::default(),
+                )])
+                .with_flow_rules(vec![FlowRule::new(|context| {
+                    (context.updated("http.status")
+                        && context.get("http.status") == Some("403")
+                        && context.get("http.host") == Some("blocked.test"))
+                    .then_some(FlowAction::Block)
+                })]);
+
+        assert_eq!(
+            feed(&mut policy, 11, 7, false, b"GET / HTTP/1.1\r\nHost: block"),
+            Verdict::Accept
+        );
+        assert_eq!(
+            feed(&mut policy, 11, 7, false, b"ed.test\r\n\r\n"),
+            Verdict::Accept
+        );
+        assert_eq!(
+            feed(
+                &mut policy,
+                11,
+                8,
+                false,
+                b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n"
+            ),
+            Verdict::Accept
+        );
+        assert_eq!(
+            feed(&mut policy, 11, 8, true, b"HTTP/1.1 403 Forbidden\r\n\r\n"),
+            Verdict::Accept
+        );
+        assert_eq!(
+            feed(&mut policy, 11, 7, true, b"HTTP/1.1 403 Forbidden\r\n\r\n"),
+            Verdict::DropFlow
+        );
+        assert_eq!(feed(&mut policy, 11, 7, true, b"again"), Verdict::DropFlow);
+
+        policy.close_decoded(FlowScope(11), 7);
+        assert_eq!(
+            feed(
+                &mut policy,
+                11,
+                7,
+                false,
+                b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n"
+            ),
+            Verdict::Accept
+        );
+        assert_eq!(
+            feed(&mut policy, 11, 7, true, b"HTTP/1.1 403 Forbidden\r\n\r\n"),
+            Verdict::Accept
+        );
+        assert_eq!(
+            feed(
+                &mut policy,
+                12,
+                7,
+                false,
+                b"GET / HTTP/1.1\r\nHost: blocked.test\r\n\r\n"
+            ),
+            Verdict::Accept
+        );
+        assert_eq!(policy.decoded_flows.len(), 3);
+    }
+
+    #[test]
+    fn decoded_input_can_inspect_h2mux_substream_destination() {
+        fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+            let mut bytes = vec![0, 0, payload.len() as u8, kind, flags];
+            bytes.extend(stream.to_be_bytes());
+            bytes.extend(payload);
+            bytes
+        }
+        let mut policy =
+            Inspect::with_analyzers(crate::ConstantPolicy(Verdict::Accept), Vec::new())
+                .with_bidirectional_analyzers(vec![BidirectionalAnalyzerRule::observing(
+                    None,
+                    || Box::<crate::sing_mux::SingMuxH2>::default(),
+                )])
+                .with_flow_rules(vec![FlowRule::new(|context| {
+                    (context.updated("sing_mux.host")
+                        && context.get("sing_mux.protocol") == Some("h2mux")
+                        && context.get("sing_mux.host") == Some("example.org")
+                        && context.get("http2.method") == Some("CONNECT"))
+                    .then_some(FlowAction::Block)
+                })]);
+        let origin = "192.0.2.1:12345".parse().unwrap();
+        let target = "198.51.100.2:443".parse().unwrap();
+        let mut carrier = b"\x00\x02PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        carrier.extend(frame(4, 0, 0, &[]));
+        let mut headers = vec![0x02, 7];
+        headers.extend(b"CONNECT");
+        headers.extend([0x01, 9]);
+        headers.extend(b"localhost");
+        carrier.extend(frame(1, 4, 1, &headers));
+        assert_eq!(
+            policy.feed_decoded(DecodedStream {
+                scope: FlowScope(44),
+                stream_id: 1,
+                origin,
+                target,
+                reverse: false,
+                bytes: &carrier,
+            }),
+            Verdict::Accept
+        );
+
+        let mut request = vec![0, 0, 3, 11];
+        request.extend(b"example.org");
+        request.extend(443u16.to_be_bytes());
+        let data = frame(0, 0, 1, &request);
+        assert_eq!(
+            policy.feed_decoded(DecodedStream {
+                scope: FlowScope(44),
+                stream_id: 1,
+                origin,
+                target,
+                reverse: false,
+                bytes: &data,
+            }),
             Verdict::DropFlow
         );
     }

@@ -180,6 +180,38 @@ pub(crate) struct ClientHelloMetadata {
     pub supported_versions: Vec<u16>,
     pub ech_extension: bool,
     pub quic_transport_parameters: bool,
+    pub quic_datagram_max_size: Option<u64>,
+}
+
+fn quic_varint(cursor: &mut Cursor<'_>) -> Option<u64> {
+    let first = cursor.byte()? as u8;
+    let width = 1usize << (first >> 6);
+    let mut value = u64::from(first & 0x3f);
+    for &byte in cursor.take(width - 1)? {
+        value = value << 8 | u64::from(byte);
+    }
+    Some(value)
+}
+
+fn quic_datagram_max_size(bytes: &[u8]) -> Option<Option<u64>> {
+    let mut parameters = Cursor(bytes);
+    let mut max_size = None;
+    while !parameters.0.is_empty() {
+        let id = quic_varint(&mut parameters)?;
+        let length = usize::try_from(quic_varint(&mut parameters)?).ok()?;
+        let value = parameters.take(length)?;
+        if id == 0x20 {
+            if max_size.is_some() {
+                return None;
+            }
+            let mut value = Cursor(value);
+            max_size = Some(quic_varint(&mut value)?);
+            if !value.0.is_empty() {
+                return None;
+            }
+        }
+    }
+    Some(max_size)
 }
 
 pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> {
@@ -210,6 +242,7 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
     let mut seen_versions = false;
     let mut ech_extension = false;
     let mut quic_transport_parameters = false;
+    let mut quic_datagram_size = None;
     while !extensions.0.is_empty() {
         let kind = extensions.word()?;
         let data = extensions.vector()?;
@@ -271,7 +304,13 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
                 }
             }
             0xfe0d => ech_extension = true,
-            0x0039 => quic_transport_parameters = true,
+            0x0039 => {
+                if quic_transport_parameters {
+                    return None;
+                }
+                quic_transport_parameters = true;
+                quic_datagram_size = quic_datagram_max_size(data)?;
+            }
             _ => {}
         }
     }
@@ -281,6 +320,7 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
         supported_versions,
         ech_extension,
         quic_transport_parameters,
+        quic_datagram_max_size: quic_datagram_size,
     })
 }
 
@@ -545,6 +585,25 @@ mod tests {
         assert_eq!(
             TlsHello::default().feed(&record(&malformed)),
             Analysis::Finished
+        );
+    }
+
+    #[test]
+    fn quic_datagram_parameter_requires_one_complete_varint() {
+        assert_eq!(
+            quic_datagram_max_size(&[0x0f, 0, 0x20, 2, 0x45, 0xb0]),
+            Some(Some(1456))
+        );
+        assert_eq!(quic_datagram_max_size(&[0x0f, 0]), Some(None));
+        assert_eq!(quic_datagram_max_size(&[0x20, 1, 0]), Some(Some(0)));
+        assert_eq!(
+            quic_datagram_max_size(&[0x20, 4, 0x80, 0, 0xff, 0xff]),
+            Some(Some(65535))
+        );
+        assert_eq!(quic_datagram_max_size(&[0x20, 2, 0x45]), None);
+        assert_eq!(
+            quic_datagram_max_size(&[0x20, 2, 0x45, 0xb0, 0x20, 1, 0]),
+            None
         );
     }
     #[test]

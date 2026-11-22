@@ -165,6 +165,11 @@ mod tests {
         )
         .unwrap();
         assert!(presence[0].condition.references_field("wireguard.type"));
+        let quic = compile(
+            r#"{"rules":[{"name":"datagram","expr":"fresh.quic.alpn == h3 && quic.datagram_max_size > 0","action":"drop_packet"}]}"#,
+        )
+        .unwrap();
+        assert!(quic[0].condition.references_field("quic.datagram_max_size"));
         assert!(
             compile(r#"{"rules":[{"name":"bad","expr":"unknown.field exists","action":"block"}]}"#)
                 .unwrap_err()

@@ -15,6 +15,7 @@ pub const FIELDS: &[&str] = &[
     "quic.tls_supported_version",
     "quic.ech_extension",
     "quic.transport_parameters",
+    "quic.datagram_max_size",
 ];
 const V1: u32 = 1;
 const V2: u32 = 0x6b33_43cf;
@@ -406,6 +407,12 @@ impl UdpStreamAnalyzer for QuicInitial {
                 field: "quic.transport_parameters",
                 value: hello.quic_transport_parameters.to_string(),
             });
+            if let Some(value) = hello.quic_datagram_max_size {
+                observations.push(Observation {
+                    field: "quic.datagram_max_size",
+                    value: value.to_string(),
+                });
+            }
         }
         UdpStreamAnalysis::FinalObservations(observations)
     }
@@ -446,7 +453,7 @@ mod tests {
         extension.extend(vector(&[4, 3, 4, 3, 3]));
         extension.extend([0xfe, 0x0d, 0, 1, 0]);
         if with_transport_parameters {
-            extension.extend([0, 0x39, 0, 2, 0x0f, 0]);
+            extension.extend([0, 0x39, 0, 6, 0x0f, 0, 0x20, 2, 0x45, 0xb0]);
         }
         let mut body = vec![3, 3];
         body.extend([0; 32]);
@@ -558,6 +565,7 @@ mod tests {
             assert_eq!(field(&result, "quic.tls_supported_version"), Some("0x0304"));
             assert_eq!(field(&result, "quic.ech_extension"), Some("true"));
             assert_eq!(field(&result, "quic.transport_parameters"), Some("true"));
+            assert_eq!(field(&result, "quic.datagram_max_size"), Some("1456"));
             if let UdpStreamAnalysis::FinalObservations(values) = &result {
                 assert!(
                     values
@@ -590,6 +598,7 @@ mod tests {
         let result = QuicInitial::default().feed(&initial(V1, 0, 0, &hello), false);
         assert_eq!(field(&result, "quic.alpn"), Some("h3"));
         assert_eq!(field(&result, "quic.transport_parameters"), Some("false"));
+        assert_eq!(field(&result, "quic.datagram_max_size"), None);
     }
 
     #[test]

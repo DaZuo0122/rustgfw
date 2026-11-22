@@ -41,7 +41,7 @@ FET：表达式引用 `fet.*` 字段时按需分析首方向首次交付的 TCP 
 
 Trojan：表达式引用 `trojan.*` 字段时按需启用双向 TCP 长度序列分析器。它从客户端兼容性 ChangeCipherSpec 开始累计前四段交替方向的字节数，报告序列和统计候选标记；树模型移植自 OpenGFW，单独附带 MPL-2.0 许可。特征依赖交付分段及换向时机，不验证加密内层协议；规则可将候选标记与 TLS、FET 或端点信息组合。
 
-QUIC：表达式引用 `quic.*` 字段时按需启用双向 UDP 流分析器，不限定端口。它用 v1/v2 Initial 公开密钥派生和 `ring` 的首部保护、AEAD 接口验证客户端 Initial，把 CRYPTO 帧按偏移重组后复用 TLS ClientHello 的 SNI、ALPN、版本列表和 ECH 扩展标记解析。首个通过认证的客户端连接 ID 决定流内分析对象，其他连接的 Initial 不会覆盖已收集片段；完整 ClientHello 后结束分析。RFC 密钥向量、自构造加密包及 OpenGFW 只读抓包样本已在本地测试；Linux 后端只需转交 UDP 数据报，无协议专用 I/O 逻辑。
+QUIC：表达式引用 `quic.*` 字段时按需启用双向 UDP 流分析器，不限定端口。它用 v1/v2 Initial 公开密钥派生和 `ring` 的首部保护、AEAD 接口检查客户端 Initial，把 CRYPTO 帧按偏移重组后复用 TLS ClientHello 的 SNI、ALPN、版本列表、ECH 扩展标记和 DATAGRAM 接收上限解析。首个能解开的客户端连接 ID 决定流内分析对象，其他连接的 Initial 不会覆盖已收集片段；完整 ClientHello 后结束分析。Initial 的密钥公开，解密成功不认证客户端身份。RFC 密钥向量、自构造加密包及 OpenGFW 只读抓包样本已在本地测试；Linux 后端只需转交 UDP 数据报，无协议专用 I/O 逻辑。Hysteria2 的可见范围和论文见[研究记录](hysteria2-quic.md)。
 
 HTTP 通过 `BidirectionalAnalyzerRule` 注册，TLS/DNS TCP/SSH 通过 `AnalyzerRule` 注册，共享流表及每方向 TCP 重组。UDP DNS 通过 `DatagramRule` 注册，逐个数据报分析，不占用 TCP 流表；数据报规则可限制源端口、目的端口或任一端口，畸形结果可要求丢弃该包。WireGuard 和表达式 DNS UDP 通过 `UdpStreamRule` 注册，保留跨数据报的双向状态。分析器报告带字段名的观察值，由规则回调匹配；新增同类分析器无需修改引擎中的协议匹配分支。TCP 观察结果区分完成与可继续分析，TLS/SSH 报告后释放分析器，DNS TCP 与 HTTP/1 可在同一流内报告后续消息。HTTP/1 同包多消息以分批观察结果逐条求值；响应批次恢复对应请求字段作为上下文，不将其计为新观察值。带端口限制的 TCP 分析器只为匹配端口的连接建立检查状态，其他 TCP 连接不占用检查流表。任一分析器匹配即阻断，其他分析器不能撤销这一决定。相同初始 SYN 重传保持状态，新的初始序号触发端点复用重建；这是被动流识别，不是内核 TCP 状态机的等价实现。
 

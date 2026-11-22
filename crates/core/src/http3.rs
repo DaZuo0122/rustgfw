@@ -213,6 +213,22 @@ impl Http3Conversation {
     }
 
     fn headers(&mut self, stream_id: u64, reverse: bool, block: Vec<u8>) -> Vec<Http3Event> {
+        // QPACK can unblock a later section before an earlier one. Keep the
+        // HTTP message order within each QUIC stream.
+        if self
+            .blocked
+            .iter()
+            .any(|item| item.stream_id == stream_id && item.reverse == reverse)
+        {
+            if self.blocked.len() < MAX_BLOCKED {
+                self.blocked.push(Blocked {
+                    stream_id,
+                    reverse,
+                    block,
+                });
+            }
+            return Vec::new();
+        }
         let fields = match self.decoders[usize::from(reverse)].decode_field_section(&block) {
             Ok(fields) => fields,
             Err(_) => {
@@ -486,6 +502,41 @@ mod tests {
             Some("dynamic.test")
         );
         assert_eq!(value(&events[0].observations, "http3.stream_id"), Some("0"));
+    }
+
+    #[test]
+    fn qpack_unblocking_preserves_response_order_on_one_stream() {
+        let mut h3 = Http3Conversation::default();
+        let mut encoder = QpackEncoder::with_dynamic_table(512);
+        let interim = encoder.encode(&[
+            HeaderField::new(b":status", b"103"),
+            HeaderField::new(b"x-test", b"dynamic-value-long-enough-to-insert"),
+        ]);
+        assert!(!interim.encoder_stream.is_empty());
+        assert!(
+            h3.feed_events(4, true, &frame(1, &interim.field_section))
+                .is_empty()
+        );
+
+        let mut static_encoder = QpackEncoder::new();
+        let final_response =
+            static_encoder.encode_field_section(&[HeaderField::new(b":status", b"403")]);
+        assert!(
+            h3.feed_events(4, true, &frame(1, &final_response))
+                .is_empty()
+        );
+        let mut updates = vec![2];
+        updates.extend(interim.encoder_stream);
+        let events = h3.feed_events(3, true, &updates);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            value(&events[0].batch.observations, "http3.status"),
+            Some("103")
+        );
+        assert_eq!(
+            value(&events[1].batch.observations, "http3.status"),
+            Some("403")
+        );
     }
 
     #[test]

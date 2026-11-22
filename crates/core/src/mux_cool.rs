@@ -164,6 +164,7 @@ impl BidirectionalStreamAnalyzer for MuxCool {
         self.directions[direction].bytes.extend_from_slice(bytes);
         let mut batches = Vec::new();
         if self.parse(direction, &mut batches).is_err() {
+            tracing::debug!(reverse, "Mux.Cool carrier parsing stopped");
             self.finished = true;
         }
         if batches.is_empty() {

@@ -442,10 +442,13 @@ fn apply_tcp_flow_rules(
         facts: &flow.facts,
         updated,
     };
-    for rule in rules {
+    for (rule_index, rule) in rules.iter().enumerate() {
         let Some(action) = (rule.matches)(&context) else {
             continue;
         };
+        tracing::debug!(protocol = "tcp", scope = scope.0, rule_index,
+            action = action_label(&action), source = %source, destination = %destination,
+            "application rule matched");
         match action {
             FlowAction::Allow => flow.allowed = true,
             FlowAction::Block | FlowAction::DropPacket => flow.blocked = true,
@@ -464,6 +467,15 @@ pub enum FlowAction {
     DropPacket,
     /// Accept this UDP datagram with a new payload. Ignored for TCP.
     ReplaceUdpPayload(Vec<u8>),
+}
+
+fn action_label(action: &FlowAction) -> &'static str {
+    match action {
+        FlowAction::Allow => "allow",
+        FlowAction::Block => "block",
+        FlowAction::DropPacket => "drop_packet",
+        FlowAction::ReplaceUdpPayload(_) => "replace_udp_payload",
+    }
 }
 
 type FlowMatch = dyn for<'a> Fn(&FlowContext<'a>) -> Option<FlowAction> + Send + Sync;
@@ -799,6 +811,12 @@ impl<P> Inspect<P> {
         if !self.decoded_flows.contains_key(&key) && self.active_count() >= self.limits.max_flows {
             self.compact_completed_flows();
             if self.active_count() >= self.limits.max_flows {
+                tracing::warn!(
+                    scope = input.scope.0,
+                    stream_id = input.stream_id,
+                    limit = self.limits.max_flows,
+                    "decoded stream capacity reached"
+                );
                 return Verdict::DropFlow;
             }
         }
@@ -847,6 +865,8 @@ impl<P> Inspect<P> {
             analysis,
         );
         if flow.blocked {
+            tracing::info!(scope = input.scope.0, stream_id = input.stream_id,
+                origin = %flow.origin, target = %flow.target, "decoded TCP stream blocked");
             Verdict::DropFlow
         } else {
             Verdict::Accept
@@ -867,6 +887,12 @@ impl<P> Inspect<P> {
         if !self.http3_connections.contains_key(&input.scope)
             && self.active_count() >= self.limits.max_flows
         {
+            tracing::warn!(
+                scope = input.scope.0,
+                stream_id = input.stream_id,
+                limit = self.limits.max_flows,
+                "HTTP/3 connection capacity reached"
+            );
             return vec![DecodedVerdict {
                 stream_id: input.stream_id,
                 verdict: Verdict::DropFlow,
@@ -888,6 +914,12 @@ impl<P> Inspect<P> {
             let key = (input.scope, event.stream_id);
             if !self.http3_flows.contains_key(&key) && self.active_count() >= self.limits.max_flows
             {
+                tracing::warn!(
+                    scope = input.scope.0,
+                    stream_id = event.stream_id,
+                    limit = self.limits.max_flows,
+                    "HTTP/3 request capacity reached"
+                );
                 decisions.push(DecodedVerdict {
                     stream_id: event.stream_id,
                     verdict: Verdict::DropFlow,
@@ -903,6 +935,7 @@ impl<P> Inspect<P> {
                 seen: now,
             });
             flow.seen = now;
+            let was_blocked = flow.blocked;
             if !flow.blocked && !flow.allowed {
                 let mut updated = Vec::new();
                 for field in event.batch.clear_fields {
@@ -927,10 +960,18 @@ impl<P> Inspect<P> {
                     facts: &flow.facts,
                     updated: &updated,
                 };
-                for rule in &self.udp_rules {
+                for (rule_index, rule) in self.udp_rules.iter().enumerate() {
                     let Some(action) = (rule.matches)(&context) else {
                         continue;
                     };
+                    tracing::debug!(
+                        protocol = "http3",
+                        scope = input.scope.0,
+                        stream_id = event.stream_id,
+                        rule_index,
+                        action = action_label(&action),
+                        "application rule matched"
+                    );
                     match action {
                         FlowAction::Allow => flow.allowed = true,
                         FlowAction::Block | FlowAction::DropPacket => flow.blocked = true,
@@ -938,6 +979,10 @@ impl<P> Inspect<P> {
                     }
                     break;
                 }
+            }
+            if !was_blocked && flow.blocked {
+                tracing::info!(scope = input.scope.0, stream_id = event.stream_id,
+                    origin = %flow.origin, target = %flow.target, "HTTP/3 request blocked");
             }
             decisions.push(DecodedVerdict {
                 stream_id: event.stream_id,
@@ -1005,10 +1050,16 @@ impl<P> Inspect<P> {
                 continue;
             }
             match rule.analyzer.inspect(transport.payload) {
-                DatagramAnalysis::Malformed => return Verdict::Drop.into(),
+                DatagramAnalysis::Malformed => {
+                    tracing::warn!(scope = packet.scope.0, source = %transport.source,
+                        destination = %transport.destination, "datagram analyzer rejected malformed input");
+                    return Verdict::Drop.into();
+                }
                 DatagramAnalysis::Observations(observations)
                     if observations.iter().any(|value| (rule.matches)(value)) =>
                 {
+                    tracing::info!(scope = packet.scope.0, source = %transport.source,
+                        destination = %transport.destination, "datagram rule dropped packet");
                     return Verdict::Drop.into();
                 }
                 DatagramAnalysis::Observations(_) => {}
@@ -1039,6 +1090,9 @@ impl<P> Inspect<P> {
         if !self.udp_flows.contains_key(&key) && self.active_count() >= self.limits.max_flows {
             self.compact_completed_flows();
             if self.active_count() >= self.limits.max_flows {
+                tracing::warn!(scope = packet.scope.0, source = %transport.source,
+                    destination = %transport.destination, limit = self.limits.max_flows,
+                    "UDP inspection capacity reached");
                 return Verdict::Drop.into();
             }
         }
@@ -1122,15 +1176,24 @@ impl<P> Inspect<P> {
                     facts: &flow.facts,
                     updated: &updated,
                 };
-                if let Some(action) = self
-                    .udp_rules
-                    .iter()
-                    .find_map(|rule| (rule.matches)(&context))
+                if let Some((rule_index, action)) =
+                    self.udp_rules.iter().enumerate().find_map(|(index, rule)| {
+                        (rule.matches)(&context).map(|action| (index, action))
+                    })
                 {
+                    tracing::debug!(protocol = "udp", scope = packet.scope.0, rule_index,
+                        action = action_label(&action), source = %transport.source,
+                        destination = %transport.destination, "application rule matched");
                     match action {
                         FlowAction::Allow => flow.allowed = true,
-                        FlowAction::Block => flow.blocked = true,
-                        FlowAction::DropPacket => drop_packet = true,
+                        FlowAction::Block => {
+                            flow.blocked = true;
+                            tracing::info!(scope = packet.scope.0, source = %transport.source,
+                                destination = %transport.destination, "UDP flow blocked");
+                        }
+                        FlowAction::DropPacket => {
+                            drop_packet = true;
+                        }
                         FlowAction::ReplaceUdpPayload(payload) => replacement = Some(payload),
                     }
                 }
@@ -1140,6 +1203,8 @@ impl<P> Inspect<P> {
         if flow.blocked {
             Verdict::DropFlow.into()
         } else if drop_packet {
+            tracing::info!(scope = packet.scope.0, source = %transport.source,
+                destination = %transport.destination, "UDP packet dropped");
             Verdict::Drop.into()
         } else if let Some(payload) = replacement {
             packet::replace_udp_payload(packet.bytes, &payload)
@@ -1158,6 +1223,13 @@ impl<P: Policy> Policy for Inspect<P> {
     fn decide(&mut self, packet: Packet<'_>) -> Decision {
         let transport_decision = self.transport.decide(packet);
         let verdict = transport_decision.verdict();
+        if verdict != Verdict::Accept {
+            tracing::debug!(
+                scope = packet.scope.0,
+                ?verdict,
+                "transport policy decided packet"
+            );
+        }
         if verdict != Verdict::Accept
             || (self.analyzers.is_empty()
                 && self.bidirectional_analyzers.is_empty()
@@ -1234,6 +1306,9 @@ impl<P: Policy> Policy for Inspect<P> {
         if self.active_count() >= self.limits.max_flows && !self.flows.contains_key(&key) {
             self.compact_completed_flows();
             if self.active_count() >= self.limits.max_flows {
+                tracing::warn!(scope = packet.scope.0, source = %t.source,
+                    destination = %t.destination, limit = self.limits.max_flows,
+                    "TCP inspection capacity reached");
                 // Active inspection cannot be silently bypassed at capacity.
                 return Verdict::Drop.into();
             }
@@ -1278,7 +1353,11 @@ impl<P: Policy> Policy for Inspect<P> {
                             !self.flow_rules.is_empty(),
                         );
                     }
-                    Err(_) => flow.blocked = true,
+                    Err(_) => {
+                        flow.blocked = true;
+                        tracing::warn!(scope = packet.scope.0, source = %t.source,
+                            destination = %t.destination, "TCP reassembly failed");
+                    }
                 }
             }
         }
@@ -1294,6 +1373,9 @@ impl<P: Policy> Policy for Inspect<P> {
             analysis,
         );
         let result = if flow.blocked {
+            tracing::info!(scope = packet.scope.0, source = %t.source,
+                destination = %t.destination, origin = %flow.origin, target = %flow.target,
+                "TCP flow blocked");
             Verdict::DropFlow
         } else {
             verdict

@@ -105,6 +105,7 @@ impl Http3Conversation {
         state.bytes.extend_from_slice(bytes);
         let mut events = Vec::new();
         if self.parse_stream(stream_id, reverse, &mut events).is_err() {
+            tracing::debug!(stream_id, reverse, "HTTP/3 stream parsing stopped");
             let state = self.streams.get_mut(&key).unwrap();
             state.bytes.clear();
             state.ignored = true;

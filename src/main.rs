@@ -40,12 +40,37 @@ fn observation_field_possible(field: &str, protocol: Protocol) -> bool {
 }
 
 fn main() -> Result<(), Error> {
+    init_logging()?;
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match args.first().map(String::as_str) {
         Some("nfqueue") => run_nfqueue(&args[1..]),
         Some("windivert") => run_windivert(&args[1..]),
         _ => Err("usage: rustgfw nfqueue <queue> <accept|drop> [rules...] [nft=input|output|forward] [ctmark=0x80000000] | rustgfw windivert <dll> <network|forward> <accept|drop> [rules...]; shared options: rules-file=path inspect-flows=N transport-flows=N flow-idle-seconds=N reorder-bytes=N http-header-bytes=N tls-buffer-bytes=N dns-message-bytes=N ssh-banner-bytes=N".into()),
     }
+}
+
+fn init_logging() -> Result<(), Error> {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    match std::env::var("RUSTGFW_LOG_FORMAT").as_deref() {
+        Ok("json") => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .json()
+            .try_init()
+            .map_err(std::io::Error::other)?,
+        Ok("text") | Err(_) => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .try_init()
+            .map_err(std::io::Error::other)?,
+        Ok(other) => {
+            return Err(
+                format!("unknown RUSTGFW_LOG_FORMAT {other:?}; expected text or json").into(),
+            );
+        }
+    }
+    Ok(())
 }
 
 struct Options {

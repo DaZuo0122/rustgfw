@@ -192,6 +192,8 @@ type DecodedKey = (FlowScope, u64);
 /// Bytes already decoded from a transport or proxy connection.
 /// `scope` identifies the outer connection and `stream_id` identifies one
 /// logical stream within it. The caller supplies bytes in order per direction.
+/// `origin` and `target` are the current path endpoints; they may change when
+/// the outer connection migrates, while `scope` and `stream_id` stay stable.
 pub struct DecodedStream<'a> {
     pub scope: FlowScope,
     pub stream_id: u64,
@@ -836,9 +838,9 @@ impl<P> Inspect<P> {
             return Verdict::DropFlow;
         }
         let (source, destination) = if input.reverse {
-            (flow.target, flow.origin)
+            (input.target, input.origin)
         } else {
-            (flow.origin, flow.target)
+            (input.origin, input.target)
         };
         let analysis = if !flow.allowed {
             analyze_tcp_bytes(
@@ -944,9 +946,9 @@ impl<P> Inspect<P> {
                 store_observations(&mut flow.facts, event.batch.context, &mut Vec::new());
                 store_observations(&mut flow.facts, event.batch.observations, &mut updated);
                 let (source, destination) = if event.reverse {
-                    (flow.target, flow.origin)
+                    (input.target, input.origin)
                 } else {
-                    (flow.origin, flow.target)
+                    (input.origin, input.target)
                 };
                 let context = FlowContext {
                     protocol: Protocol::Udp,
@@ -1470,6 +1472,127 @@ mod tests {
         inspect.close_http3_connection(FlowScope(91));
         assert!(inspect.http3_flows.is_empty());
         assert!(inspect.http3_connections.is_empty());
+    }
+
+    #[test]
+    fn http3_migration_keeps_request_facts_and_uses_current_path() {
+        use compcol::{hpack::HeaderField, qpack::QpackEncoder};
+
+        let old_client = "192.0.2.1:12345".parse().unwrap();
+        let old_server = "198.51.100.2:443".parse().unwrap();
+        let new_client = "192.0.2.9:54321".parse().unwrap();
+        let new_server = "198.51.100.8:443".parse().unwrap();
+        let mut inspect = Inspect::with_analyzers((), Vec::new()).with_udp_streams(
+            Vec::new(),
+            vec![FlowRule::new(move |context| {
+                (context.updated("http3.status")
+                    && context.get("http3.path") == Some("/migrated")
+                    && context.origin == old_client
+                    && context.target == old_server
+                    && context.source == new_server
+                    && context.destination == new_client
+                    && context.reverse)
+                    .then_some(FlowAction::Block)
+            })],
+        );
+        let mut encoder = QpackEncoder::new();
+        let frame = |fields: &[HeaderField], encoder: &mut QpackEncoder| {
+            let block = encoder.encode_field_section(fields);
+            let mut frame = vec![1, block.len() as u8];
+            frame.extend(block);
+            frame
+        };
+        let request = frame(
+            &[
+                HeaderField::new(b":method", b"GET"),
+                HeaderField::new(b":path", b"/migrated"),
+            ],
+            &mut encoder,
+        );
+        let response = frame(&[HeaderField::new(b":status", b"403")], &mut encoder);
+        assert_eq!(
+            inspect.feed_http3(DecodedStream {
+                scope: FlowScope(93),
+                stream_id: 0,
+                origin: old_client,
+                target: old_server,
+                reverse: false,
+                bytes: &request,
+            }),
+            vec![DecodedVerdict {
+                stream_id: 0,
+                verdict: Verdict::Accept,
+            }]
+        );
+        assert_eq!(
+            inspect.feed_http3(DecodedStream {
+                scope: FlowScope(93),
+                stream_id: 0,
+                origin: new_client,
+                target: new_server,
+                reverse: true,
+                bytes: &response,
+            }),
+            vec![DecodedVerdict {
+                stream_id: 0,
+                verdict: Verdict::DropFlow,
+            }]
+        );
+        assert_eq!(
+            inspect.feed_http3(DecodedStream {
+                scope: FlowScope(94),
+                stream_id: 0,
+                origin: new_client,
+                target: new_server,
+                reverse: true,
+                bytes: &response,
+            }),
+            vec![DecodedVerdict {
+                stream_id: 0,
+                verdict: Verdict::Accept,
+            }]
+        );
+    }
+
+    #[test]
+    fn decoded_stream_migration_updates_packet_endpoints() {
+        let old_client = "192.0.2.1:12345".parse().unwrap();
+        let old_server = "198.51.100.2:443".parse().unwrap();
+        let new_client = "192.0.2.9:54321".parse().unwrap();
+        let new_server = "198.51.100.8:443".parse().unwrap();
+        let mut inspect =
+            Inspect::with_analyzers((), Vec::new()).with_flow_rules(vec![FlowRule::new(
+                move |context| {
+                    (context.origin == old_client
+                        && context.target == old_server
+                        && context.source == new_server
+                        && context.destination == new_client
+                        && context.reverse)
+                        .then_some(FlowAction::Block)
+                },
+            )]);
+        assert_eq!(
+            inspect.feed_decoded(DecodedStream {
+                scope: FlowScope(95),
+                stream_id: 0,
+                origin: old_client,
+                target: old_server,
+                reverse: false,
+                bytes: b"request",
+            }),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inspect.feed_decoded(DecodedStream {
+                scope: FlowScope(95),
+                stream_id: 0,
+                origin: new_client,
+                target: new_server,
+                reverse: true,
+                bytes: b"response",
+            }),
+            Verdict::DropFlow
+        );
     }
 
     #[test]

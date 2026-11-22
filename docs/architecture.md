@@ -55,6 +55,8 @@ TCP 重组模块 `core::tcp` 已接入 `core::inspect` 的双向分析路径，�
 
 HTTP/3 的解码流使用 `Inspect::feed_http3`：连接状态按 `FlowScope` 隔离，QPACK 编码器流与请求 HEADERS 共享动态表，请求和响应按 QUIC stream ID 关联。每条请求流独立运行 UDP 表达式规则；返回的 `DecodedVerdict` 携带被裁决的请求流 ID，以处理 QPACK 更新触发的延迟头部事件。调用方需要验证协商的 HTTP/3 ALPN，并提供已解密、按流有序的 QUIC 字节。当前 Linux NFQUEUE 后端尚无这种适配器，因此逐包规则只能使用 QUIC Initial 的可见字段。
 
+QUIC 迁移时，解码接入方保持同一连接 `FlowScope` 并提交当前路径端点；HTTP/3 规则的 `source`/`destination` 更新，首次端点 `origin`/`target` 与请求事实保留。逐包路径不会凭未认证的连接 ID 合并不同五元组。观察限制和 QUICstep 对照见 [QUIC 连接迁移](quic-migration.md)。
+
 命令行的 `decoded-http3` 模式把已解密流事件接入这条核心路径，并按流输出裁决；输入格式见 [已解密流输入](decoded-streams.md)。它不接管 UDP socket 或 NFQUEUE，便于在 Linux 上独立验证规则与 QPACK 状态。
 
 引擎核心通过 `tracing` 发布结构化裁决与诊断事件，输出由调用方配置。命令行默认写入标准错误，级别和格式见 [引擎日志](logging.md)。

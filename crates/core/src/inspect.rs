@@ -975,7 +975,8 @@ impl<P> Inspect<P> {
                         "application rule matched"
                     );
                     match action {
-                        FlowAction::Allow => flow.allowed = true,
+                        FlowAction::Allow if !event.provisional => flow.allowed = true,
+                        FlowAction::Allow => {}
                         FlowAction::Block | FlowAction::DropPacket => flow.blocked = true,
                         FlowAction::ReplaceUdpPayload(_) => continue,
                     }
@@ -1551,6 +1552,78 @@ mod tests {
                 stream_id: 0,
                 verdict: Verdict::Accept,
             }]
+        );
+    }
+
+    #[test]
+    fn http3_late_request_rechecks_early_response_rule() {
+        use compcol::{hpack::HeaderField, qpack::QpackEncoder};
+
+        let mut inspect = Inspect::with_analyzers((), Vec::new()).with_udp_streams(
+            Vec::new(),
+            vec![
+                FlowRule::new(|context| {
+                    (context.updated("http3.status")
+                        && context.get("http3.status") == Some("403")
+                        && context.get("http3.path") == Some("/late"))
+                    .then_some(FlowAction::Block)
+                }),
+                FlowRule::new(|context| {
+                    (context.updated("http3.status") && context.get("http3.status") == Some("403"))
+                        .then_some(FlowAction::Allow)
+                }),
+            ],
+        );
+        let mut encoder = QpackEncoder::new();
+        let frame = |fields: &[HeaderField], encoder: &mut QpackEncoder| {
+            let block = encoder.encode_field_section(fields);
+            let mut frame = vec![1, block.len() as u8];
+            frame.extend(block);
+            frame
+        };
+        let origin = "192.0.2.1:12345".parse().unwrap();
+        let target = "198.51.100.2:443".parse().unwrap();
+        let response = frame(&[HeaderField::new(b":status", b"403")], &mut encoder);
+        assert_eq!(
+            inspect.feed_http3(DecodedStream {
+                scope: FlowScope(96),
+                stream_id: 4,
+                origin,
+                target,
+                reverse: true,
+                bytes: &response,
+            }),
+            vec![DecodedVerdict {
+                stream_id: 4,
+                verdict: Verdict::Accept,
+            }]
+        );
+        let request = frame(
+            &[
+                HeaderField::new(b":method", b"GET"),
+                HeaderField::new(b":path", b"/late"),
+            ],
+            &mut encoder,
+        );
+        assert_eq!(
+            inspect.feed_http3(DecodedStream {
+                scope: FlowScope(96),
+                stream_id: 4,
+                origin,
+                target,
+                reverse: false,
+                bytes: &request,
+            }),
+            vec![
+                DecodedVerdict {
+                    stream_id: 4,
+                    verdict: Verdict::Accept,
+                },
+                DecodedVerdict {
+                    stream_id: 4,
+                    verdict: Verdict::DropFlow,
+                },
+            ]
         );
     }
 

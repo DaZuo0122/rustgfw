@@ -15,11 +15,15 @@ pub const FIELDS: &[&str] = &[
 pub struct Http3Event {
     pub stream_id: u64,
     pub reverse: bool,
+    /// A response observed before its request can be blocked immediately, but
+    /// an Allow must wait for the request context before becoming terminal.
+    pub provisional: bool,
     pub batch: ObservationBatch,
 }
 const MAX_FRAME: usize = 65_536;
 const MAX_STREAMS: usize = 256;
 const MAX_BLOCKED: usize = 16;
+const MAX_EARLY_RESPONSES: usize = 16;
 
 #[derive(Default)]
 struct Stream {
@@ -44,6 +48,7 @@ pub struct Http3Conversation {
     streams: HashMap<(u64, bool), Stream>,
     decoders: [QpackDecoder; 2],
     requests: HashMap<u64, Vec<Observation>>,
+    early_responses: HashMap<u64, Vec<Vec<Observation>>>,
     blocked: Vec<Blocked>,
 }
 
@@ -53,6 +58,7 @@ impl Default for Http3Conversation {
             streams: HashMap::new(),
             decoders: std::array::from_fn(|_| QpackDecoder::with_limits(MAX_FRAME, MAX_FRAME)),
             requests: HashMap::new(),
+            early_responses: HashMap::new(),
             blocked: Vec::new(),
         }
     }
@@ -126,6 +132,7 @@ impl Http3Conversation {
         self.streams.remove(&(stream_id, false));
         self.streams.remove(&(stream_id, true));
         self.requests.remove(&stream_id);
+        self.early_responses.remove(&stream_id);
         self.blocked.retain(|item| item.stream_id != stream_id);
     }
 
@@ -196,13 +203,7 @@ impl Http3Conversation {
                 let payload = state.bytes[header..header + length].to_vec();
                 state.bytes.drain(..header + length);
                 state.headers_seen = true;
-                if let Some(batch) = self.headers(stream_id, reverse, payload) {
-                    events.push(Http3Event {
-                        stream_id,
-                        reverse,
-                        batch,
-                    });
-                }
+                events.extend(self.headers(stream_id, reverse, payload));
             } else {
                 state.bytes.drain(..header);
                 state.skip = length;
@@ -211,12 +212,7 @@ impl Http3Conversation {
         Ok(())
     }
 
-    fn headers(
-        &mut self,
-        stream_id: u64,
-        reverse: bool,
-        block: Vec<u8>,
-    ) -> Option<ObservationBatch> {
+    fn headers(&mut self, stream_id: u64, reverse: bool, block: Vec<u8>) -> Vec<Http3Event> {
         let fields = match self.decoders[usize::from(reverse)].decode_field_section(&block) {
             Ok(fields) => fields,
             Err(_) => {
@@ -228,7 +224,7 @@ impl Http3Conversation {
                         block,
                     });
                 }
-                return None;
+                return Vec::new();
             }
         };
         let mut values = vec![observation("http3.stream_id", stream_id.to_string())];
@@ -240,37 +236,67 @@ impl Http3Conversation {
                 b":status" => "http3.status",
                 _ => continue,
             };
-            let value = String::from_utf8(field.value).ok()?;
+            let Ok(value) = String::from_utf8(field.value) else {
+                return Vec::new();
+            };
             values.push(observation(name, value));
         }
         let is_request = values.iter().any(|item| item.field == "http3.method");
         let is_response = values.iter().any(|item| item.field == "http3.status");
         if is_request {
             self.requests.insert(stream_id, values.clone());
+            let mut events = vec![Http3Event {
+                stream_id,
+                reverse,
+                provisional: false,
+                batch: ObservationBatch {
+                    clear_fields: FIELDS,
+                    context: Vec::new(),
+                    observations: values.clone(),
+                },
+            }];
+            if let Some(responses) = self.early_responses.remove(&stream_id) {
+                events.extend(responses.into_iter().map(|observations| Http3Event {
+                    stream_id,
+                    reverse: true,
+                    provisional: false,
+                    batch: ObservationBatch {
+                        clear_fields: FIELDS,
+                        context: values.clone(),
+                        observations,
+                    },
+                }));
+            }
+            return events;
         }
-        let context = if is_response {
-            self.requests.get(&stream_id).cloned().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        (is_request || is_response).then_some(ObservationBatch {
-            clear_fields: FIELDS,
-            context,
-            observations: values,
-        })
+        if is_response {
+            let context = self.requests.get(&stream_id).cloned().unwrap_or_default();
+            if context.is_empty() {
+                let pending = self.early_responses.entry(stream_id).or_default();
+                if pending.len() == MAX_EARLY_RESPONSES {
+                    pending.remove(0);
+                }
+                pending.push(values.clone());
+            }
+            return vec![Http3Event {
+                stream_id,
+                reverse,
+                provisional: context.is_empty(),
+                batch: ObservationBatch {
+                    clear_fields: FIELDS,
+                    context,
+                    observations: values,
+                },
+            }];
+        }
+        Vec::new()
     }
 
     fn retry_blocked(&mut self, direction: usize, events: &mut Vec<Http3Event>) {
         let mut pending = std::mem::take(&mut self.blocked);
         for item in pending.drain(..) {
             if usize::from(item.reverse) == direction {
-                if let Some(batch) = self.headers(item.stream_id, item.reverse, item.block) {
-                    events.push(Http3Event {
-                        stream_id: item.stream_id,
-                        reverse: item.reverse,
-                        batch,
-                    });
-                }
+                events.extend(self.headers(item.stream_id, item.reverse, item.block));
             } else {
                 self.blocked.push(item);
             }
@@ -348,6 +374,88 @@ mod tests {
         assert_eq!(value(&response0[0].context, "http3.path"), Some("/one"));
         h3.close_stream(4);
         assert!(!h3.requests.contains_key(&4));
+    }
+
+    #[test]
+    fn early_responses_are_replayed_with_late_request_context() {
+        let mut h3 = Http3Conversation::default();
+        let mut encoder = QpackEncoder::new();
+        let interim = frame(
+            1,
+            &encoder.encode_field_section(&[HeaderField::new(b":status", b"103")]),
+        );
+        let final_response = frame(
+            1,
+            &encoder.encode_field_section(&[HeaderField::new(b":status", b"200")]),
+        );
+        let first = h3.feed_events(4, true, &interim);
+        assert_eq!(first.len(), 1);
+        assert!(first[0].reverse);
+        assert_eq!(
+            value(&first[0].batch.observations, "http3.status"),
+            Some("103")
+        );
+        assert!(first[0].batch.context.is_empty());
+        let second = h3.feed_events(4, true, &final_response);
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            value(&second[0].batch.observations, "http3.status"),
+            Some("200")
+        );
+
+        let request = frame(
+            1,
+            &encoder.encode_field_section(&[
+                HeaderField::new(b":method", b"GET"),
+                HeaderField::new(b":path", b"/late"),
+            ]),
+        );
+        let events = h3.feed_events(4, false, &request);
+        assert_eq!(events.len(), 3);
+        assert!(!events[0].reverse);
+        assert_eq!(
+            value(&events[0].batch.observations, "http3.path"),
+            Some("/late")
+        );
+        for (event, status) in events[1..].iter().zip(["103", "200"]) {
+            assert!(event.reverse);
+            assert_eq!(value(&event.batch.context, "http3.path"), Some("/late"));
+            assert_eq!(
+                value(&event.batch.observations, "http3.status"),
+                Some(status)
+            );
+        }
+        assert!(!h3.early_responses.contains_key(&4));
+    }
+
+    #[test]
+    fn late_request_still_sees_final_response_after_many_interim_headers() {
+        let mut h3 = Http3Conversation::default();
+        let mut encoder = QpackEncoder::new();
+        let interim = frame(
+            1,
+            &encoder.encode_field_section(&[HeaderField::new(b":status", b"103")]),
+        );
+        for _ in 0..MAX_EARLY_RESPONSES {
+            assert_eq!(h3.feed_events(0, true, &interim).len(), 1);
+        }
+        let final_response = frame(
+            1,
+            &encoder.encode_field_section(&[HeaderField::new(b":status", b"403")]),
+        );
+        assert_eq!(h3.feed_events(0, true, &final_response).len(), 1);
+        let request = frame(
+            1,
+            &encoder.encode_field_section(&[
+                HeaderField::new(b":method", b"GET"),
+                HeaderField::new(b":path", b"/late"),
+            ]),
+        );
+        let events = h3.feed_events(0, false, &request);
+        assert_eq!(events.len(), MAX_EARLY_RESPONSES + 1);
+        let last = events.last().unwrap();
+        assert_eq!(value(&last.batch.observations, "http3.status"), Some("403"));
+        assert_eq!(value(&last.batch.context, "http3.path"), Some("/late"));
     }
 
     #[test]

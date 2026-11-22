@@ -53,7 +53,7 @@ TCP 重组模块 `core::tcp` 已接入 `core::inspect` 的双向分析路径，�
 
 已有解码结果的接入方可调用 `Inspect::feed_decoded(DecodedStream { scope, stream_id, origin, target, reverse, bytes })`。`scope` 标识外层连接，`stream_id` 区分其内部逻辑流；调用方按方向有序交付字节，并在结束时调用 `close_decoded`。这一路径跳过 IP/TCP 包解析与内核传输策略，复用相同的流分析器、观察批次和表达式规则，返回值只裁决该逻辑流，具体阻断由提供解码字节的接入方执行。普通逐包路径仍自行 TCP 重组。Linux NFQUEUE 不提供 TLS 或代理载荷解密，因此当前命令行没有解码字节的来源；此接口供后续代理或解密适配器使用。
 
-HTTP/3 的解码流使用 `Inspect::feed_http3`：连接状态按 `FlowScope` 隔离，QPACK 编码器流与请求 HEADERS 共享动态表，请求和响应按 QUIC stream ID 关联。每条请求流独立运行 UDP 表达式规则；返回的 `DecodedVerdict` 携带被裁决的请求流 ID，以处理 QPACK 更新触发的延迟头部事件。调用方需要验证协商的 HTTP/3 ALPN，并提供已解密、按流有序的 QUIC 字节。当前 Linux NFQUEUE 后端尚无这种适配器，因此逐包规则只能使用 QUIC Initial 的可见字段。
+HTTP/3 的解码流使用 `Inspect::feed_http3`：连接状态按 `FlowScope` 隔离，QPACK 编码器流与请求 HEADERS 共享动态表，请求和响应按 QUIC stream ID 关联。每条请求流独立运行 UDP 表达式规则；返回的 `DecodedVerdict` 携带被裁决的请求流 ID，以处理 QPACK 更新触发的延迟头部事件。服务端响应若先于客户端请求交付，响应字段先独立裁决，待请求字段到达后会按原顺序重新裁决带请求上下文的响应；提前出现的 `Block` 可立即执行，`Allow` 等到请求上下文确定后才终止检查。调用方需要验证协商的 HTTP/3 ALPN，并提供已解密、按流有序的 QUIC 字节。当前 Linux NFQUEUE 后端尚无这种适配器，因此逐包规则只能使用 QUIC Initial 的可见字段。
 
 QUIC 迁移时，解码接入方保持同一连接 `FlowScope` 并提交当前路径端点；HTTP/3 规则的 `source`/`destination` 更新，首次端点 `origin`/`target` 与请求事实保留。逐包路径不会凭未认证的连接 ID 合并不同五元组。观察限制和 QUICstep 对照见 [QUIC 连接迁移](quic-migration.md)。
 

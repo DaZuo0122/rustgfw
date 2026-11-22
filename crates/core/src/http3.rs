@@ -26,6 +26,8 @@ struct Stream {
     bytes: Vec<u8>,
     kind: Option<u64>,
     first_frame: bool,
+    headers_seen: bool,
+    skip: u64,
     ignored: bool,
 }
 
@@ -60,7 +62,7 @@ fn varint(bytes: &[u8]) -> Option<(u64, usize)> {
     let first = *bytes.first()?;
     let width = 1usize << (first >> 6);
     let mut value = u64::from(first & 0x3f);
-    for &byte in bytes.get(1..width)?.iter().skip(1) {
+    for &byte in bytes.get(1..width)? {
         value = (value << 8) | u64::from(byte);
     }
     Some((value, width))
@@ -102,13 +104,20 @@ impl Http3Conversation {
         if state.ignored {
             return Vec::new();
         }
-        state.bytes.extend_from_slice(bytes);
         let mut events = Vec::new();
-        if self.parse_stream(stream_id, reverse, &mut events).is_err() {
-            tracing::debug!(stream_id, reverse, "HTTP/3 stream parsing stopped");
-            let state = self.streams.get_mut(&key).unwrap();
-            state.bytes.clear();
-            state.ignored = true;
+        for chunk in bytes.chunks(8192) {
+            self.streams
+                .get_mut(&key)
+                .unwrap()
+                .bytes
+                .extend_from_slice(chunk);
+            if self.parse_stream(stream_id, reverse, &mut events).is_err() {
+                tracing::debug!(stream_id, reverse, "HTTP/3 stream parsing stopped");
+                let state = self.streams.get_mut(&key).unwrap();
+                state.bytes.clear();
+                state.ignored = true;
+                break;
+            }
         }
         events
     }
@@ -153,37 +162,50 @@ impl Http3Conversation {
             return Err(());
         }
         loop {
-            let state = &self.streams[&key];
+            let state = self.streams.get_mut(&key).unwrap();
+            if state.skip != 0 {
+                let available = state.skip.min(state.bytes.len() as u64) as usize;
+                state.bytes.drain(..available);
+                state.skip -= available as u64;
+                if state.skip != 0 {
+                    break;
+                }
+            }
             let Some((kind, type_width)) = varint(&state.bytes) else {
                 break;
             };
             let Some((length, length_width)) = varint(&state.bytes[type_width..]) else {
                 break;
             };
-            let length = usize::try_from(length).map_err(|_| ())?;
-            if length > MAX_FRAME {
-                return Err(());
-            }
             let header = type_width + length_width;
-            if state.bytes.len() < header + length {
-                break;
-            }
-            let state = self.streams.get_mut(&key).unwrap();
-            let payload = state.bytes[header..header + length].to_vec();
-            state.bytes.drain(..header + length);
             if uni && !state.first_frame && kind != 4 {
                 return Err(());
             }
+            if uni && matches!(kind, 0 | 1) || !uni && kind == 0 && !state.headers_seen {
+                return Err(());
+            }
             state.first_frame = true;
-            if !uni
-                && kind == 1
-                && let Some(batch) = self.headers(stream_id, reverse, payload)
-            {
-                events.push(Http3Event {
-                    stream_id,
-                    reverse,
-                    batch,
-                });
+            if !uni && kind == 1 {
+                let length = usize::try_from(length).map_err(|_| ())?;
+                if length > MAX_FRAME {
+                    return Err(());
+                }
+                if state.bytes.len() < header + length {
+                    break;
+                }
+                let payload = state.bytes[header..header + length].to_vec();
+                state.bytes.drain(..header + length);
+                state.headers_seen = true;
+                if let Some(batch) = self.headers(stream_id, reverse, payload) {
+                    events.push(Http3Event {
+                        stream_id,
+                        reverse,
+                        batch,
+                    });
+                }
+            } else {
+                state.bytes.drain(..header);
+                state.skip = length;
             }
         }
         Ok(())
@@ -264,8 +286,10 @@ mod tests {
     fn varint(value: usize) -> Vec<u8> {
         if value < 64 {
             vec![value as u8]
-        } else {
+        } else if value < 16384 {
             vec![0x40 | (value >> 8) as u8, value as u8]
+        } else {
+            ((value as u32) | 0x8000_0000).to_be_bytes().to_vec()
         }
     }
 
@@ -363,5 +387,63 @@ mod tests {
         assert!(h3.streams[&(2, false)].first_frame);
         assert!(matches!(h3.feed(6, false, &[0, 1, 0]), Analysis::Pending));
         assert!(h3.streams[&(6, false)].ignored);
+    }
+
+    #[test]
+    fn large_data_and_extension_frames_are_skipped_across_chunks() {
+        let mut h3 = Http3Conversation::default();
+        let mut encoder = QpackEncoder::new();
+        let request = encoder.encode_field_section(&[
+            HeaderField::new(b":method", b"GET"),
+            HeaderField::new(b":path", b"/after"),
+        ]);
+        batches(h3.feed(0, false, &frame(1, &request)));
+        let data = frame(0, &vec![0x55; 131_072]);
+        assert!(matches!(
+            h3.feed(0, false, &data[..50_000]),
+            Analysis::Pending
+        ));
+        assert!(h3.streams[&(0, false)].skip > 0);
+        assert!(h3.streams[&(0, false)].bytes.is_empty());
+        assert!(matches!(
+            h3.feed(0, false, &data[50_000..]),
+            Analysis::Pending
+        ));
+        assert_eq!(h3.streams[&(0, false)].skip, 0);
+        assert!(!h3.streams[&(0, false)].ignored);
+
+        let mut extension = frame(0x21, &vec![0x33; 131_072]);
+        extension.extend(frame(1, &request));
+        let found = batches(h3.feed(4, false, &extension));
+        assert_eq!(value(&found[0].observations, "http3.path"), Some("/after"));
+        assert!(h3.streams[&(4, false)].bytes.is_empty());
+    }
+
+    #[test]
+    fn data_before_headers_stops_that_request_stream() {
+        let mut h3 = Http3Conversation::default();
+        assert!(matches!(
+            h3.feed(0, false, &frame(0, b"body")),
+            Analysis::Pending
+        ));
+        assert!(h3.streams[&(0, false)].ignored);
+    }
+
+    #[test]
+    fn two_byte_frame_length_preserves_long_authority() {
+        let mut h3 = Http3Conversation::default();
+        let mut encoder = QpackEncoder::new();
+        encoder.set_huffman(false);
+        let host = format!("{}.test", "a".repeat(72));
+        let block = encoder.encode_field_section(&[
+            HeaderField::new(b":method", b"GET"),
+            HeaderField::new(b":authority", host.as_bytes()),
+        ]);
+        assert!(block.len() >= 64);
+        let result = batches(h3.feed(0, false, &frame(1, &block)));
+        assert_eq!(
+            value(&result[0].observations, "http3.authority"),
+            Some(host.as_str())
+        );
     }
 }

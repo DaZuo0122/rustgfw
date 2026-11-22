@@ -12,6 +12,8 @@
 
 `scope` 在同一运行中唯一标识一条 QUIC 连接，可用不超过 64 位的 JSON 整数，或用十进制字符串表示完整 128 位值。输出中的 `scope` 始终是十进制字符串。`stream_id` 是 QUIC stream ID；`reverse=false` 表示客户端发送，`true` 表示服务端发送。`origin` 与 `target` 是外层 UDP 端点。`bytes` 是该方向此流新增的有序明文字节，取值为 0 到 255 的整数数组；调用方负责 QUIC 解密、乱序重组、去重和 HTTP/3 ALPN 验证。
 
+核心按 QUIC 变长整数解析帧长度。HEADERS 的编码块限 64 KiB；DATA 与未知扩展帧的载荷会按长度逐段跳过，不要求一次提供完整帧。
+
 输出示例：
 
 ```json

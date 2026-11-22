@@ -2,6 +2,8 @@
 
 当前支持 IPv4/IPv6 TCP/UDP 协议与端口规则、双向流决策缓存及 Linux NFQUEUE 逐包执行。Windows WinDivert 网络层适配器已可编译，本机连接的部分静态丢弃规则与动态 `DropFlow` 已接入 WFP，转发静态丢弃规则已接入 WinDivert 高优先级 DROP 句柄；真实驱动收发与 WFP 流量尚未验证。整体尚不是 OpenGFW 的功能替代品。
 
+主流客户端协议与当前逐包识别能力的对照见[协议覆盖盘点](protocol-coverage.md)。
+
 ## 边界
 
 - `rustgfw-core`：平台无关策略与执行接口。内核 packet ID、conntrack ID 和 WinDivert 地址只属于后端，不能作为跨平台流标识；后端通过 `FlowScope` 区分同端点的流量域。

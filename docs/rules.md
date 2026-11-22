@@ -67,7 +67,7 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 | `http.host`、`http.method`、`http.target`、`http.request_version` | `http.method == CONNECT && http.target ends_with :443` | TCP HTTP/1 请求的请求行与可见 authority/Host |
 | `http.status`、`http.response_version` | `http.status >= 400` | TCP HTTP/1 响应的状态码与版本；状态码是十进制观察值 |
 | `http2.stream_id`、`http2.method`、`http2.path`、`http2.authority`、`http2.status` | `http2.path == /blocked && fresh.http2.status == 404` | 明文 HTTP/2 的流 ID、请求伪头部与响应状态；响应按 stream ID 恢复对应请求字段 |
-| `http3.stream_id`、`http3.method`、`http3.path`、`http3.authority`、`http3.status` | `http3.path == /blocked && fresh.http3.status == 404` | 已解密 HTTP/3 流的请求和响应字段；需要调用 `Inspect::feed_http3`，普通 NFQUEUE 包路径不产生这些字段 |
+| `http3.stream_id`、`http3.method`、`http3.path`、`http3.authority`、`http3.status`、`http3.request_header_name`、`http3.response_header_name` | `http3.path == /blocked && fresh.http3.status == 404` | 已解密 HTTP/3 流的请求和响应字段；请求与响应的普通头部名称分开报告，不保存头部值；需要调用 `Inspect::feed_http3`，普通 NFQUEUE 包路径不产生这些字段 |
 | `mux_cool.session_id`、`mux_cool.status`、`mux_cool.network`、`mux_cool.host`、`mux_cool.port` | `mux_cool.host == blocked.test && fresh.mux_cool.status == keep` | 可见 Mux.Cool 载体内的子连接 ID、状态与目标；响应按 ID 恢复客户端 New 帧中的目标 |
 | `sing_mux.version`、`sing_mux.protocol`、`sing_mux.padding` | `sing_mux.protocol == h2mux && fresh.http2.method == CONNECT` | 明文 sing-mux 版本、承载协议及 padding 标志；支持 `h2mux`、`smux`、`yamux` |
 | `sing_mux.stream_id`、`sing_mux.frame`、`sing_mux.network`、`sing_mux.host`、`sing_mux.port` | `sing_mux.protocol == h2mux && fresh.sing_mux.host == example.org && http2.method == CONNECT` | 三种 sing-mux 承载的子流 ID 与目标网络、地址、端口；`sing_mux.frame` 目前只用于 `smux`/`yamux` 帧事件 |

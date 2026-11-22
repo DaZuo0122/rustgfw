@@ -8,7 +8,7 @@ Hysteria2 建立在标准 QUIC 和 QUIC DATAGRAM 上。认证从 HTTP/3 的 `POS
 | --- | --- | --- |
 | 标准 QUIC v1/v2 的客户端 Initial | 解开公开的 Initial 保护，读取可见 SNI、ALPN、ECH 扩展标记及客户端 DATAGRAM 接收上限 `quic.datagram_max_size`；用表达式组合条件 | `max_datagram_frame_size > 0` 只表示客户端愿意接收 DATAGRAM，HTTP/3 及其他 QUIC 应用也可使用它；缺少该字段也可能只是没捕获到完整 Initial |
 | 握手后的被动逐包数据 | 观察方向、包长、时间和路径端点，用于后续经验证的统计候选模型 | 0-RTT、Handshake 和 1-RTT 载荷没有公开解密密钥；无法直接读 `/auth`、代理目标、DATAGRAM 载荷或 HTTP/3 头部 |
-| 可信解密适配器提供的 QUIC 流 | 将已解密且按流有序的 HTTP/3 字节交给 `Inspect::feed_http3`，用现有表达式关联 `/auth` 与响应；代理流另需 Hysteria2 格式解析器 | 需要接入端持有应用流或会话密钥，并执行 QPACK 解码、流重组及阻断；当前 NFQUEUE 路径没有该适配器 |
+| 可信解密适配器提供的 QUIC 流 | 将已解密且按流有序的 HTTP/3 字节交给 `Inspect::feed_http3`，用表达式关联 `/auth`、`hysteria-auth` 头部名称与响应；代理流另需 Hysteria2 格式解析器 | 需要接入端持有应用流或会话密钥，并执行 QUIC 流重组及阻断；当前 NFQUEUE 路径没有该适配器 |
 | Salamander / Gecko 模式 | 可做不依赖 QUIC 明文格式的外层 UDP 统计研究 | Salamander 用预共享密钥遮盖所有 QUIC 包；Gecko 再对长首部包分片、填充。没有密钥时，现有 QUIC Initial 分析器也无法看到原始包 |
 
 Initial 的公开密钥派生与后续密钥的分界见 [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html)；DATAGRAM 参数 `0x20` 的含义见 [RFC 9221](https://www.rfc-editor.org/rfc/rfc9221.html)。[RFC 9312](https://www.rfc-editor.org/rfc/rfc9312.html) 提醒被动观察者不能可靠地仅凭通用线缆特征识别所有 QUIC 流，也不能把连接 ID 当作可靠的跨路径身份凭据。QUIC 迁移另见[连接迁移设计](quic-migration.md)。
@@ -23,5 +23,5 @@ Initial 的公开密钥派生与后续密钥的分界见 [RFC 9001](https://www.
 ## 后续路线
 
 1. 先用 `quic.datagram_max_size` 与 `quic.alpn`、目标、协议版本等字段写**候选规则**，在普通 HTTP/3、WebTransport、MASQUE、Hysteria2 默认与混淆模式的真实样本上评估误报与漏报。示例：`fresh.quic.alpn == h3 && quic.datagram_max_size > 0`。它只表达客户端同时提出 `h3` 且允许接收 DATAGRAM。
-2. 若需要确定代理认证或内部目标，在受控终端或代理处接入已解密的 QUIC 流，复用 HTTP/3 入口，再实现 Hysteria2 认证和代理帧解码；单靠路径上的 NFQUEUE 无法恢复 1-RTT 密钥。
+2. 若能在受控终端或代理处接入已解密的 QUIC 流，可用 `fresh.http3.status == 233 && http3.method == POST && http3.path == /auth && http3.authority == hysteria && http3.request_header_name == hysteria-auth` 标记符合 Hysteria2 认证形状的请求与成功响应。这个条件不校验认证凭据；若需确认身份或解析内部目标，还要接入认证结果及 Hysteria2 代理帧解码。单靠路径上的 NFQUEUE 无法恢复 1-RTT 密钥。
 3. 若测试显示连接级包形状有稳定价值，再设计可选统计分析器。先采集带标签样本，覆盖不同客户端、网络、拥塞算法、混淆模式和连接迁移；在独立样本上量化误报，避免把特定测试环境的阈值写进核心。

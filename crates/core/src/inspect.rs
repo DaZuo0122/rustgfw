@@ -1476,6 +1476,88 @@ mod tests {
     }
 
     #[test]
+    fn http3_expression_correlates_hysteria_auth_request_and_reply() {
+        use crate::conditions::{MatchRule, parse_expression};
+        use compcol::{hpack::HeaderField, qpack::QpackEncoder};
+
+        let rule = MatchRule {
+            condition: parse_expression(
+                "fresh.http3.status == 233 && http3.method == POST && http3.path == /auth && http3.authority == hysteria && http3.request_header_name == hysteria-auth",
+            )
+            .unwrap(),
+            action: FlowAction::Block,
+        };
+        let mut inspect = Inspect::with_analyzers((), Vec::new())
+            .with_udp_streams(Vec::new(), vec![rule.into_flow_rule()]);
+        let mut encoder = QpackEncoder::new();
+        let frame = |fields: &[HeaderField], encoder: &mut QpackEncoder| {
+            let block = encoder.encode_field_section(fields);
+            let mut bytes = vec![1];
+            if block.len() < 64 {
+                bytes.push(block.len() as u8);
+            } else {
+                bytes.extend([0x40 | (block.len() >> 8) as u8, block.len() as u8]);
+            }
+            bytes.extend(block);
+            bytes
+        };
+        let origin = "192.0.2.1:12345".parse().unwrap();
+        let target = "198.51.100.2:443".parse().unwrap();
+        let feed = |inspect: &mut Inspect<()>, stream_id, reverse, bytes: &[u8]| {
+            inspect.feed_http3(DecodedStream {
+                scope: FlowScope(98),
+                stream_id,
+                origin,
+                target,
+                reverse,
+                bytes,
+            })
+        };
+        let request = frame(
+            &[
+                HeaderField::new(b":method", b"POST"),
+                HeaderField::new(b":path", b"/auth"),
+                HeaderField::new(b":authority", b"hysteria"),
+                HeaderField::new(b"hysteria-auth", b"secret-token"),
+            ],
+            &mut encoder,
+        );
+        assert_eq!(
+            feed(&mut inspect, 0, false, &request)[0].verdict,
+            Verdict::Accept
+        );
+        let response = frame(&[HeaderField::new(b":status", b"233")], &mut encoder);
+        assert_eq!(
+            feed(&mut inspect, 0, true, &response)[0].verdict,
+            Verdict::DropFlow
+        );
+
+        let ordinary_request = frame(
+            &[
+                HeaderField::new(b":method", b"POST"),
+                HeaderField::new(b":path", b"/auth"),
+                HeaderField::new(b":authority", b"hysteria"),
+            ],
+            &mut encoder,
+        );
+        assert_eq!(
+            feed(&mut inspect, 4, false, &ordinary_request)[0].verdict,
+            Verdict::Accept
+        );
+        let ordinary_reply = frame(
+            &[
+                HeaderField::new(b":status", b"233"),
+                HeaderField::new(b"hysteria-auth", b"not-a-request-header"),
+            ],
+            &mut encoder,
+        );
+        assert_eq!(
+            feed(&mut inspect, 4, true, &ordinary_reply)[0].verdict,
+            Verdict::Accept
+        );
+    }
+
+    #[test]
     fn http3_migration_keeps_request_facts_and_uses_current_path() {
         use compcol::{hpack::HeaderField, qpack::QpackEncoder};
 

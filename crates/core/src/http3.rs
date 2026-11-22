@@ -10,6 +10,8 @@ pub const FIELDS: &[&str] = &[
     "http3.path",
     "http3.authority",
     "http3.status",
+    "http3.request_header_name",
+    "http3.response_header_name",
 ];
 
 pub struct Http3Event {
@@ -250,7 +252,19 @@ impl Http3Conversation {
                 b":path" => "http3.path",
                 b":authority" => "http3.authority",
                 b":status" => "http3.status",
-                _ => continue,
+                _ => {
+                    if !field.name.starts_with(b":")
+                        && let Ok(name) = String::from_utf8(field.name)
+                    {
+                        let field = if reverse {
+                            "http3.response_header_name"
+                        } else {
+                            "http3.request_header_name"
+                        };
+                        values.push(observation(field, name));
+                    }
+                    continue;
+                }
             };
             let Ok(value) = String::from_utf8(field.value) else {
                 return Vec::new();
@@ -390,6 +404,55 @@ mod tests {
         assert_eq!(value(&response0[0].context, "http3.path"), Some("/one"));
         h3.close_stream(4);
         assert!(!h3.requests.contains_key(&4));
+    }
+
+    #[test]
+    fn auth_header_name_follows_the_request_without_exposing_its_value() {
+        let mut h3 = Http3Conversation::default();
+        let mut encoder = QpackEncoder::new();
+        let request = frame(
+            1,
+            &encoder.encode_field_section(&[
+                HeaderField::new(b":method", b"POST"),
+                HeaderField::new(b":path", b"/auth"),
+                HeaderField::new(b":authority", b"hysteria"),
+                HeaderField::new(b"hysteria-auth", b"secret-token"),
+                HeaderField::new(b"hysteria-cc-rx", b"0"),
+            ]),
+        );
+        let request = batches(h3.feed(0, false, &request));
+        assert_eq!(value(&request[0].observations, "http3.path"), Some("/auth"));
+        assert_eq!(
+            value(&request[0].observations, "http3.request_header_name"),
+            Some("hysteria-auth")
+        );
+        assert!(
+            request[0]
+                .observations
+                .iter()
+                .all(|observation| !observation.value.contains("secret-token"))
+        );
+
+        let response = frame(
+            1,
+            &encoder.encode_field_section(&[
+                HeaderField::new(b":status", b"233"),
+                HeaderField::new(b"hysteria-udp", b"true"),
+            ]),
+        );
+        let response = batches(h3.feed(0, true, &response));
+        assert_eq!(
+            value(&response[0].observations, "http3.status"),
+            Some("233")
+        );
+        assert_eq!(
+            value(&response[0].context, "http3.request_header_name"),
+            Some("hysteria-auth")
+        );
+        assert_eq!(
+            value(&response[0].observations, "http3.response_header_name"),
+            Some("hysteria-udp")
+        );
     }
 
     #[test]

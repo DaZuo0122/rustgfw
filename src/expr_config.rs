@@ -170,6 +170,15 @@ mod tests {
         )
         .unwrap();
         assert!(quic[0].condition.references_field("quic.datagram_max_size"));
+        let http3 = compile(
+            r#"{"rules":[{"name":"auth","expr":"fresh.http3.status == 233 && http3.request_header_name == hysteria-auth","action":"block"}]}"#,
+        )
+        .unwrap();
+        assert!(
+            http3[0]
+                .condition
+                .references_field("http3.request_header_name")
+        );
         assert!(
             compile(r#"{"rules":[{"name":"bad","expr":"unknown.field exists","action":"block"}]}"#)
                 .unwrap_err()

@@ -66,6 +66,7 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 | `payload_hex` | `payload_hex starts_with 0x00ff` | 当前传输层载荷中的二进制字节；十六进制数字须成对 |
 | `http.host`、`http.method`、`http.target`、`http.request_version` | `http.method == CONNECT && http.target ends_with :443` | TCP HTTP/1 请求的请求行与可见 authority/Host |
 | `http.status`、`http.response_version` | `http.status >= 400` | TCP HTTP/1 响应的状态码与版本；状态码是十进制观察值 |
+| `http.upgrade_offer`、`http.upgrade_selected` | `http.upgrade_offer == websocket && fresh.http.upgrade_selected == websocket` | 明文 HTTP/1.1 的 Upgrade 提议及 101 响应选择；两侧均要求 `Connection: Upgrade`，只能说明可见的升级协商 |
 | `http2.stream_id`、`http2.method`、`http2.path`、`http2.authority`、`http2.status` | `http2.path == /blocked && fresh.http2.status == 404` | 明文 HTTP/2 的流 ID、请求伪头部与响应状态；响应按 stream ID 恢复对应请求字段 |
 | `http3.stream_id`、`http3.method`、`http3.path`、`http3.authority`、`http3.status`、`http3.request_header_name`、`http3.response_header_name` | `http3.path == /blocked && fresh.http3.status == 404` | 已解密 HTTP/3 流的请求和响应字段；请求与响应的普通头部名称分开报告，不保存头部值；需要调用 `Inspect::feed_http3`，普通 NFQUEUE 包路径不产生这些字段 |
 | `mux_cool.session_id`、`mux_cool.status`、`mux_cool.network`、`mux_cool.host`、`mux_cool.port` | `mux_cool.host == blocked.test && fresh.mux_cool.status == keep` | 可见 Mux.Cool 载体内的子连接 ID、状态与目标；响应按 ID 恢复客户端 New 帧中的目标 |
@@ -95,6 +96,8 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 DNS 表达式逐个 UDP 数据报或 TCP 长度前缀消息求值；新消息替换前一条 DNS 字段。响应若带问题段，可同时匹配 `dns.qname` 与 `fresh.dns.rcode` 或答案字段；`dns.qtype` 仅在恰好一个 IN 类问题时报告，避免把多问题的域名和类型错配。答案字段汇集该响应答案段内相应类型的所有 IN 类记录，`dns.answer_cname` 报告规范名称的目标，支持压缩名称。`dns.qr` 的值为 `query` 或 `response`。目前不解析权威段、附加段以及其他答案类型。DNS 首部、问题和答案格式依据：[RFC 1035](https://www.rfc-editor.org/rfc/rfc1035.html)、[RFC 3596](https://www.rfc-editor.org/rfc/rfc3596.html)；TCP 可连续承载多条消息，响应顺序不作假定：[RFC 7766](https://www.rfc-editor.org/rfc/rfc7766.html)。
 
 HTTP 分析器依据 `Content-Length` 跳过定长消息体，也能按最终 `Transfer-Encoding: chunked` 的块长度、扩展和 trailer 找到下一条消息；消息体中的文本不会被当成新请求。没有长度标记的请求视为无消息体。遇到同时出现 `Transfer-Encoding` 与 `Content-Length`、不一致的长度、无法识别的传输编码、`Connection: close` 或无法定界的响应体时，报告当前可见头部后停止该方向的后续解析。明文 HTTP/2 不在此分析器内。消息体长度判定依据：[RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html)。
+
+`http.upgrade_offer` 与 `http.upgrade_selected` 分别报告 HTTP/1.1 请求和 101 响应中声明的 Upgrade 协议，大小写归一为小写，支持以逗号分隔的多个提议。两个字段都要求同条消息存在 `Connection: Upgrade`。响应规则可用请求上下文确认双方均声明 `websocket` 或其他协议；这些字段不验证 WebSocket 的 `Sec-WebSocket-Accept`，也不证明升级后的数据属于代理。TLS 内的握手不会进入逐包分析器。依据：[RFC 9110 Upgrade](https://www.rfc-editor.org/rfc/rfc9110.html#section-7.8)、[RFC 6455](https://www.rfc-editor.org/rfc/rfc6455.html)。
 
 HTTP/2 分析器识别直接发送连接前言的明文 h2c 连接，按 TCP 双向重组后的帧解析 HEADERS/CONTINUATION 和 HPACK 字段。请求以 stream ID 保存；同一连接内请求与响应交错时，响应规则可结合对应的 `http2.path` 与 `fresh.http2.status`。它不解析 HTTP/1.1 Upgrade 切换、TLS 加密后的 h2 载荷、服务端推送或 HTTP/2 DATA 内容；仅凭客户端 TLS ALPN 提供 `h2` 也不能确认服务端最终选择。帧和流语义依据：[RFC 9113](https://www.rfc-editor.org/rfc/rfc9113.html)，头部压缩使用 [httlib-hpack](https://docs.rs/httlib-hpack/latest/httlib_hpack/) 解码。
 

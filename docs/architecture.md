@@ -41,6 +41,8 @@ SOCKS：表达式引用 `socks.*` 字段时按需启用 TCP 首方向请求分�
 
 VLESS：表达式引用 `vless.*` 字段时按需启用 TCP 首方向请求分析器，不限定端口。仅解析没有 TLS/REALITY 等保护层的 v0 首部，支持 TCP、UDP、Mux、Rvs 命令和目标地址；`vless.candidate` 仅表示线缆结构匹配，不验证 UUID。Mux/Rvs 没有目标地址字段。
 
+HTTP/1 Upgrade：表达式引用 `http.upgrade_offer` 或 `http.upgrade_selected` 时复用双向 HTTP/1 分析器。它分别记录客户端提议和服务端 101 响应选择的升级协议，要求同条消息带 `Connection: Upgrade`，并将响应关联到对应请求；升级后的字节不再按 HTTP/1 解析。字段仅说明明文握手的载体协商，不识别受 TLS 或升级后的载荷保护的代理协议。
+
 FET：表达式引用 `fet.*` 字段时按需分析首方向首次交付的 TCP 数据，最多采样 8192 字节。分析器按 OpenGFW 的五组豁免条件报告 `fet.candidate` 与各项统计值；这是统计启发式，不是加密真实性验证或具体代理协议识别。首次采样受 TCP 分段影响，可在规则中约束 `fet.sample_len` 并与其他字段组合。
 
 Trojan：表达式引用 `trojan.*` 字段时按需启用双向 TCP 长度序列分析器。它从客户端兼容性 ChangeCipherSpec 开始累计前四段交替方向的字节数，报告序列和统计候选标记；树模型移植自 OpenGFW，单独附带 MPL-2.0 许可。特征依赖交付分段及换向时机，不验证加密内层协议；规则可将候选标记与 TLS、FET 或端点信息组合。

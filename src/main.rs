@@ -1553,6 +1553,59 @@ mod tests {
     }
 
     #[test]
+    fn http_upgrade_rule_requires_server_selection() {
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"WebSocket upgrade","expr":"proto == tcp && http.upgrade_offer == websocket && fresh.http.upgrade_selected == websocket && fresh.http.status == 101","action":"block"}]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let tcp = |sequence: u32, payload: &[u8], reverse: bool| {
+            let mut bytes = vec![0; 40 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 6;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&443u16.to_be_bytes());
+            bytes[24..28].copy_from_slice(&sequence.to_be_bytes());
+            bytes[32] = 0x50;
+            bytes[33] = 0x18;
+            bytes[40..].copy_from_slice(payload);
+            if reverse {
+                for offset in 0..4 {
+                    bytes.swap(12 + offset, 16 + offset);
+                }
+                bytes.swap(20, 22);
+                bytes.swap(21, 23);
+            }
+            bytes
+        };
+        let evaluate = |policy: &mut dyn rustgfw_core::Policy, bytes: &[u8]| {
+            policy.evaluate(rustgfw_core::Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: rustgfw_core::FlowScope::default(),
+            })
+        };
+        let request = tcp(
+            100,
+            b"GET /ws HTTP/1.1\r\nHost: relay.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            false,
+        );
+        let response = tcp(
+            500,
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            true,
+        );
+        assert_eq!(evaluate(&mut policy, &request), Verdict::Accept);
+        assert_eq!(evaluate(&mut policy, &response), Verdict::DropFlow);
+    }
+
+    #[test]
     fn http_expression_combines_request_and_response_fields() {
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(

@@ -11,9 +11,15 @@ pub const FIELDS: &[&str] = &[
     "http.request_version",
     "http.status",
     "http.response_version",
+    "http.upgrade_offer",
+    "http.upgrade_selected",
 ];
 const REQUEST_FIELDS: &[&str] = FIELDS;
-const RESPONSE_FIELDS: &[&str] = &["http.status", "http.response_version"];
+const RESPONSE_FIELDS: &[&str] = &[
+    "http.status",
+    "http.response_version",
+    "http.upgrade_selected",
+];
 
 #[derive(Default)]
 enum Body {
@@ -294,6 +300,30 @@ fn chunk_size(line: &[u8]) -> Option<usize> {
     usize::from_str_radix(std::str::from_utf8(number).ok()?, 16).ok()
 }
 
+fn http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+}
+
+fn upgrade_tokens(value: &[u8]) -> Vec<String> {
+    let Ok(value) = std::str::from_utf8(value) else {
+        return Vec::new();
+    };
+    value
+        .split(',')
+        .map(str::trim_ascii)
+        .filter(|part| {
+            let mut components = part.split('/');
+            let valid = components.next().is_some_and(http_token)
+                && components.next().is_none_or(http_token);
+            valid && components.next().is_none()
+        })
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
 fn parse_message(header: &[u8]) -> Option<Message> {
     let mut lines = header.split(|&byte| byte == b'\n');
     let first = lines.next()?;
@@ -379,6 +409,8 @@ fn parse_message(header: &[u8]) -> Option<Message> {
     let mut framing_valid = true;
     let mut transfer_codings = Vec::new();
     let mut connection_close = false;
+    let mut connection_upgrade = false;
+    let mut upgrades = Vec::new();
     for line in lines {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
@@ -425,12 +457,39 @@ fn parse_message(header: &[u8]) -> Option<Message> {
                     .split(|&byte| byte == b',')
                     .map(|coding| coding.trim_ascii().to_vec()),
             );
-        } else if name.eq_ignore_ascii_case(b"connection")
-            && value
-                .split(|&byte| byte == b',')
-                .any(|token| token.trim_ascii().eq_ignore_ascii_case(b"close"))
+        } else if name.eq_ignore_ascii_case(b"connection") {
+            for token in value.split(|&byte| byte == b',') {
+                let token = token.trim_ascii();
+                connection_close |= token.eq_ignore_ascii_case(b"close");
+                connection_upgrade |= token.eq_ignore_ascii_case(b"upgrade");
+            }
+        } else if name.eq_ignore_ascii_case(b"upgrade") {
+            upgrades.extend(upgrade_tokens(value));
+        }
+    }
+    if http11 && connection_upgrade {
+        let field = if request {
+            Some("http.upgrade_offer")
+        } else if observations
+            .iter()
+            .any(|item| item.field == "http.status" && item.value == "101")
         {
-            connection_close = true;
+            Some("http.upgrade_selected")
+        } else {
+            None
+        };
+        if let Some(field) = field {
+            for protocol in upgrades {
+                if !observations
+                    .iter()
+                    .any(|item| item.field == field && item.value == protocol)
+                {
+                    observations.push(Observation {
+                        field,
+                        value: protocol,
+                    });
+                }
+            }
         }
     }
     let (body, continue_after) = if no_response_body {
@@ -526,6 +585,75 @@ mod tests {
         assert_eq!(
             conversation.feed(b"GET /inside HTTP/1.1\r\n\r\n", false),
             Analysis::Finished
+        );
+    }
+
+    #[test]
+    fn upgrade_offer_and_selection_are_correlated() {
+        let mut conversation = HttpConversation::default();
+        assert_eq!(
+            conversation.feed(
+                b"GET /ws HTTP/1.1\r\nHost: relay.test\r\nConnection: keep-alive, Upgr",
+                false,
+            ),
+            Analysis::Pending
+        );
+        let (offers, finished) =
+            batches(conversation.feed(b"ade\r\nUpgrade: WebSocket, h2c\r\n\r\n", false));
+        assert!(!finished);
+        assert_eq!(offers.len(), 1);
+        assert!(
+            offers[0]
+                .observations
+                .iter()
+                .any(|item| { item.field == "http.upgrade_offer" && item.value == "websocket" })
+        );
+        assert!(
+            offers[0]
+                .observations
+                .iter()
+                .any(|item| item.field == "http.upgrade_offer" && item.value == "h2c")
+        );
+        let (responses, finished) = batches(conversation.feed(
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            true,
+        ));
+        assert!(finished);
+        assert_eq!(responses.len(), 1);
+        assert!(
+            responses[0]
+                .context
+                .iter()
+                .any(|item| item.field == "http.upgrade_offer" && item.value == "websocket")
+        );
+        assert!(
+            responses[0]
+                .observations
+                .iter()
+                .any(|item| { item.field == "http.upgrade_selected" && item.value == "websocket" })
+        );
+        assert_eq!(conversation.feed(b"\x81\x00", true), Analysis::Finished);
+    }
+
+    #[test]
+    fn upgrade_header_alone_or_non_switching_response_is_not_selection() {
+        let (request, _) =
+            batches(HttpMessages::default().feed(b"GET / HTTP/1.1\r\nUpgrade: websocket\r\n\r\n"));
+        assert!(
+            !request[0]
+                .observations
+                .iter()
+                .any(|item| item.field == "http.upgrade_offer")
+        );
+        let (response, _) = batches(
+            HttpMessages::default()
+                .feed(b"HTTP/1.1 200 OK\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"),
+        );
+        assert!(
+            !response[0]
+                .observations
+                .iter()
+                .any(|item| item.field == "http.upgrade_selected")
         );
     }
 

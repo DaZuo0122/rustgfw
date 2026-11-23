@@ -6,6 +6,13 @@ pub const FIELDS: &[&str] = &[
     "tls.alpn",
     "tls.supported_version",
     "tls.ech_extension",
+    "tls.client_legacy_version",
+    "tls.client_cipher_suite",
+    "tls.client_cipher_suites",
+    "tls.client_cipher_suites_no_grease",
+    "tls.client_extension",
+    "tls.client_extensions",
+    "tls.client_extensions_no_grease",
     "tls.server_version",
     "tls.server_cipher",
     "tls.server_alpn",
@@ -66,6 +73,10 @@ impl StreamAnalyzer for TlsHello {
                             self.finished = true;
                             return Analysis::Finished;
                         };
+                        observations.extend(client_fingerprint_observations(
+                            &hello,
+                            TLS_FINGERPRINT_FIELDS,
+                        ));
                         if let Some(value) = hello.sni {
                             observations.push(Observation {
                                 field: "tls.sni",
@@ -175,12 +186,94 @@ impl<'a> Cursor<'a> {
     }
 }
 pub(crate) struct ClientHelloMetadata {
+    pub legacy_version: u16,
+    pub cipher_suites: Vec<u16>,
+    pub extension_types: Vec<u16>,
     pub sni: Option<String>,
     pub alpn: Vec<String>,
     pub supported_versions: Vec<u16>,
     pub ech_extension: bool,
     pub quic_transport_parameters: bool,
     pub quic_datagram_max_size: Option<u64>,
+}
+
+pub(crate) struct ClientFingerprintFields {
+    pub legacy_version: &'static str,
+    pub cipher_suite: &'static str,
+    pub cipher_suites: &'static str,
+    pub cipher_suites_no_grease: &'static str,
+    pub extension: &'static str,
+    pub extensions: &'static str,
+    pub extensions_no_grease: &'static str,
+}
+
+const TLS_FINGERPRINT_FIELDS: ClientFingerprintFields = ClientFingerprintFields {
+    legacy_version: "tls.client_legacy_version",
+    cipher_suite: "tls.client_cipher_suite",
+    cipher_suites: "tls.client_cipher_suites",
+    cipher_suites_no_grease: "tls.client_cipher_suites_no_grease",
+    extension: "tls.client_extension",
+    extensions: "tls.client_extensions",
+    extensions_no_grease: "tls.client_extensions_no_grease",
+};
+
+fn is_grease(value: u16) -> bool {
+    value & 0x0f0f == 0x0a0a && (value >> 8) == (value & 0xff)
+}
+
+fn append_ordered_codes(
+    observations: &mut Vec<Observation>,
+    codes: &[u16],
+    item_field: &'static str,
+    ordered_field: &'static str,
+    without_grease_field: &'static str,
+) {
+    let mut ordered = Vec::with_capacity(codes.len());
+    let mut without_grease = Vec::with_capacity(codes.len());
+    for &code in codes {
+        let value = format!("0x{code:04x}");
+        observations.push(Observation {
+            field: item_field,
+            value: value.clone(),
+        });
+        if !is_grease(code) {
+            without_grease.push(value.clone());
+        }
+        ordered.push(value);
+    }
+    observations.push(Observation {
+        field: ordered_field,
+        value: ordered.join(","),
+    });
+    observations.push(Observation {
+        field: without_grease_field,
+        value: without_grease.join(","),
+    });
+}
+
+pub(crate) fn client_fingerprint_observations(
+    hello: &ClientHelloMetadata,
+    fields: ClientFingerprintFields,
+) -> Vec<Observation> {
+    let mut observations = vec![Observation {
+        field: fields.legacy_version,
+        value: format!("0x{:04x}", hello.legacy_version),
+    }];
+    append_ordered_codes(
+        &mut observations,
+        &hello.cipher_suites,
+        fields.cipher_suite,
+        fields.cipher_suites,
+        fields.cipher_suites_no_grease,
+    );
+    append_ordered_codes(
+        &mut observations,
+        &hello.extension_types,
+        fields.extension,
+        fields.extensions,
+        fields.extensions_no_grease,
+    );
+    observations
 }
 
 fn quic_varint(cursor: &mut Cursor<'_>) -> Option<u64> {
@@ -216,7 +309,8 @@ fn quic_datagram_max_size(bytes: &[u8]) -> Option<Option<u64>> {
 
 pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> {
     let mut c = Cursor(body);
-    c.take(34)?;
+    let legacy_version = c.word()? as u16;
+    c.take(32)?;
     let session = c.byte()?;
     if session > 32 {
         return None;
@@ -226,6 +320,12 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
     if suites.is_empty() || suites.len() % 2 != 0 {
         return None;
     }
+    let cipher_suites = suites
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+        .collect();
     let compression = c.byte()?;
     if compression == 0 {
         return None;
@@ -243,9 +343,11 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
     let mut ech_extension = false;
     let mut quic_transport_parameters = false;
     let mut quic_datagram_size = None;
+    let mut extension_types = Vec::new();
     while !extensions.0.is_empty() {
         let kind = extensions.word()?;
         let data = extensions.vector()?;
+        extension_types.push(kind as u16);
         match kind {
             0 => {
                 if name.is_some() {
@@ -315,6 +417,9 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
         }
     }
     Some(ClientHelloMetadata {
+        legacy_version,
+        cipher_suites,
+        extension_types,
         sni: name,
         alpn,
         supported_versions,
@@ -490,20 +595,78 @@ mod tests {
             for byte in wire {
                 result = analyzer.feed(&[byte]);
             }
-            assert_eq!(
-                result,
-                Analysis::FinalObservations(vec![
-                    Observation {
-                        field: "tls.sni",
-                        value: "example.com".into(),
-                    },
-                    Observation {
-                        field: "tls.ech_extension",
-                        value: "false".into(),
-                    },
-                ])
+            let Analysis::FinalObservations(values) = result else {
+                panic!("expected ClientHello observations");
+            };
+            assert!(
+                values
+                    .iter()
+                    .any(|item| item.field == "tls.sni" && item.value == "example.com")
+            );
+            assert!(
+                values
+                    .iter()
+                    .any(|item| item.field == "tls.ech_extension" && item.value == "false")
+            );
+            assert!(
+                values
+                    .iter()
+                    .any(|item| item.field == "tls.client_cipher_suites" && item.value == "0x1301")
+            );
+            assert!(
+                values
+                    .iter()
+                    .any(|item| item.field == "tls.client_extensions" && item.value == "0x0000")
             );
         }
+    }
+    #[test]
+    fn client_fingerprint_keeps_wire_order_and_exposes_grease_free_order() {
+        let mut extensions = vec![0x1a, 0x1a, 0, 0, 0, 43, 0, 3, 2, 3, 4];
+        extensions.extend([0x2a, 0x2a, 0, 0]);
+        let mut body = vec![3, 3];
+        body.extend([0; 32]);
+        body.push(0);
+        body.extend(vector(&[0x0a, 0x0a, 0x13, 1, 0xc0, 0x2f]));
+        body.extend([1, 0]);
+        body.extend(vector(&extensions));
+        let mut handshake = vec![1, 0, 0, body.len() as u8];
+        handshake.extend(body);
+        let Analysis::FinalObservations(values) = TlsHello::default().feed(&record(&handshake))
+        else {
+            panic!("expected ClientHello observations");
+        };
+        let field = |name| {
+            values
+                .iter()
+                .find(|item| item.field == name)
+                .map(|item| item.value.as_str())
+        };
+        assert_eq!(field("tls.client_legacy_version"), Some("0x0303"));
+        assert_eq!(
+            field("tls.client_cipher_suites"),
+            Some("0x0a0a,0x1301,0xc02f")
+        );
+        assert_eq!(
+            field("tls.client_cipher_suites_no_grease"),
+            Some("0x1301,0xc02f")
+        );
+        assert_eq!(field("tls.client_extensions"), Some("0x1a1a,0x002b,0x2a2a"));
+        assert_eq!(field("tls.client_extensions_no_grease"), Some("0x002b"));
+        assert_eq!(
+            values
+                .iter()
+                .filter(|item| item.field == "tls.client_cipher_suite")
+                .count(),
+            3
+        );
+        assert_eq!(
+            values
+                .iter()
+                .filter(|item| item.field == "tls.client_extension")
+                .count(),
+            3
+        );
     }
     #[test]
     fn truncation_and_malformed_lengths() {

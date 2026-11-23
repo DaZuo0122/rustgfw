@@ -1533,7 +1533,7 @@ mod tests {
     fn tls_alpn_expression_enables_inspection_without_sni() {
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"HTTP/2 offer","expr":"proto == tcp && fresh.tls.alpn == h2 && tls.ech_extension == false","action":"block"}]}"#,
+            r#"{"rules":[{"name":"HTTP/2 offer","expr":"proto == tcp && fresh.tls.alpn == h2 && tls.ech_extension == false && tls.client_cipher_suite == 0x1301 && tls.client_extension == 0x0010","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();

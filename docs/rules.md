@@ -76,6 +76,8 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 | `dns.id`、`dns.qr`、`dns.opcode`、`dns.qname`、`dns.qtype`、`dns.rcode` | `dns.qname == example.test && dns.qtype == 28` | DNS 消息 ID、查询或响应、操作码、IN 类问题域名与单问题类型；`rcode` 只在响应上报告首部低四位，数值字段为十进制字符串 |
 | `dns.answer_ipv4`、`dns.answer_ipv6`、`dns.answer_cname` | `dns.qname == example.test && fresh.dns.answer_ipv4 in 203.0.113.0/24` | 响应答案段中的 IN 类 A、AAAA 地址与 CNAME 目标；一个字段可有多个值 |
 | `tls.supported_version`、`tls.ech_extension` | `tls.supported_version == 0x0304 && tls.ech_extension == true` | ClientHello 的 `supported_versions` 提供列表及 ECH 扩展是否出现；列表中的版本各产生一个观察值 |
+| `tls.client_legacy_version`、`tls.client_cipher_suite`、`tls.client_extension` | `tls.client_cipher_suite == 0x1301 && tls.client_extension == 0xfe0d` | ClientHello 的 legacy version，以及按线缆顺序分别报告的密码套件和扩展类型；单项字段可有多个值 |
+| `tls.client_cipher_suites`、`tls.client_extensions`、对应的 `_no_grease` 字段 | `tls.client_cipher_suites_no_grease == "0x1301,0x1302"` | 逗号分隔的有序十六进制列表；原始字段保留 GREASE 值，`_no_grease` 只删除 RFC 8701 保留值，仍保留其余项顺序 |
 | `tls.server_version`、`tls.server_cipher`、`tls.server_alpn` | `tls.alpn == h2 && fresh.tls.server_version == 0x0304` | TCP ServerHello 所选版本与密码套件以四位十六进制字符串表示；明文 ServerHello 中的 ALPN 单独报告 |
 | `ssh.protocol`、`ssh.software`、`ssh.banner` | `fresh.ssh.software contains "OpenSSH"` | TCP 任一方向首次识别出的 SSH 标识行字段 |
 | `wireguard.type`、`wireguard.sender_index`、`wireguard.receiver_index`、`wireguard.receiver_matched`、`wireguard.counter` | `wireguard.receiver_matched == true` | UDP WireGuard 报文形状与最近的反方向索引关联；索引和计数器按十进制字符串比较 |
@@ -91,6 +93,7 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 | `udp_shape.time_source`、`udp_shape.last_gap_us`、`udp_shape.gaps_us`、`udp_shape.origin_first_span_us`、`udp_shape.first_reply_delay_us` | `proto == udp && fresh.udp_shape.origin_first_span_us < 20000` | UDP 早期数据报的时间来源与微秒间隔；接收线程时间受排队延迟影响 |
 | `trojan.candidate`、`trojan.seq1`～`trojan.seq4` | `proto == tcp && trojan.candidate == true && trojan.seq1 >= 200` | 客户端 ChangeCipherSpec 后前四段交替方向的 TCP 字节数及长度模型的候选结果 |
 | `quic.version`、`quic.sni`、`quic.alpn`、`quic.tls_supported_version`、`quic.ech_extension`、`quic.transport_parameters`、`quic.datagram_max_size` | `fresh.quic.alpn == h3 && quic.datagram_max_size > 0` | UDP QUIC v1/v2 客户端 Initial 中的 TLS ClientHello；ALPN 为客户端提供的列表，`transport_parameters` 表示扩展号 `0x0039` 是否出现；`datagram_max_size` 是客户端声明愿意接收的最大 DATAGRAM 帧长 |
+| `quic.tls_client_legacy_version`、`quic.tls_client_cipher_suite`、`quic.tls_client_extension`、有序复数字段及其 `_no_grease` 版本 | `quic.tls_client_extensions_no_grease contains "0x0039"` | QUIC Initial 解出的 ClientHello 使用与 TCP TLS 相同的套件/扩展序列观察方式；不包含加密后的握手或 1-RTT 内容 |
 | `fresh.` 加字段名 | `fresh.dns.qname == "blocked.test"` | 该字段必须由当前包更新 |
 | 观察字段加 `exists` | `fresh.wireguard.type exists` | 字段至少有一个值；`fresh.` 还要求当前包更新 |
 | 数值观察字段 | `fresh.openvpn.tx_packets > 10` | `>`、`>=`、`<`、`<=` 按无符号十进制整数比较；非数字值不匹配 |

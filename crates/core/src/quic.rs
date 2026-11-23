@@ -1,7 +1,7 @@
 //! QUIC v1/v2 client Initial inspection. Initial keys are public by design.
 use crate::{
     inspect::{Observation, UdpStreamAnalysis, UdpStreamAnalyzer},
-    tls::client_hello_metadata,
+    tls::{ClientFingerprintFields, client_fingerprint_observations, client_hello_metadata},
 };
 use ring::{
     aead::{self, quic},
@@ -16,7 +16,23 @@ pub const FIELDS: &[&str] = &[
     "quic.ech_extension",
     "quic.transport_parameters",
     "quic.datagram_max_size",
+    "quic.tls_client_legacy_version",
+    "quic.tls_client_cipher_suite",
+    "quic.tls_client_cipher_suites",
+    "quic.tls_client_cipher_suites_no_grease",
+    "quic.tls_client_extension",
+    "quic.tls_client_extensions",
+    "quic.tls_client_extensions_no_grease",
 ];
+const QUIC_FINGERPRINT_FIELDS: ClientFingerprintFields = ClientFingerprintFields {
+    legacy_version: "quic.tls_client_legacy_version",
+    cipher_suite: "quic.tls_client_cipher_suite",
+    cipher_suites: "quic.tls_client_cipher_suites",
+    cipher_suites_no_grease: "quic.tls_client_cipher_suites_no_grease",
+    extension: "quic.tls_client_extension",
+    extensions: "quic.tls_client_extensions",
+    extensions_no_grease: "quic.tls_client_extensions_no_grease",
+};
 const V1: u32 = 1;
 const V2: u32 = 0x6b33_43cf;
 const SALT_V1: [u8; 20] = [
@@ -380,6 +396,10 @@ impl UdpStreamAnalyzer for QuicInitial {
             value: if version == V1 { "1" } else { "2" }.into(),
         }];
         if let Some(hello) = client_hello_metadata(&stream[4..4 + length]) {
+            observations.extend(client_fingerprint_observations(
+                &hello,
+                QUIC_FINGERPRINT_FIELDS,
+            ));
             if let Some(value) = hello.sni {
                 observations.push(Observation {
                     field: "quic.sni",
@@ -566,6 +586,18 @@ mod tests {
             assert_eq!(field(&result, "quic.ech_extension"), Some("true"));
             assert_eq!(field(&result, "quic.transport_parameters"), Some("true"));
             assert_eq!(field(&result, "quic.datagram_max_size"), Some("1456"));
+            assert_eq!(
+                field(&result, "quic.tls_client_legacy_version"),
+                Some("0x0303")
+            );
+            assert_eq!(
+                field(&result, "quic.tls_client_cipher_suites"),
+                Some("0x1301")
+            );
+            assert_eq!(
+                field(&result, "quic.tls_client_extensions"),
+                Some("0x0000,0x0010,0x002b,0xfe0d,0x0039")
+            );
             if let UdpStreamAnalysis::FinalObservations(values) = &result {
                 assert!(
                     values

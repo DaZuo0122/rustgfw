@@ -42,7 +42,8 @@ pub struct TcpShape {
     last_time: Option<CaptureTime>,
     gaps: Vec<Option<u64>>,
     syn_time: Option<CaptureTime>,
-    saw_syn_ack: bool,
+    syn_sequence: Option<u32>,
+    syn_ack_sequence: Option<u32>,
     handshake_rtt_us: Option<u64>,
 }
 
@@ -54,18 +55,34 @@ impl TcpPacketAnalyzer for TcpShape {
     fn observe_header(
         &mut self,
         flags: u8,
+        sequence: u32,
+        acknowledgment: u32,
         reverse: bool,
         capture_time: Option<CaptureTime>,
     ) -> Analysis {
-        if !reverse && flags & 0x12 == 0x02 && self.syn_time.is_none() {
-            self.syn_time = capture_time;
+        if !reverse && flags & 0x12 == 0x02 {
+            if self.syn_sequence.is_none() {
+                self.syn_sequence = Some(sequence);
+            }
+            if self.syn_sequence == Some(sequence) && self.syn_time.is_none() {
+                self.syn_time = capture_time;
+            }
         }
-        if reverse && flags & 0x12 == 0x12 {
-            self.saw_syn_ack = true;
+        if reverse
+            && flags & 0x12 == 0x12
+            && self
+                .syn_sequence
+                .is_some_and(|syn| acknowledgment == syn.wrapping_add(1))
+            && self.syn_ack_sequence.is_none()
+        {
+            self.syn_ack_sequence = Some(sequence);
         }
         if !reverse
             && flags & 0x12 == 0x10
-            && self.saw_syn_ack
+            && flags & 0x04 == 0
+            && self
+                .syn_ack_sequence
+                .is_some_and(|syn_ack| acknowledgment == syn_ack.wrapping_add(1))
             && self.handshake_rtt_us.is_none()
             && let Some(rtt) = capture_time
                 .zip(self.syn_time)
@@ -345,15 +362,31 @@ mod tests {
         let at =
             |micros| CaptureTime::Kernel(SystemTime::UNIX_EPOCH + Duration::from_micros(micros));
         assert!(matches!(
-            shape.observe_header(0x02, false, Some(at(0))),
+            shape.observe_header(0x02, 99, 0, false, Some(at(0))),
             Analysis::Pending
         ));
         assert!(matches!(
-            shape.observe_header(0x12, true, Some(at(5_000))),
+            shape.observe_header(0x12, 499, 999, true, Some(at(5_000))),
             Analysis::Pending
         ));
-        let rtt = observations(shape.observe_header(0x10, false, Some(at(10_000))));
-        assert_eq!(field(&rtt, "tcp_shape.handshake_rtt_us"), Some("10000"));
+        assert!(matches!(
+            shape.observe_header(0x10, 100, 500, false, Some(at(10_000))),
+            Analysis::Pending
+        ));
+        assert!(matches!(
+            shape.observe_header(0x12, 499, 100, true, Some(at(11_000))),
+            Analysis::Pending
+        ));
+        assert!(matches!(
+            shape.observe_header(0x10, 100, 999, false, Some(at(11_500))),
+            Analysis::Pending
+        ));
+        assert!(matches!(
+            shape.observe_header(0x14, 100, 500, false, Some(at(11_750))),
+            Analysis::Pending
+        ));
+        let rtt = observations(shape.observe_header(0x10, 100, 500, false, Some(at(12_000))));
+        assert_eq!(field(&rtt, "tcp_shape.handshake_rtt_us"), Some("12000"));
         observations(shape.feed_timed(10, &[1; 100], false, Some(at(12_000))));
         let values = observations(shape.feed_timed(110, &[2; 200], false, Some(at(15_000))));
         assert_eq!(field(&values, "tcp_shape.timed_bursts"), Some("300"));
@@ -371,5 +404,16 @@ mod tests {
                 .iter()
                 .any(|value| value.field == "tcp_shape.size_trigram" && value.value == "2,2,-2")
         );
+    }
+
+    #[test]
+    fn handshake_ack_validation_handles_sequence_wraparound() {
+        let mut shape = TcpShape::default();
+        let at =
+            |micros| CaptureTime::Kernel(SystemTime::UNIX_EPOCH + Duration::from_micros(micros));
+        shape.observe_header(0x02, u32::MAX, 0, false, Some(at(100)));
+        shape.observe_header(0x12, u32::MAX, 0, true, Some(at(200)));
+        let values = observations(shape.observe_header(0x10, 0, 0, false, Some(at(400))));
+        assert_eq!(field(&values, "tcp_shape.handshake_rtt_us"), Some("300"));
     }
 }

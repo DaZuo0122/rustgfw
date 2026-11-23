@@ -1952,6 +1952,14 @@ mod tests {
             bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
             bytes[22..24].copy_from_slice(&443u16.to_be_bytes());
             bytes[24..28].copy_from_slice(&sequence.to_be_bytes());
+            let acknowledgment = if flags & 0x10 == 0 {
+                0u32
+            } else if reverse {
+                100
+            } else {
+                500
+            };
+            bytes[28..32].copy_from_slice(&acknowledgment.to_be_bytes());
             bytes[32] = 0x50;
             bytes[33] = flags;
             bytes[40..].copy_from_slice(payload);

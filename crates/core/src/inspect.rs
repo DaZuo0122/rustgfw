@@ -61,6 +61,8 @@ pub trait TcpPacketAnalyzer {
     fn observe_header(
         &mut self,
         _flags: u8,
+        _sequence: u32,
+        _acknowledgment: u32,
         _reverse: bool,
         _capture_time: Option<CaptureTime>,
     ) -> Analysis {
@@ -1426,7 +1428,13 @@ impl<P: Policy> Policy for Inspect<P> {
                     continue;
                 };
                 let mut finished = collect_tcp_analysis(
-                    analyzer.observe_header(t.tcp_flags, reverse, packet.capture_time),
+                    analyzer.observe_header(
+                        t.tcp_flags,
+                        t.tcp_sequence.unwrap(),
+                        t.tcp_acknowledgment.unwrap(),
+                        reverse,
+                        packet.capture_time,
+                    ),
                     &|_| false,
                     &mut flow.facts,
                     &mut flow.blocked,

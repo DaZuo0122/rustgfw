@@ -23,6 +23,7 @@ pub struct Transport<'a> {
     pub payload_offset: usize,
     pub tcp_flags: u8,
     pub tcp_sequence: Option<u32>,
+    pub tcp_acknowledgment: Option<u32>,
 }
 
 fn word(bytes: &[u8], offset: usize) -> u16 {
@@ -136,6 +137,8 @@ pub fn parse(bytes: &[u8]) -> Result<Transport<'_>, ParseError> {
         tcp_flags,
         tcp_sequence: (protocol == Protocol::Tcp)
             .then(|| u32::from_be_bytes(data[4..8].try_into().unwrap())),
+        tcp_acknowledgment: (protocol == Protocol::Tcp)
+            .then(|| u32::from_be_bytes(data[8..12].try_into().unwrap())),
     })
 }
 
@@ -238,6 +241,7 @@ mod tests {
     fn lengths_fragments_and_payload() {
         let mut p = udp(false);
         assert_eq!(parse(&p).unwrap().payload, b"dns");
+        assert_eq!(parse(&p).unwrap().tcp_acknowledgment, None);
         for len in 0..p.len() {
             assert!(parse(&p[..len]).is_err());
         }
@@ -247,6 +251,24 @@ mod tests {
         p[25] = 7;
         assert_eq!(parse(&p).unwrap_err(), ParseError::Malformed);
     }
+
+    #[test]
+    fn tcp_sequence_and_acknowledgment_are_parsed_separately() {
+        let mut packet = vec![0u8; 40];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&40u16.to_be_bytes());
+        packet[9] = 6;
+        packet[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&443u16.to_be_bytes());
+        packet[24..28].copy_from_slice(&u32::MAX.to_be_bytes());
+        packet[28..32].copy_from_slice(&500u32.to_be_bytes());
+        packet[32] = 0x50;
+        packet[33] = 0x10;
+        let parsed = parse(&packet).unwrap();
+        assert_eq!(parsed.tcp_sequence, Some(u32::MAX));
+        assert_eq!(parsed.tcp_acknowledgment, Some(500));
+    }
+
     #[test]
     fn ipv6_extension_header() {
         let mut p = vec![0; 56];

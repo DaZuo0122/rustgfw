@@ -289,9 +289,16 @@ impl Options {
                     .iter()
                     .any(|field| rule.condition.references_field(field))
         });
-        let needs_quic_udp = self.expr_rules.iter().any(|rule| {
+        let needs_quic_client = self.expr_rules.iter().any(|rule| {
             eligible(rule, Protocol::Udp)
-                && rustgfw_core::quic::FIELDS
+                && rustgfw_core::quic::FIELDS.iter().any(|field| {
+                    !rustgfw_core::quic::SERVER_FIELDS.contains(field)
+                        && rule.condition.references_field(field)
+                })
+        });
+        let needs_quic_server = self.expr_rules.iter().any(|rule| {
+            eligible(rule, Protocol::Udp)
+                && rustgfw_core::quic::SERVER_FIELDS
                     .iter()
                     .any(|field| rule.condition.references_field(field))
         });
@@ -381,11 +388,16 @@ impl Options {
                     Box::new(rustgfw_core::openvpn::OpenVpnUdp::default())
                 })
             }),
-            needs_quic_udp.then(|| {
+            needs_quic_client.then(|| {
                 UdpStreamRule::new(
                     None,
                     || Box::new(rustgfw_core::quic::QuicInitial::default()),
                 )
+            }),
+            needs_quic_server.then(|| {
+                UdpStreamRule::new(None, || {
+                    Box::new(rustgfw_core::quic::QuicServerInitial::default())
+                })
             }),
             needs_udp_shape.then(|| {
                 UdpStreamRule::new(None, || {

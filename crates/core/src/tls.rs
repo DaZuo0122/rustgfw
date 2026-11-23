@@ -540,14 +540,14 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
     })
 }
 
-struct ServerHelloMetadata {
-    version: u16,
-    cipher: u16,
+pub(crate) struct ServerHelloMetadata {
+    pub(crate) version: u16,
+    pub(crate) cipher: u16,
     alpn: Option<String>,
-    retry: bool,
+    pub(crate) retry: bool,
 }
 
-fn server_hello_metadata(body: &[u8]) -> Option<ServerHelloMetadata> {
+pub(crate) fn server_hello_metadata(body: &[u8]) -> Option<ServerHelloMetadata> {
     let mut c = Cursor(body);
     let legacy_version = c.word()? as u16;
     let random = c.take(32)?;

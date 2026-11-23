@@ -1,7 +1,10 @@
-//! QUIC v1/v2 client Initial inspection. Initial keys are public by design.
+//! QUIC v1/v2 Initial inspection. Initial keys are public by design.
 use crate::{
     inspect::{Observation, UdpStreamAnalysis, UdpStreamAnalyzer},
-    tls::{ClientFingerprintFields, client_fingerprint_observations, client_hello_metadata},
+    tls::{
+        ClientFingerprintFields, client_fingerprint_observations, client_hello_metadata,
+        server_hello_metadata,
+    },
 };
 use ring::{
     aead::{self, quic},
@@ -32,7 +35,10 @@ pub const FIELDS: &[&str] = &[
     "quic.tls_client_key_share_group",
     "quic.tls_client_key_share_groups",
     "quic.tls_client_key_share_groups_no_grease",
+    "quic.server_version",
+    "quic.server_cipher",
 ];
+pub const SERVER_FIELDS: &[&str] = &["quic.server_version", "quic.server_cipher"];
 const QUIC_FINGERPRINT_FIELDS: ClientFingerprintFields = ClientFingerprintFields {
     legacy_version: "quic.tls_client_legacy_version",
     cipher_suite: "quic.tls_client_cipher_suite",
@@ -94,14 +100,18 @@ struct InitialKeys {
     iv: [u8; 12],
 }
 
-fn initial_material(version: u32, dcid: &[u8]) -> Option<([u8; 16], [u8; 12], [u8; 16])> {
+fn initial_material_for(
+    version: u32,
+    dcid: &[u8],
+    server: bool,
+) -> Option<([u8; 16], [u8; 12], [u8; 16])> {
     let (salt, key_label, iv_label, hp_label) = match version {
         V1 => (&SALT_V1[..], "quic key", "quic iv", "quic hp"),
         V2 => (&SALT_V2[..], "quicv2 key", "quicv2 iv", "quicv2 hp"),
         _ => return None,
     };
     let initial = hkdf::Salt::new(hkdf::HKDF_SHA256, salt).extract(dcid);
-    let secret = expand_label(&initial, "client in", 32)?;
+    let secret = expand_label(&initial, if server { "server in" } else { "client in" }, 32)?;
     let client = hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, &secret);
     let key = expand_label(&client, key_label, 16)?.try_into().ok()?;
     let iv: [u8; 12] = expand_label(&client, iv_label, 12)?.try_into().ok()?;
@@ -109,13 +119,17 @@ fn initial_material(version: u32, dcid: &[u8]) -> Option<([u8; 16], [u8; 12], [u
     Some((key, iv, hp))
 }
 
-fn initial_keys(version: u32, dcid: &[u8]) -> Option<InitialKeys> {
-    let (key, iv, hp) = initial_material(version, dcid)?;
+fn initial_keys_for(version: u32, dcid: &[u8], server: bool) -> Option<InitialKeys> {
+    let (key, iv, hp) = initial_material_for(version, dcid, server)?;
     Some(InitialKeys {
         payload: aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, &key).ok()?),
         header: quic::HeaderProtectionKey::new(&quic::AES_128, &hp).ok()?,
         iv,
     })
+}
+
+fn initial_keys(version: u32, dcid: &[u8]) -> Option<InitialKeys> {
+    initial_keys_for(version, dcid, false)
 }
 
 fn varint(bytes: &[u8], cursor: &mut usize) -> Option<u64> {
@@ -133,6 +147,7 @@ fn varint(bytes: &[u8], cursor: &mut usize) -> Option<u64> {
 struct Header<'a> {
     version: u32,
     dcid: &'a [u8],
+    scid: &'a [u8],
     packet_len: usize,
     pn_offset: usize,
     initial: bool,
@@ -165,7 +180,7 @@ fn parse_header(bytes: &[u8]) -> Option<Header<'_>> {
     if scid_len > 20 {
         return None;
     }
-    bytes.get(cursor..cursor + scid_len)?;
+    let scid = bytes.get(cursor..cursor + scid_len)?;
     cursor += scid_len;
     if initial {
         let token_len = usize::try_from(varint(bytes, &mut cursor)?).ok()?;
@@ -180,6 +195,7 @@ fn parse_header(bytes: &[u8]) -> Option<Header<'_>> {
     Some(Header {
         version,
         dcid,
+        scid,
         packet_len,
         pn_offset: cursor,
         initial,
@@ -247,6 +263,49 @@ struct Fragment {
     data: Vec<u8>,
 }
 
+#[derive(Default)]
+struct CryptoBuffer {
+    fragments: Vec<Fragment>,
+    retained_bytes: usize,
+}
+
+impl CryptoBuffer {
+    fn insert(&mut self, frame: Fragment) -> bool {
+        for existing in &self.fragments {
+            let start = frame.offset.max(existing.offset);
+            let end = (frame.offset + frame.data.len()).min(existing.offset + existing.data.len());
+            if start < end
+                && frame.data[start - frame.offset..end - frame.offset]
+                    != existing.data[start - existing.offset..end - existing.offset]
+            {
+                return false;
+            }
+        }
+        if self.fragments.len() == MAX_FRAMES
+            || self.retained_bytes + frame.data.len() > MAX_CRYPTO_BYTES
+        {
+            return false;
+        }
+        self.retained_bytes += frame.data.len();
+        self.fragments.push(frame);
+        true
+    }
+
+    fn contiguous(&mut self) -> Vec<u8> {
+        self.fragments.sort_by_key(|frame| frame.offset);
+        let mut data = Vec::new();
+        for frame in &self.fragments {
+            if frame.offset > data.len() {
+                break;
+            }
+            if frame.offset + frame.data.len() > data.len() {
+                data.extend_from_slice(&frame.data[data.len() - frame.offset..]);
+            }
+        }
+        data
+    }
+}
+
 fn crypto_frames(plaintext: &[u8]) -> Option<Vec<Fragment>> {
     let mut cursor = 0;
     let mut fragments = Vec::new();
@@ -288,49 +347,11 @@ fn crypto_frames(plaintext: &[u8]) -> Option<Vec<Fragment>> {
 #[derive(Default)]
 pub struct QuicInitial {
     connection: Option<(u32, Vec<u8>)>,
-    fragments: Vec<Fragment>,
-    retained_bytes: usize,
+    crypto: CryptoBuffer,
     largest_number: Option<u64>,
     client_direction: Option<bool>,
     client_datagrams: usize,
     finished: bool,
-}
-
-impl QuicInitial {
-    fn insert(&mut self, frame: Fragment) -> bool {
-        for existing in &self.fragments {
-            let start = frame.offset.max(existing.offset);
-            let end = (frame.offset + frame.data.len()).min(existing.offset + existing.data.len());
-            if start < end
-                && frame.data[start - frame.offset..end - frame.offset]
-                    != existing.data[start - existing.offset..end - existing.offset]
-            {
-                return false;
-            }
-        }
-        if self.fragments.len() == MAX_FRAMES
-            || self.retained_bytes + frame.data.len() > MAX_CRYPTO_BYTES
-        {
-            return false;
-        }
-        self.retained_bytes += frame.data.len();
-        self.fragments.push(frame);
-        true
-    }
-
-    fn contiguous(&mut self) -> Vec<u8> {
-        self.fragments.sort_by_key(|frame| frame.offset);
-        let mut data = Vec::new();
-        for frame in &self.fragments {
-            if frame.offset > data.len() {
-                break;
-            }
-            if frame.offset + frame.data.len() > data.len() {
-                data.extend_from_slice(&frame.data[data.len() - frame.offset..]);
-            }
-        }
-        data
-    }
 }
 
 impl UdpStreamAnalyzer for QuicInitial {
@@ -384,7 +405,7 @@ impl UdpStreamAnalyzer for QuicInitial {
             }
             self.largest_number = Some(self.largest_number.map_or(number, |old| old.max(number)));
             for frame in frames {
-                if !self.insert(frame) {
+                if !self.crypto.insert(frame) {
                     self.finished = true;
                     return UdpStreamAnalysis::Finished;
                 }
@@ -394,7 +415,7 @@ impl UdpStreamAnalyzer for QuicInitial {
         if !accepted {
             return UdpStreamAnalysis::Pending;
         }
-        let stream = self.contiguous();
+        let stream = self.crypto.contiguous();
         if stream.len() < 4 {
             return UdpStreamAnalysis::Pending;
         }
@@ -453,6 +474,160 @@ impl UdpStreamAnalyzer for QuicInitial {
             }
         }
         UdpStreamAnalysis::FinalObservations(observations)
+    }
+}
+
+struct ServerConnection {
+    version: u32,
+    initial_dcid: Vec<u8>,
+    client_scid: Vec<u8>,
+    client_direction: bool,
+}
+
+/// Observes a server's first TLS ServerHello from the public QUIC Initial space.
+#[derive(Default)]
+pub struct QuicServerInitial {
+    connection: Option<ServerConnection>,
+    crypto: CryptoBuffer,
+    largest_number: Option<u64>,
+    server_datagrams: usize,
+    finished: bool,
+}
+
+impl QuicServerInitial {
+    fn server_hello(&mut self) -> UdpStreamAnalysis {
+        let stream = self.crypto.contiguous();
+        if stream.len() < 4 {
+            return UdpStreamAnalysis::Pending;
+        }
+        let mut offset = 0;
+        let mut seen_retry = false;
+        loop {
+            if stream.len() < offset + 4 {
+                return UdpStreamAnalysis::Pending;
+            }
+            let length = usize::from(stream[offset + 1]) << 16
+                | usize::from(stream[offset + 2]) << 8
+                | usize::from(stream[offset + 3]);
+            if stream[offset] != 2 || length > MAX_CRYPTO_BYTES - offset - 4 {
+                self.finished = true;
+                return UdpStreamAnalysis::Finished;
+            }
+            if stream.len() < offset + 4 + length {
+                return UdpStreamAnalysis::Pending;
+            }
+            let Some(hello) = server_hello_metadata(&stream[offset + 4..offset + 4 + length])
+            else {
+                self.finished = true;
+                return UdpStreamAnalysis::Finished;
+            };
+            if !hello.retry {
+                self.finished = true;
+                return UdpStreamAnalysis::FinalObservations(vec![
+                    Observation {
+                        field: "quic.server_version",
+                        value: format!("0x{:04x}", hello.version),
+                    },
+                    Observation {
+                        field: "quic.server_cipher",
+                        value: format!("0x{:04x}", hello.cipher),
+                    },
+                ]);
+            }
+            if seen_retry {
+                self.finished = true;
+                return UdpStreamAnalysis::Finished;
+            }
+            seen_retry = true;
+            offset += 4 + length;
+        }
+    }
+}
+
+impl UdpStreamAnalyzer for QuicServerInitial {
+    fn feed(&mut self, payload: &[u8], reverse: bool) -> UdpStreamAnalysis {
+        if self.finished {
+            return UdpStreamAnalysis::Finished;
+        }
+        if self
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.client_direction == reverse)
+        {
+            return UdpStreamAnalysis::Pending;
+        }
+        let mut datagram = payload;
+        let mut packets = 0;
+        let mut accepted = false;
+        while let Some(header) = parse_header(datagram) {
+            packets += 1;
+            if packets > MAX_COALESCED_PACKETS {
+                break;
+            }
+            let packet = &datagram[..header.packet_len];
+            datagram = &datagram[header.packet_len..];
+            if !header.initial {
+                continue;
+            }
+            if let Some(connection) = &self.connection {
+                if header.version != connection.version || header.dcid != connection.client_scid {
+                    continue;
+                }
+                let Some(keys) =
+                    initial_keys_for(connection.version, &connection.initial_dcid, true)
+                else {
+                    continue;
+                };
+                let Some((number, plaintext)) =
+                    open_initial(packet, header.pn_offset, &keys, self.largest_number)
+                else {
+                    continue;
+                };
+                let Some(frames) = crypto_frames(&plaintext) else {
+                    continue;
+                };
+                self.largest_number =
+                    Some(self.largest_number.map_or(number, |old| old.max(number)));
+                for frame in frames {
+                    if !self.crypto.insert(frame) {
+                        self.finished = true;
+                        return UdpStreamAnalysis::Finished;
+                    }
+                }
+                accepted = true;
+            } else {
+                let Some(keys) = initial_keys(header.version, header.dcid) else {
+                    continue;
+                };
+                let Some((_, plaintext)) = open_initial(packet, header.pn_offset, &keys, None)
+                else {
+                    continue;
+                };
+                if crypto_frames(&plaintext).is_none() {
+                    continue;
+                }
+                self.connection = Some(ServerConnection {
+                    version: header.version,
+                    initial_dcid: header.dcid.to_vec(),
+                    client_scid: header.scid.to_vec(),
+                    client_direction: reverse,
+                });
+            }
+        }
+        if self.connection.is_some()
+            && self.connection.as_ref().unwrap().client_direction != reverse
+        {
+            self.server_datagrams += 1;
+            if self.server_datagrams > MAX_CLIENT_DATAGRAMS {
+                self.finished = true;
+                return UdpStreamAnalysis::Finished;
+            }
+        }
+        if accepted {
+            self.server_hello()
+        } else {
+            UdpStreamAnalysis::Pending
+        }
     }
 }
 
@@ -518,9 +693,16 @@ mod tests {
         }
     }
 
-    fn initial(version: u32, number: u8, offset: usize, data: &[u8]) -> Vec<u8> {
-        let dcid = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
-        let keys = initial_keys(version, &dcid).unwrap();
+    fn initial_packet(
+        version: u32,
+        number: u8,
+        offset: usize,
+        data: &[u8],
+        cids: (&[u8], &[u8], &[u8]),
+        server: bool,
+    ) -> Vec<u8> {
+        let (dcid, scid, key_dcid) = cids;
+        let keys = initial_keys_for(version, key_dcid, server).unwrap();
         let mut plaintext = vec![6];
         plaintext.extend(encode_varint(offset));
         plaintext.extend(encode_varint(data.len()));
@@ -531,7 +713,9 @@ mod tests {
         header.extend(version.to_be_bytes());
         header.push(dcid.len() as u8);
         header.extend(dcid);
-        header.extend([0, 0]); // Empty source CID and token.
+        header.push(scid.len() as u8);
+        header.extend(scid);
+        header.push(0); // Empty token.
         header.extend(encode_varint(1 + plaintext.len() + 16));
         let pn_offset = header.len();
         header.push(number);
@@ -550,6 +734,22 @@ mod tests {
         header[0] ^= mask[0] & 0x0f;
         header[pn_offset] ^= mask[1];
         header
+    }
+
+    fn initial(version: u32, number: u8, offset: usize, data: &[u8]) -> Vec<u8> {
+        let dcid = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
+        initial_packet(version, number, offset, data, (&dcid, &[], &dcid), false)
+    }
+
+    fn server_hello() -> Vec<u8> {
+        let mut body = vec![3, 3];
+        body.extend([0x42; 32]);
+        body.extend([0, 0x13, 1, 0]);
+        body.extend(vector(&[0, 43, 0, 2, 3, 4]));
+        let len = body.len();
+        let mut handshake = vec![2, (len >> 16) as u8, (len >> 8) as u8, len as u8];
+        handshake.extend(body);
+        handshake
     }
 
     fn field<'a>(result: &'a UdpStreamAnalysis, name: &str) -> Option<&'a str> {
@@ -580,7 +780,26 @@ mod tests {
                 "45b95e15235d6f45a6b19cbcb0294ba9",
             ),
         ] {
-            let actual = initial_material(version, &dcid).unwrap();
+            let actual = initial_material_for(version, &dcid, false).unwrap();
+            assert_eq!(actual.0.as_slice(), hex(key));
+            assert_eq!(actual.1.as_slice(), hex(iv));
+            assert_eq!(actual.2.as_slice(), hex(hp));
+        }
+        for (version, key, iv, hp) in [
+            (
+                V1,
+                "cf3a5331653c364c88f0f379b6067e37",
+                "0ac1493ca1905853b0bba03e",
+                "c206b8d9b9f0f37644430b490eeaa314",
+            ),
+            (
+                V2,
+                "82db637861d55e1d011f19ea71d5d2a7",
+                "dd13c276499c0249d3310652",
+                "edf6d05c83121201b436e16877593c3a",
+            ),
+        ] {
+            let actual = initial_material_for(version, &dcid, true).unwrap();
             assert_eq!(actual.0.as_slice(), hex(key));
             assert_eq!(actual.1.as_slice(), hex(iv));
             assert_eq!(actual.2.as_slice(), hex(hp));
@@ -683,6 +902,120 @@ mod tests {
         assert_eq!(
             field(&analyzer.feed(&valid, false), "quic.sni"),
             Some("blocked.test")
+        );
+    }
+
+    #[test]
+    fn decrypts_and_reassembles_v1_v2_server_hello() {
+        let initial_dcid = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
+        let client_scid = [0x11, 0x22, 0x33, 0x44];
+        let server_scid = [0xaa, 0xbb, 0xcc, 0xdd];
+        for version in [V1, V2] {
+            let client = initial_packet(
+                version,
+                0,
+                0,
+                &client_hello("example.test", true),
+                (&initial_dcid, &client_scid, &initial_dcid),
+                false,
+            );
+            let hello = server_hello();
+            let split = hello.len() / 2;
+            let later = initial_packet(
+                version,
+                1,
+                split,
+                &hello[split..],
+                (&client_scid, &server_scid, &initial_dcid),
+                true,
+            );
+            let earlier = initial_packet(
+                version,
+                0,
+                0,
+                &hello[..split],
+                (&client_scid, &server_scid, &initial_dcid),
+                true,
+            );
+            let mut analyzer = QuicServerInitial::default();
+            assert!(matches!(
+                analyzer.feed(&client, false),
+                UdpStreamAnalysis::Pending
+            ));
+            assert!(matches!(
+                analyzer.feed(&later, true),
+                UdpStreamAnalysis::Pending
+            ));
+            let result = analyzer.feed(&earlier, true);
+            assert_eq!(field(&result, "quic.server_version"), Some("0x0304"));
+            assert_eq!(field(&result, "quic.server_cipher"), Some("0x1301"));
+            assert!(matches!(
+                analyzer.feed(&earlier, true),
+                UdpStreamAnalysis::Finished
+            ));
+
+            let mut reversed = QuicServerInitial::default();
+            assert!(matches!(
+                reversed.feed(&client, true),
+                UdpStreamAnalysis::Pending
+            ));
+            assert_eq!(
+                field(&reversed.feed(&earlier, false), "quic.server_cipher"),
+                None
+            );
+            assert_eq!(
+                field(&reversed.feed(&later, false), "quic.server_cipher"),
+                Some("0x1301")
+            );
+        }
+    }
+
+    #[test]
+    fn server_hello_requires_matching_cid_and_valid_initial_tag() {
+        let initial_dcid = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
+        let client_scid = [0x11, 0x22, 0x33, 0x44];
+        let client = initial_packet(
+            V1,
+            0,
+            0,
+            &client_hello("example.test", true),
+            (&initial_dcid, &client_scid, &initial_dcid),
+            false,
+        );
+        let valid = initial_packet(
+            V1,
+            0,
+            0,
+            &server_hello(),
+            (&client_scid, &[0xaa], &initial_dcid),
+            true,
+        );
+        let wrong_cid = initial_packet(
+            V1,
+            0,
+            0,
+            &server_hello(),
+            (&[0xff], &[0xaa], &initial_dcid),
+            true,
+        );
+        let mut corrupt = valid.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        let mut analyzer = QuicServerInitial::default();
+        assert!(matches!(
+            analyzer.feed(&client, false),
+            UdpStreamAnalysis::Pending
+        ));
+        assert!(matches!(
+            analyzer.feed(&wrong_cid, true),
+            UdpStreamAnalysis::Pending
+        ));
+        assert!(matches!(
+            analyzer.feed(&corrupt, true),
+            UdpStreamAnalysis::Pending
+        ));
+        assert_eq!(
+            field(&analyzer.feed(&valid, true), "quic.server_cipher"),
+            Some("0x1301")
         );
     }
 

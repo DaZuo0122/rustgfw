@@ -543,7 +543,7 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
 pub(crate) struct ServerHelloMetadata {
     pub(crate) version: u16,
     pub(crate) cipher: u16,
-    alpn: Option<String>,
+    pub(crate) alpn: Option<String>,
     pub(crate) retry: bool,
 }
 
@@ -602,8 +602,8 @@ pub(crate) fn server_hello_metadata(body: &[u8]) -> Option<ServerHelloMetadata> 
             }
         }
     }
-    if version == 0x0304 {
-        // TLS 1.3 sends its selected ALPN in encrypted EncryptedExtensions.
+    if matches!(version, 0x0304 | 0xfefc) {
+        // TLS/DTLS 1.3 sends its selected ALPN in encrypted EncryptedExtensions.
         alpn = None;
     }
     Some(ServerHelloMetadata {

@@ -5,6 +5,7 @@ use std::{
 };
 pub mod conditions;
 pub mod dns;
+pub mod dtls;
 pub mod fet;
 pub mod http;
 pub mod http2;

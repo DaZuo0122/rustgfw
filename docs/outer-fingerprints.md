@@ -24,6 +24,8 @@ TCP 序列按照**包到达顺序**记录，不是 TCP 重组后的字节块大�
 
 `UdpShape` 在按需启用时观察同一 UDP 端点对的前 8 个数据报。它记录首包长度、前 64 字节的平均置位数、可打印字符比例与 Shannon 熵，以及相对首包方向的有符号包长序列、首次反向前的同向包数和累计字节数。`udp_shape.first_quic_initial_shape` 只检查 v1/v2 Initial 的可见头部形状，不进行 QUIC AEAD 验证；需要验证公开 Initial 时继续使用 `quic.*`。
 
+DTLS 的 epoch 0 握手也有可见外层结构；需要区分它与随机外观 UDP 候选时使用 `dtls.*`。`DtlsHello` 可在分片跨多个数据报时重组 ClientHello，提取 SNI、ALPN、扩展序列及 cookie 交换事实；这些字段描述载体握手，不指认其内部隧道应用。
+
 `udp_shape.fragmented_random_candidate` 在首次反向之前至少两个同向数据报累计达到 1200 字节、每个被检查数据报前缀至少 32 字节、平均置位数位于 3.4–4.6、可打印比例低于 0.5、前缀熵至少 4.5 bit/byte，且没有标准 v1/v2 Initial 形状时置为 `true`。数值门槛是据论文和 Gecko 线缆格式提出的工程假设，尚未用带标签的 Hysteria2 Gecko、普通 H3、游戏及语音 UDP 样本校准；规则应结合端点、`quic.*` 和双向序列评估误报。
 
 本地只读对照测试已检查 OpenGFW 提供的 Chrome、Firefox、curl、quiche、ngtcp2、aioquic 客户端 QUIC Initial 抓包；这些首包均被标为标准 Initial 形状，未触发随机碎片候选。这组对照只覆盖握手首包，不代表整个正常 UDP 背景流量。

@@ -268,6 +268,8 @@ impl Condition {
                                     | "tls.alpn"
                                     | "tls.server_alpn"
                                     | "quic.alpn"
+                                    | "dtls.alpn"
+                                    | "dtls.server_alpn"
                             );
                             operator.matches(actual.as_bytes(), value.as_bytes(), insensitive)
                         })

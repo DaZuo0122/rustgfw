@@ -18,6 +18,7 @@ type Error = Box<dyn std::error::Error>;
 fn observation_field_possible(field: &str, protocol: Protocol) -> bool {
     if rustgfw_core::wireguard::FIELDS.contains(&field)
         || rustgfw_core::quic::FIELDS.contains(&field)
+        || rustgfw_core::dtls::FIELDS.contains(&field)
         || rustgfw_core::udp_shape::FIELDS.contains(&field)
         || rustgfw_core::http3::FIELDS.contains(&field)
     {
@@ -302,6 +303,12 @@ impl Options {
                     .iter()
                     .any(|field| rule.condition.references_field(field))
         });
+        let needs_dtls_udp = self.expr_rules.iter().any(|rule| {
+            eligible(rule, Protocol::Udp)
+                && rustgfw_core::dtls::FIELDS
+                    .iter()
+                    .any(|field| rule.condition.references_field(field))
+        });
         let needs_udp_shape = self.expr_rules.iter().any(|rule| {
             eligible(rule, Protocol::Udp)
                 && rustgfw_core::udp_shape::FIELDS
@@ -398,6 +405,9 @@ impl Options {
                 UdpStreamRule::new(None, || {
                     Box::new(rustgfw_core::quic::QuicServerInitial::default())
                 })
+            }),
+            needs_dtls_udp.then(|| {
+                UdpStreamRule::new(None, || Box::new(rustgfw_core::dtls::DtlsHello::default()))
             }),
             needs_udp_shape.then(|| {
                 UdpStreamRule::new(None, || {
@@ -2203,6 +2213,50 @@ mod tests {
         assert_eq!(evaluate(303, &[0; 100], false), Verdict::Accept);
         assert_eq!(evaluate(600, &[0; 100], true), Verdict::Accept);
         assert_eq!(evaluate(403, b"x", false), Verdict::DropFlow);
+    }
+
+    #[test]
+    fn dtls_expression_reassembles_real_client_hello() {
+        use rustgfw_core::{FlowScope, Packet, Policy};
+
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"DTLS SNI","expr":"proto == udp && fresh.dtls.sni == dtls.example && dtls.alpn == h2","action":"drop_packet"}]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let udp = |payload: &[u8]| {
+            let mut bytes = vec![0; 28 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 17;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&443u16.to_be_bytes());
+            bytes[24..26].copy_from_slice(&(8 + payload.len() as u16).to_be_bytes());
+            bytes[28..].copy_from_slice(payload);
+            bytes
+        };
+        let evaluate = |policy: &mut dyn Policy, bytes: &[u8]| {
+            policy.evaluate(Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+                capture_time: None,
+            })
+        };
+        let first = udp(include_bytes!(
+            "../tests/fixtures/dtls-openssl12-client-0.bin"
+        ));
+        let second = udp(include_bytes!(
+            "../tests/fixtures/dtls-openssl12-client-1.bin"
+        ));
+        assert_eq!(evaluate(&mut policy, &first), Verdict::Accept);
+        assert_eq!(evaluate(&mut policy, &second), Verdict::Drop);
+        assert_eq!(evaluate(&mut policy, &udp(b"later")), Verdict::Accept);
     }
 
     #[test]

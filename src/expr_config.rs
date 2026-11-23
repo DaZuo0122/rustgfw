@@ -75,6 +75,7 @@ pub fn compile(source: &str) -> Result<Vec<MatchRule>, String> {
                     && !rustgfw_core::sing_mux::FIELDS.contains(&field)
                     && !rustgfw_core::sing_mux_frames::FIELDS.contains(&field)
                     && !rustgfw_core::quic::FIELDS.contains(&field)
+                    && !rustgfw_core::dtls::FIELDS.contains(&field)
                     && !rustgfw_core::udp_shape::FIELDS.contains(&field)
                 {
                     return Err(format!("rule {:?}: unknown observation field {field}", spec.name));

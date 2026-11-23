@@ -51,7 +51,7 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 
 例如 `rustgfw nfqueue 100 accept nft=forward rules-file=rules.json`。`rules-file` 可以和现有的传输层规则、资源预算参数一起使用；传输层规则先执行。当前没有规则文件热更新入口。
 
-表达式使用 `!`、`&&`、`||` 和括号，优先级依次递减。比较值可用裸词或双引号字符串；字符串支持 `\"`、`\\`、`\n`、`\r`、`\t`。观察字段、`payload` 和 `payload_hex` 支持 `==`、`!=`、`contains`、`starts_with`、`ends_with`；域名等观察字段比较忽略 ASCII 大小写，`http.method`、`http.target`、`tls.alpn`、`tls.server_alpn`、`quic.alpn` 及载荷区分大小写。端口和 `payload.len` 支持 `==`、`!=`、`<`、`<=`、`>`、`>=`；`proto`、`reverse` 和 IP 地址支持 `==`、`!=`。可比较的内容：
+表达式使用 `!`、`&&`、`||` 和括号，优先级依次递减。比较值可用裸词或双引号字符串；字符串支持 `\"`、`\\`、`\n`、`\r`、`\t`。观察字段、`payload` 和 `payload_hex` 支持 `==`、`!=`、`contains`、`starts_with`、`ends_with`；域名等观察字段比较忽略 ASCII 大小写，`http.method`、`http.target`、`tls.alpn`、`tls.server_alpn`、`quic.alpn`、`dtls.alpn`、`dtls.server_alpn` 及载荷区分大小写。端口和 `payload.len` 支持 `==`、`!=`、`<`、`<=`、`>`、`>=`；`proto`、`reverse` 和 IP 地址支持 `==`、`!=`。可比较的内容：
 
 可选的 `expressions` 对象定义命名条件，在规则或其他命名条件中以 `@名称` 引用。加载时递归展开引用，并检查未知名称和循环引用；展开后的规则按正常布尔逻辑求值。命名条件只组合匹配条件，动作仍由各条规则指定。
 
@@ -99,6 +99,9 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 | `quic.tls_client_supported_group`、`quic.tls_client_signature_algorithm`、`quic.tls_client_key_share_group`，以及各自的有序复数和 `_no_grease` 字段 | `quic.tls_client_supported_group == 0x001d` | QUIC Initial 中可见的 ClientHello 扩展内部列表；字段语义与 TCP TLS 相同 |
 | `quic.server_version`、`quic.server_cipher` | `fresh.quic.server_cipher == 0x1301` | 反向 QUIC v1/v2 Initial 中 ServerHello 的 TLS 协商版本和密码套件；需先看到客户端 Initial 才能派生服务端密钥，TLS 1.3 的 ALPN 不在此阶段明文中 |
 | `quic.retry_integrity_valid` | `fresh.quic.retry_integrity_valid == true` | 已先看到客户端 Initial，且反向 v1/v2 Retry 的连接 ID、非空 token 和完整性标签通过检查时报告；固定公开校验密钥不提供服务端身份认证 |
+| `dtls.sni`、`dtls.alpn`、`dtls.supported_version`、`dtls.ech_extension`、`dtls.client_cookie_present` | `proto == udp && fresh.dtls.sni == blocked.test` | DTLS 1.2/1.3 明文 ClientHello；`client_cookie_present` 随 cookie 交换后的新 ClientHello 更新，ALPN 为客户端提供值 |
+| `dtls.client_legacy_version`、`dtls.client_cipher_suite`、`dtls.client_extension`、有序复数字段及其 `_no_grease` 版本 | `dtls.client_extensions_no_grease contains "0x0010"` | 复用 TLS ClientHello 的套件、扩展、supported groups、signature algorithms 与 key share 列表解析；DTLS cookie 字段先从握手正文剥离 |
+| `dtls.hello_verify`、`dtls.server_version`、`dtls.server_cipher`、`dtls.server_alpn` | `fresh.dtls.hello_verify == true || fresh.dtls.server_cipher == 0x1301` | 反向 DTLS 1.2 HelloVerifyRequest、DTLS 1.2/1.3 ServerHello；1.3 的服务端 ALPN 位于加密的 EncryptedExtensions，不产生 `server_alpn` |
 | `fresh.` 加字段名 | `fresh.dns.qname == "blocked.test"` | 该字段必须由当前包更新 |
 | 观察字段加 `exists` | `fresh.wireguard.type exists` | 字段至少有一个值；`fresh.` 还要求当前包更新 |
 | 数值观察字段 | `fresh.openvpn.tx_packets > 10` | `>`、`>=`、`<`、`<=` 按无符号十进制整数比较；非数字值不匹配 |

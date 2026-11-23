@@ -213,7 +213,10 @@ pub(crate) struct ClientHelloMetadata {
     pub supported_versions: Vec<u16>,
     pub ech_extension: bool,
     pub quic_transport_parameters: bool,
+    pub quic_transport_parameter_ids: Vec<u64>,
     pub quic_datagram_max_size: Option<u64>,
+    pub quic_disable_active_migration: bool,
+    pub quic_active_connection_id_limit: Option<u64>,
 }
 
 pub(crate) struct ClientFingerprintFields {
@@ -421,25 +424,47 @@ fn quic_varint(cursor: &mut Cursor<'_>) -> Option<u64> {
     Some(value)
 }
 
-fn quic_datagram_max_size(bytes: &[u8]) -> Option<Option<u64>> {
+#[derive(Default, PartialEq, Eq, Debug)]
+struct QuicTransportParameters {
+    ids: Vec<u64>,
+    datagram_max_size: Option<u64>,
+    disable_active_migration: bool,
+    active_connection_id_limit: Option<u64>,
+}
+
+fn quic_transport_parameters(bytes: &[u8]) -> Option<QuicTransportParameters> {
     let mut parameters = Cursor(bytes);
-    let mut max_size = None;
+    let mut result = QuicTransportParameters::default();
     while !parameters.0.is_empty() {
         let id = quic_varint(&mut parameters)?;
         let length = usize::try_from(quic_varint(&mut parameters)?).ok()?;
         let value = parameters.take(length)?;
-        if id == 0x20 {
-            if max_size.is_some() {
-                return None;
+        result.ids.push(id);
+        match id {
+            0x0c => {
+                if result.disable_active_migration || !value.is_empty() {
+                    return None;
+                }
+                result.disable_active_migration = true;
             }
-            let mut value = Cursor(value);
-            max_size = Some(quic_varint(&mut value)?);
-            if !value.0.is_empty() {
-                return None;
+            0x0e | 0x20 => {
+                let mut encoded = Cursor(value);
+                let number = quic_varint(&mut encoded)?;
+                if !encoded.0.is_empty() {
+                    return None;
+                }
+                if id == 0x0e {
+                    if result.active_connection_id_limit.replace(number).is_some() {
+                        return None;
+                    }
+                } else if result.datagram_max_size.replace(number).is_some() {
+                    return None;
+                }
             }
+            _ => {}
         }
     }
-    Some(max_size)
+    Some(result)
 }
 
 pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> {
@@ -479,8 +504,7 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
     let mut signature_algorithms = None;
     let mut key_shares = None;
     let mut ech_extension = false;
-    let mut quic_transport_parameters = false;
-    let mut quic_datagram_size = None;
+    let mut quic_parameters = None;
     let mut extension_types = Vec::new();
     while !extensions.0.is_empty() {
         let kind = extensions.word()?;
@@ -563,15 +587,16 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
             }
             0xfe0d => ech_extension = true,
             0x0039 => {
-                if quic_transport_parameters {
+                if quic_parameters.is_some() {
                     return None;
                 }
-                quic_transport_parameters = true;
-                quic_datagram_size = quic_datagram_max_size(data)?;
+                quic_parameters = Some(quic_transport_parameters(data)?);
             }
             _ => {}
         }
     }
+    let quic_transport_parameters = quic_parameters.is_some();
+    let quic_parameters = quic_parameters.unwrap_or_default();
     Some(ClientHelloMetadata {
         legacy_version,
         random,
@@ -587,7 +612,10 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
         supported_versions,
         ech_extension,
         quic_transport_parameters,
-        quic_datagram_max_size: quic_datagram_size,
+        quic_transport_parameter_ids: quic_parameters.ids,
+        quic_datagram_max_size: quic_parameters.datagram_max_size,
+        quic_disable_active_migration: quic_parameters.disable_active_migration,
+        quic_active_connection_id_limit: quic_parameters.active_connection_id_limit,
     })
 }
 
@@ -975,22 +1003,32 @@ mod tests {
     }
 
     #[test]
-    fn quic_datagram_parameter_requires_one_complete_varint() {
+    fn quic_transport_parameters_preserve_order_and_parse_migration_values() {
+        let parsed = quic_transport_parameters(&[
+            0x0f, 0, 0x1b, 0, 0x0c, 0, 0x0e, 1, 4, 0x20, 2, 0x45, 0xb0,
+        ])
+        .unwrap();
+        assert_eq!(parsed.ids, [0x0f, 0x1b, 0x0c, 0x0e, 0x20]);
+        assert!(parsed.disable_active_migration);
+        assert_eq!(parsed.active_connection_id_limit, Some(4));
+        assert_eq!(parsed.datagram_max_size, Some(1456));
         assert_eq!(
-            quic_datagram_max_size(&[0x0f, 0, 0x20, 2, 0x45, 0xb0]),
-            Some(Some(1456))
+            quic_transport_parameters(&[]),
+            Some(QuicTransportParameters::default())
         );
-        assert_eq!(quic_datagram_max_size(&[0x0f, 0]), Some(None));
-        assert_eq!(quic_datagram_max_size(&[0x20, 1, 0]), Some(Some(0)));
         assert_eq!(
-            quic_datagram_max_size(&[0x20, 4, 0x80, 0, 0xff, 0xff]),
-            Some(Some(65535))
+            quic_transport_parameters(&[0x20, 4, 0x80, 0, 0xff, 0xff])
+                .unwrap()
+                .datagram_max_size,
+            Some(65535)
         );
-        assert_eq!(quic_datagram_max_size(&[0x20, 2, 0x45]), None);
+        assert_eq!(quic_transport_parameters(&[0x20, 2, 0x45]), None);
         assert_eq!(
-            quic_datagram_max_size(&[0x20, 2, 0x45, 0xb0, 0x20, 1, 0]),
+            quic_transport_parameters(&[0x20, 2, 0x45, 0xb0, 0x20, 1, 0]),
             None
         );
+        assert_eq!(quic_transport_parameters(&[0x0c, 1, 0]), None);
+        assert_eq!(quic_transport_parameters(&[0x0e, 2, 0, 0]), None);
     }
     #[test]
     fn server_hello_reports_selected_version_cipher_and_visible_alpn() {

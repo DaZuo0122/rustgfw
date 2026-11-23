@@ -2267,7 +2267,7 @@ mod tests {
         let payload = std::fs::read(fixture).unwrap();
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"QUIC SNI","expr":"proto == udp && fresh.quic.sni == ngtcp2.sniff.test","action":"drop_packet"}]}"#,
+            r#"{"rules":[{"name":"QUIC SNI","expr":"proto == udp && fresh.quic.sni == ngtcp2.sniff.test && quic.transport_parameter_id == 0xf && quic.disable_active_migration exists","action":"drop_packet"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();

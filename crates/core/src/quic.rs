@@ -18,7 +18,12 @@ pub const FIELDS: &[&str] = &[
     "quic.tls_supported_version",
     "quic.ech_extension",
     "quic.transport_parameters",
+    "quic.transport_parameter_id",
+    "quic.transport_parameter_ids",
+    "quic.transport_parameter_ids_no_grease",
     "quic.datagram_max_size",
+    "quic.disable_active_migration",
+    "quic.active_connection_id_limit",
     "quic.tls_client_legacy_version",
     "quic.tls_client_random",
     "quic.tls_client_session_id",
@@ -573,6 +578,39 @@ impl UdpStreamAnalyzer for QuicInitial {
                 field: "quic.transport_parameters",
                 value: hello.quic_transport_parameters.to_string(),
             });
+            if hello.quic_transport_parameters {
+                let mut ordered = Vec::new();
+                let mut without_grease = Vec::new();
+                for id in hello.quic_transport_parameter_ids {
+                    let value = format!("0x{id:x}");
+                    observations.push(Observation {
+                        field: "quic.transport_parameter_id",
+                        value: value.clone(),
+                    });
+                    if id % 31 != 27 {
+                        without_grease.push(value.clone());
+                    }
+                    ordered.push(value);
+                }
+                observations.push(Observation {
+                    field: "quic.transport_parameter_ids",
+                    value: ordered.join(","),
+                });
+                observations.push(Observation {
+                    field: "quic.transport_parameter_ids_no_grease",
+                    value: without_grease.join(","),
+                });
+                observations.push(Observation {
+                    field: "quic.disable_active_migration",
+                    value: hello.quic_disable_active_migration.to_string(),
+                });
+                if let Some(value) = hello.quic_active_connection_id_limit {
+                    observations.push(Observation {
+                        field: "quic.active_connection_id_limit",
+                        value: value.to_string(),
+                    });
+                }
+            }
             if let Some(value) = hello.quic_datagram_max_size {
                 observations.push(Observation {
                     field: "quic.datagram_max_size",
@@ -798,7 +836,9 @@ mod tests {
         extension.extend(vector(&vector(&[0, 29, 0, 1, 1])));
         extension.extend([0xfe, 0x0d, 0, 1, 0]);
         if with_transport_parameters {
-            extension.extend([0, 0x39, 0, 6, 0x0f, 0, 0x20, 2, 0x45, 0xb0]);
+            extension.extend([
+                0, 0x39, 0, 13, 0x0f, 0, 0x1b, 0, 0x0c, 0, 0x0e, 1, 4, 0x20, 2, 0x45, 0xb0,
+            ]);
         }
         let mut body = vec![3, 3];
         body.extend([0; 32]);
@@ -1142,6 +1182,19 @@ mod tests {
             assert_eq!(field(&result, "quic.tls_supported_version"), Some("0x0304"));
             assert_eq!(field(&result, "quic.ech_extension"), Some("true"));
             assert_eq!(field(&result, "quic.transport_parameters"), Some("true"));
+            assert_eq!(
+                field(&result, "quic.transport_parameter_ids"),
+                Some("0xf,0x1b,0xc,0xe,0x20")
+            );
+            assert_eq!(
+                field(&result, "quic.transport_parameter_ids_no_grease"),
+                Some("0xf,0xc,0xe,0x20")
+            );
+            assert_eq!(
+                field(&result, "quic.disable_active_migration"),
+                Some("true")
+            );
+            assert_eq!(field(&result, "quic.active_connection_id_limit"), Some("4"));
             assert_eq!(field(&result, "quic.datagram_max_size"), Some("1456"));
             assert_eq!(
                 field(&result, "quic.tls_client_legacy_version"),
@@ -1404,6 +1457,15 @@ mod tests {
                 result = analyzer.feed(&bytes, false);
             }
             assert_eq!(field(&result, "quic.sni"), Some(expected), "{name}");
+            assert!(
+                field(&result, "quic.transport_parameter_ids")
+                    .is_some_and(|ids| ids.split(',').any(|id| id == "0xf")),
+                "{name}"
+            );
+            assert!(
+                field(&result, "quic.transport_parameter_ids_no_grease").is_some(),
+                "{name}"
+            );
             assert_eq!(
                 field(&result, "quic.tls_client_session_id_len"),
                 Some("0"),

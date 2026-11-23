@@ -11,7 +11,11 @@
 
 `TcpShape` 通过 `TcpPacketAnalyzer` 在 TCP 重组之前观察前 16 个带载荷数据包。它记录首包前 64 字节的统计量、原始包的有符号长度序列、相邻同向包累计长度，以及首次反向之前的包数和总字节数。正值属于建流方向，负值属于反方向。相同方向、序号和载荷长度的重传不重复计数。`tcp_shape.first_random_like` 使用前缀平均置位数 3.4–4.6、可打印比例低于 0.5、Shannon 熵至少 4.5 bit/byte 的组合，表示随机外观；可与 `tls.*`、`fet.*`、`trojan.*` 和端点字段组成表达式。
 
-TCP 序列按照**包到达顺序**记录，不是 TCP 重组后的字节块大小。当前只跳过完全相同的重传；乱序、部分重叠和分段策略仍会改变序列。`tcp_shape.signed_bursts` 只合并相邻同向包，没有论文中的 RTT 和时间间隔约束，因此不能直接套用论文报告的识别准确率。`tcp_shape.gaps_us` 逐项记录已计入包之间的微秒间隔，`last_gap_us` 报告当前包与前一包的间隔，`origin_first_span_us` 和 `first_reply_delay_us` 分别报告首方向首轮跨度及首次反向延迟。解码流入口不运行 `TcpPacketAnalyzer`，因为已解码字节没有原始包边界。
+TCP 序列按照**包到达顺序**记录，不是 TCP 重组后的字节块大小。当前只跳过完全相同的重传；乱序、部分重叠和分段策略仍会改变序列。`tcp_shape.gaps_us` 逐项记录已计入包之间的微秒间隔，`last_gap_us` 报告当前包与前一包的间隔，`origin_first_span_us` 和 `first_reply_delay_us` 分别报告首方向首轮跨度及首次反向延迟。解码流入口不运行 `TcpPacketAnalyzer`，因为已解码字节没有原始包边界。
+
+参考 [Xue 等人的特征提取方法](https://www.usenix.org/system/files/usenixsecurity24-xue-fingerprinting.pdf)，`tcp_shape.handshake_rtt_us` 取最初 SYN 到看到反向 SYN-ACK 后首个起始方向 ACK 的时间差；握手不完整、时间来源不一致或时间倒退时该字段缺失。`tcp_shape.timed_bursts` 仅在 RTT 与所有数据包间隔均可比较时生成：相邻同向包的间隔小于 3 倍握手 RTT 才合并，否则新建突发；无法计算时为 `?`。`signed_bursts` 继续只按方向合并，便于对照。`tcp_shape.size_trigram` 使用论文的 1–160、161–600、601–1210、1211+ 字节四档，正负号保留方向；每个新包报告迄今所有连续三包窗口，例如 `1,-4,-4`，表达式可匹配其中任一值。
+
+论文还用 SEQ/ACK 对包建立总序，并在有标签数据上训练三元组与突发分类器。当前 RTT 估计依据方向和标志位，尚未核对 ACK number；数据包只保留到达顺序和前 16 个载荷包，也没有移植论文的训练参数。这些字段是可组合的特征，不等于论文分类器或其报告的准确率。
 
 `UdpShape` 在按需启用时观察同一 UDP 端点对的前 8 个数据报。它记录首包长度、前 64 字节的平均置位数、可打印字符比例与 Shannon 熵，以及相对首包方向的有符号包长序列、首次反向前的同向包数和累计字节数。`udp_shape.first_quic_initial_shape` 只检查 v1/v2 Initial 的可见头部形状，不进行 QUIC AEAD 验证；需要验证公开 Initial 时继续使用 `quic.*`。
 
@@ -27,4 +31,4 @@ TCP 序列按照**包到达顺序**记录，不是 TCP 重组后的字节块大�
 
 `Inspect::feed_decoded` 用与逐包 TCP 路径相同的 `AnalyzerRule`、`BidirectionalAnalyzerRule` 和 `FlowRule`；单元测试已验证裸 VLESS 请求头经该入口分段输入后，原有 `vless.*` 表达式会阻断对应逻辑流。其他 HTTP/1、TLS、SOCKS、SSH 和复用协议分析器同样通过注册工厂复用。调用方必须先解密、解复用，并剥离代理封装头；当前 Linux NFQUEUE 与 Windows WinDivert 路径没有这些密钥，也不会自动得到内层明文。HTTP/3 的解码入口 `feed_http3` 单独接收 QUIC 请求流及 QPACK 状态。
 
-下一轮需要用带标签抓包比较 Hysteria2 默认/Salamander/Gecko、普通 H3 与其他高熵 UDP，在不同分片、丢包和中途抓包条件下统计召回率与误报率，再决定是否固化更强的协议候选或加入时序特征。
+下一轮需要用带标签抓包比较 Hysteria2 默认/Salamander/Gecko、普通 H3 与其他高熵 UDP，在不同分片、丢包和中途抓包条件下统计召回率与误报率，再决定是否固化更强的协议候选或训练时序模型。

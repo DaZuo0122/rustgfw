@@ -1937,11 +1937,11 @@ mod tests {
     fn tcp_shape_expression_uses_raw_packets_and_ignores_retransmission() {
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"early burst","expr":"proto == tcp && tcp_shape.first_random_like == true && fet.candidate == true && tcp_shape.packet_count == 3 && fresh.tcp_shape.signed_bursts == \"100,-500\" && tcp_shape.first_reply_delay_us >= 30000 && fresh.tcp_shape.last_gap_us >= 10000","action":"block"}]}"#,
+            r#"{"rules":[{"name":"early burst","expr":"proto == tcp && tcp_shape.first_random_like == true && fet.candidate == true && tcp_shape.packet_count == 3 && tcp_shape.handshake_rtt_us == 10000 && tcp_shape.size_trigram == \"1,-2,-2\" && fresh.tcp_shape.timed_bursts == \"100,-500\" && tcp_shape.first_reply_delay_us >= 30000 && fresh.tcp_shape.last_gap_us >= 10000","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
-        let tcp = |sequence: u32, payload: &[u8], reverse: bool| {
+        let tcp = |sequence: u32, payload: &[u8], reverse: bool, flags: u8| {
             let mut bytes = vec![0; 40 + payload.len()];
             let length = bytes.len() as u16;
             bytes[0] = 0x45;
@@ -1953,7 +1953,7 @@ mod tests {
             bytes[22..24].copy_from_slice(&443u16.to_be_bytes());
             bytes[24..28].copy_from_slice(&sequence.to_be_bytes());
             bytes[32] = 0x50;
-            bytes[33] = 0x18;
+            bytes[33] = flags;
             bytes[40..].copy_from_slice(payload);
             if reverse {
                 for offset in 0..4 {
@@ -1978,15 +1978,27 @@ mod tests {
         let random = (0..100)
             .map(|index| (index * 73 + 151) as u8)
             .collect::<Vec<_>>();
-        let first = tcp(100, &random, false);
-        assert_eq!(evaluate(&mut policy, &first, 100_000), Verdict::Accept);
-        assert_eq!(evaluate(&mut policy, &first, 105_000), Verdict::Accept);
         assert_eq!(
-            evaluate(&mut policy, &tcp(500, &[0; 200], true), 130_000),
+            evaluate(&mut policy, &tcp(99, &[], false, 0x02), 80_000),
             Verdict::Accept
         );
         assert_eq!(
-            evaluate(&mut policy, &tcp(700, &[0; 300], true), 145_000),
+            evaluate(&mut policy, &tcp(499, &[], true, 0x12), 85_000),
+            Verdict::Accept
+        );
+        assert_eq!(
+            evaluate(&mut policy, &tcp(100, &[], false, 0x10), 90_000),
+            Verdict::Accept
+        );
+        let first = tcp(100, &random, false, 0x18);
+        assert_eq!(evaluate(&mut policy, &first, 100_000), Verdict::Accept);
+        assert_eq!(evaluate(&mut policy, &first, 105_000), Verdict::Accept);
+        assert_eq!(
+            evaluate(&mut policy, &tcp(500, &[0; 200], true, 0x18), 130_000),
+            Verdict::Accept
+        );
+        assert_eq!(
+            evaluate(&mut policy, &tcp(700, &[0; 300], true, 0x18), 145_000),
             Verdict::DropFlow
         );
     }

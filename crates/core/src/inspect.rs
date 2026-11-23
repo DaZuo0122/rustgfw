@@ -56,6 +56,17 @@ pub trait BidirectionalStreamAnalyzer {
 pub trait TcpPacketAnalyzer {
     fn feed(&mut self, sequence: u32, payload: &[u8], reverse: bool) -> Analysis;
 
+    /// Called for every TCP packet, including empty SYN/ACK packets, before
+    /// `feed_timed` receives a payload-bearing packet.
+    fn observe_header(
+        &mut self,
+        _flags: u8,
+        _reverse: bool,
+        _capture_time: Option<CaptureTime>,
+    ) -> Analysis {
+        Analysis::Pending
+    }
+
     fn feed_timed(
         &mut self,
         sequence: u32,
@@ -1408,26 +1419,38 @@ impl<P: Policy> Policy for Inspect<P> {
             return Verdict::DropFlow.into();
         }
         let mut analysis = TcpAnalysis::default();
-        if !flow.allowed && !t.payload.is_empty() {
+        if !flow.allowed {
             let reverse = t.source != flow.origin;
             for slot in &mut flow.packet_analyzers {
                 let Some(analyzer) = slot else {
                     continue;
                 };
-                if collect_tcp_analysis(
-                    analyzer.feed_timed(
-                        t.tcp_sequence.unwrap(),
-                        t.payload,
-                        reverse,
-                        packet.capture_time,
-                    ),
+                let mut finished = collect_tcp_analysis(
+                    analyzer.observe_header(t.tcp_flags, reverse, packet.capture_time),
                     &|_| false,
                     &mut flow.facts,
                     &mut flow.blocked,
                     &mut analysis.updated,
                     &mut analysis.batches,
                     !self.flow_rules.is_empty(),
-                ) {
+                );
+                if !finished && !t.payload.is_empty() {
+                    finished = collect_tcp_analysis(
+                        analyzer.feed_timed(
+                            t.tcp_sequence.unwrap(),
+                            t.payload,
+                            reverse,
+                            packet.capture_time,
+                        ),
+                        &|_| false,
+                        &mut flow.facts,
+                        &mut flow.blocked,
+                        &mut analysis.updated,
+                        &mut analysis.batches,
+                        !self.flow_rules.is_empty(),
+                    );
+                }
+                if finished {
                     *slot = None;
                 }
             }

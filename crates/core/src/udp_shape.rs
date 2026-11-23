@@ -1,6 +1,9 @@
 //! Early UDP wire shape for opaque QUIC and randomized proxy traffic.
-use crate::inspect::{Observation, UdpStreamAnalysis, UdpStreamAnalyzer};
 use crate::wire_stats::PrefixStats;
+use crate::{
+    CaptureTime,
+    inspect::{Observation, UdpStreamAnalysis, UdpStreamAnalyzer},
+};
 
 pub const FIELDS: &[&str] = &[
     "udp_shape.first_len",
@@ -15,6 +18,11 @@ pub const FIELDS: &[&str] = &[
     "udp_shape.origin_first_bytes",
     "udp_shape.reply_seen",
     "udp_shape.fragmented_random_candidate",
+    "udp_shape.time_source",
+    "udp_shape.last_gap_us",
+    "udp_shape.gaps_us",
+    "udp_shape.origin_first_span_us",
+    "udp_shape.first_reply_delay_us",
 ];
 
 const MAX_PACKETS: usize = 8;
@@ -28,15 +36,45 @@ pub struct UdpShape {
     origin_first_random_like: bool,
     reply_seen: bool,
     candidate: bool,
+    first_time: Option<CaptureTime>,
+    last_time: Option<CaptureTime>,
+    gaps: Vec<String>,
 }
 
 impl UdpStreamAnalyzer for UdpShape {
     fn feed(&mut self, payload: &[u8], reverse: bool) -> UdpStreamAnalysis {
+        self.feed_timed(payload, reverse, None)
+    }
+
+    fn feed_timed(
+        &mut self,
+        payload: &[u8],
+        reverse: bool,
+        capture_time: Option<CaptureTime>,
+    ) -> UdpStreamAnalysis {
         if self.lengths.len() == MAX_PACKETS {
             return UdpStreamAnalysis::Finished;
         }
         let first = self.lengths.is_empty();
         let mut observations = Vec::new();
+        if first {
+            self.first_time = capture_time;
+        } else {
+            let gap = capture_time
+                .zip(self.last_time)
+                .and_then(|(now, before)| now.elapsed_us_since(before));
+            let gap = gap.map_or_else(|| "?".to_owned(), |value| value.to_string());
+            self.gaps.push(gap.clone());
+            observations.push(Observation {
+                field: "udp_shape.last_gap_us",
+                value: gap,
+            });
+        }
+        self.last_time = capture_time;
+        observations.push(Observation {
+            field: "udp_shape.time_source",
+            value: capture_time.map_or("none", CaptureTime::source).to_owned(),
+        });
         if first {
             let stats = PrefixStats::sample(payload);
             self.first_quic = quic_initial_shape(payload);
@@ -65,11 +103,27 @@ impl UdpStreamAnalyzer for UdpShape {
             }
         }
         if reverse {
+            if !self.reply_seen {
+                let delay = capture_time
+                    .zip(self.first_time)
+                    .and_then(|(now, before)| now.elapsed_us_since(before));
+                observations.push(Observation {
+                    field: "udp_shape.first_reply_delay_us",
+                    value: delay.map_or_else(|| "?".to_owned(), |value| value.to_string()),
+                });
+            }
             self.reply_seen = true;
         } else if !self.reply_seen {
             self.origin_first_run += 1;
             self.origin_first_bytes += payload.len();
             self.origin_first_random_like &= random_like(payload);
+            let span = capture_time
+                .zip(self.first_time)
+                .and_then(|(now, before)| now.elapsed_us_since(before));
+            observations.push(Observation {
+                field: "udp_shape.origin_first_span_us",
+                value: span.map_or_else(|| "?".to_owned(), |value| value.to_string()),
+            });
             if self.origin_first_run >= 2
                 && self.origin_first_bytes >= 1200
                 && self.origin_first_random_like
@@ -81,6 +135,7 @@ impl UdpStreamAnalyzer for UdpShape {
         let length = payload.len() as i64;
         self.lengths.push(if reverse { -length } else { length });
         for (field, value) in [
+            ("udp_shape.gaps_us", self.gaps.join(",")),
             (
                 "udp_shape.signed_lengths",
                 self.lengths
@@ -133,6 +188,7 @@ fn quic_initial_shape(payload: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, SystemTime};
 
     fn values(result: UdpStreamAnalysis) -> Vec<Observation> {
         match result {
@@ -192,6 +248,27 @@ mod tests {
             Some("700,700,-120")
         );
         assert_eq!(field(&observed, "udp_shape.reply_seen"), Some("true"));
+    }
+
+    #[test]
+    fn reports_first_flight_and_reply_timing() {
+        let mut shape = UdpShape::default();
+        let at =
+            |micros| CaptureTime::Kernel(SystemTime::UNIX_EPOCH + Duration::from_micros(micros));
+        values(shape.feed_timed(&[1; 600], false, Some(at(1_000))));
+        let observed = values(shape.feed_timed(&[2; 600], false, Some(at(4_000))));
+        assert_eq!(field(&observed, "udp_shape.last_gap_us"), Some("3000"));
+        assert_eq!(
+            field(&observed, "udp_shape.origin_first_span_us"),
+            Some("3000")
+        );
+        let observed = values(shape.feed_timed(&[3; 50], true, Some(at(20_000))));
+        assert_eq!(
+            field(&observed, "udp_shape.first_reply_delay_us"),
+            Some("19000")
+        );
+        assert_eq!(field(&observed, "udp_shape.gaps_us"), Some("3000,16000"));
+        assert_eq!(field(&observed, "udp_shape.time_source"), Some("kernel"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Linux NFQUEUE adapter. Firewall ownership remains with the operator.
 #![cfg(target_os = "linux")]
-use rustgfw_core::{Decision, FlowScope, Packet, PacketIo, Policy, Verdict};
+use rustgfw_core::{CaptureTime, Decision, FlowScope, Packet, PacketIo, Policy, Verdict};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::{
@@ -45,7 +45,7 @@ fn untracked_scope(indev: u32, outdev: u32, mark: u32) -> FlowScope {
 }
 
 struct PacketReader {
-    packets: Option<Receiver<io::Result<nfq::Message>>>,
+    packets: Option<Receiver<io::Result<(nfq::Message, Instant)>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -61,7 +61,8 @@ impl PacketReader {
                 while !thread_stop.load(Ordering::Relaxed) {
                     match queue.recv() {
                         Ok(packet) => {
-                            if sender.send(Ok(packet)).is_err() {
+                            let received_at = Instant::now();
+                            if sender.send(Ok((packet, received_at))).is_err() {
                                 break;
                             }
                         }
@@ -88,7 +89,7 @@ impl PacketReader {
         })
     }
 
-    fn recv(&self) -> io::Result<nfq::Message> {
+    fn recv(&self) -> io::Result<(nfq::Message, Instant)> {
         match self
             .packets
             .as_ref()
@@ -342,7 +343,12 @@ impl PacketIo for NfQueue {
             }
         }
         self.flush_pending_if_due()?;
-        let mut message = self.packet_reader.recv()?;
+        let (mut message, received_at) = self.packet_reader.recv()?;
+        let capture_time = Some(
+            message
+                .get_timestamp()
+                .map_or(CaptureTime::Receive(received_at), CaptureTime::Kernel),
+        );
         let bytes = message.get_payload();
         let conntrack = message.get_conntrack();
         let has_conntrack = conntrack.is_some();
@@ -384,6 +390,7 @@ impl PacketIo for NfQueue {
                 original_len: message.get_original_len(),
                 checksum_ready: message.is_checksum_ready(),
                 scope,
+                capture_time,
             })
         };
         let verdict = decision.verdict();

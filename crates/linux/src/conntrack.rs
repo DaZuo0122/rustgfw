@@ -461,6 +461,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: ConntrackKey { id, zone }.scope(),
+                capture_time: None,
             })
         };
         assert_eq!(evaluate(&mut policy, &bytes, 42), Verdict::DropFlow);

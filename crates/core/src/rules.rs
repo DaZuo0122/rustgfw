@@ -126,6 +126,7 @@ mod tests {
             original_len: bytes.len(),
             checksum_ready: true,
             scope: FlowScope::default(),
+            capture_time: None,
         }
     }
     #[test]

@@ -11,7 +11,7 @@
 
 `TcpShape` 通过 `TcpPacketAnalyzer` 在 TCP 重组之前观察前 16 个带载荷数据包。它记录首包前 64 字节的统计量、原始包的有符号长度序列、相邻同向包累计长度，以及首次反向之前的包数和总字节数。正值属于建流方向，负值属于反方向。相同方向、序号和载荷长度的重传不重复计数。`tcp_shape.first_random_like` 使用前缀平均置位数 3.4–4.6、可打印比例低于 0.5、Shannon 熵至少 4.5 bit/byte 的组合，表示随机外观；可与 `tls.*`、`fet.*`、`trojan.*` 和端点字段组成表达式。
 
-TCP 序列按照**包到达顺序**记录，不是 TCP 重组后的字节块大小。当前只跳过完全相同的重传；乱序、部分重叠和分段策略仍会改变序列。`tcp_shape.signed_bursts` 只合并相邻同向包，没有论文中的 RTT 和时间间隔约束，因此不能直接套用论文报告的识别准确率。解码流入口不运行 `TcpPacketAnalyzer`，因为已解码字节没有原始包边界。
+TCP 序列按照**包到达顺序**记录，不是 TCP 重组后的字节块大小。当前只跳过完全相同的重传；乱序、部分重叠和分段策略仍会改变序列。`tcp_shape.signed_bursts` 只合并相邻同向包，没有论文中的 RTT 和时间间隔约束，因此不能直接套用论文报告的识别准确率。`tcp_shape.gaps_us` 逐项记录已计入包之间的微秒间隔，`last_gap_us` 报告当前包与前一包的间隔，`origin_first_span_us` 和 `first_reply_delay_us` 分别报告首方向首轮跨度及首次反向延迟。解码流入口不运行 `TcpPacketAnalyzer`，因为已解码字节没有原始包边界。
 
 `UdpShape` 在按需启用时观察同一 UDP 端点对的前 8 个数据报。它记录首包长度、前 64 字节的平均置位数、可打印字符比例与 Shannon 熵，以及相对首包方向的有符号包长序列、首次反向前的同向包数和累计字节数。`udp_shape.first_quic_initial_shape` 只检查 v1/v2 Initial 的可见头部形状，不进行 QUIC AEAD 验证；需要验证公开 Initial 时继续使用 `quic.*`。
 
@@ -19,7 +19,9 @@ TCP 序列按照**包到达顺序**记录，不是 TCP 重组后的字节块大�
 
 本地只读对照测试已检查 OpenGFW 提供的 Chrome、Firefox、curl、quiche、ngtcp2、aioquic 客户端 QUIC Initial 抓包；这些首包均被标为标准 Initial 形状，未触发随机碎片候选。这组对照只覆盖握手首包，不代表整个正常 UDP 背景流量。
 
-每个字段的观察值属于外层数据报，不要求 MITM。包长序列只保留前 8 个数据报，并以首个看到的方向为正；在中途开始抓包时，正方向不一定是客户端。该分析器当前没有测量时序：内核或后端提供的包时间戳尚未进入核心输入，不能用用户态处理时间冒充线上间隔。
+每个字段的观察值属于外层数据报，不要求 MITM。包长序列只保留前 8 个数据报，并以首个看到的方向为正；在中途开始抓包时，正方向不一定是客户端。`udp_shape.gaps_us`、`last_gap_us`、`origin_first_span_us` 和 `first_reply_delay_us` 与 TCP 同义，可用于检验 Gecko 首轮分片的时间聚集性。
+
+`Packet.capture_time` 保留来源：Linux NFQUEUE 有 `NFQA_TIMESTAMP` 时用内核包时间，否则用独立接收线程刚收到包时的单调时钟。`time_source` 为 `kernel`、`receive` 或 `none`。不同来源、缺失时间或时间倒退时，相应间隔记为 `?`，数值比较不会匹配。接收线程时间包含内核排队延迟，不能当作真实线上间隔；内核时间戳也受抓包点、时钟及转发路径影响。现阶段不把这些时间字段固化成协议判定阈值，先用带标签抓包校准。
 
 ## 内层复用边界
 

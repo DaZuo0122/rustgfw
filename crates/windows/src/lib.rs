@@ -182,6 +182,7 @@ impl PacketIo for WinDivert {
             original_len: bytes.len(),
             checksum_ready: false,
             scope: traffic_scope(self.layer, &address),
+            capture_time: None,
         });
         let verdict = decision.verdict();
         if verdict == Verdict::DropFlow

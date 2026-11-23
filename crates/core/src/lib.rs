@@ -1,5 +1,8 @@
 //! OS-independent packet policy execution. No kernel identifiers enter policy code.
-use std::io;
+use std::{
+    io,
+    time::{Instant, SystemTime},
+};
 pub mod conditions;
 pub mod dns;
 pub mod fet;
@@ -64,6 +67,51 @@ pub struct Packet<'a> {
     pub checksum_ready: bool,
     /// Backend-defined traffic domain. Distinct domains never share flow state.
     pub scope: FlowScope,
+    /// Kernel packet time when available, otherwise backend receive time.
+    pub capture_time: Option<CaptureTime>,
+}
+
+/// A packet timestamp retains its source so queue delay is never mixed with
+/// the kernel clock when computing inter-packet gaps.
+#[derive(Clone, Copy, Debug)]
+pub enum CaptureTime {
+    Kernel(SystemTime),
+    Receive(Instant),
+}
+impl CaptureTime {
+    pub fn elapsed_us_since(self, earlier: Self) -> Option<u64> {
+        let elapsed = match (self, earlier) {
+            (Self::Kernel(now), Self::Kernel(before)) => now.duration_since(before).ok()?,
+            (Self::Receive(now), Self::Receive(before)) => now.checked_duration_since(before)?,
+            _ => return None,
+        };
+        u64::try_from(elapsed.as_micros()).ok()
+    }
+
+    pub fn source(self) -> &'static str {
+        match self {
+            Self::Kernel(_) => "kernel",
+            Self::Receive(_) => "receive",
+        }
+    }
+}
+
+#[cfg(test)]
+mod capture_time_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn only_compares_ordered_timestamps_from_the_same_source() {
+        let before = CaptureTime::Kernel(SystemTime::UNIX_EPOCH + Duration::from_micros(100));
+        let after = CaptureTime::Kernel(SystemTime::UNIX_EPOCH + Duration::from_micros(125));
+        assert_eq!(after.elapsed_us_since(before), Some(25));
+        assert_eq!(before.elapsed_us_since(after), None);
+        assert_eq!(
+            after.elapsed_us_since(CaptureTime::Receive(Instant::now())),
+            None
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -136,6 +184,7 @@ mod tests {
                 original_len: 20,
                 checksum_ready: false,
                 scope: FlowScope::default(),
+                capture_time: None,
             }));
             if self.fail {
                 Err(io::Error::other("verdict failed"))
@@ -170,6 +219,7 @@ mod tests {
                     original_len: self.bytes.len(),
                     checksum_ready: true,
                     scope: FlowScope::default(),
+                    capture_time: None,
                 }));
                 Ok(())
             }

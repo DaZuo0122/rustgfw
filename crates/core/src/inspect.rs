@@ -1,7 +1,7 @@
 //! Incremental stream analysis. Each direction shares reassembly across analyzers.
 pub use crate::http::HttpFirstMessage as HttpHost;
 use crate::{
-    Decision, FlowScope, Packet, Policy, Verdict,
+    CaptureTime, Decision, FlowScope, Packet, Policy, Verdict,
     http3::Http3Conversation,
     packet::{self, Protocol},
     tcp::Reassembler,
@@ -55,6 +55,16 @@ pub trait BidirectionalStreamAnalyzer {
 /// boundaries and sequence numbers are preserved for wire-shape models.
 pub trait TcpPacketAnalyzer {
     fn feed(&mut self, sequence: u32, payload: &[u8], reverse: bool) -> Analysis;
+
+    fn feed_timed(
+        &mut self,
+        sequence: u32,
+        payload: &[u8],
+        reverse: bool,
+        _capture_time: Option<CaptureTime>,
+    ) -> Analysis {
+        self.feed(sequence, payload, reverse)
+    }
 }
 
 pub enum DatagramAnalysis {
@@ -69,6 +79,15 @@ pub trait DatagramAnalyzer: Send + Sync {
 /// A stateful UDP analyzer receives both directions of one endpoint pair.
 pub trait UdpStreamAnalyzer {
     fn feed(&mut self, payload: &[u8], reverse: bool) -> UdpStreamAnalysis;
+
+    fn feed_timed(
+        &mut self,
+        payload: &[u8],
+        reverse: bool,
+        _capture_time: Option<CaptureTime>,
+    ) -> UdpStreamAnalysis {
+        self.feed(payload, reverse)
+    }
 }
 
 pub enum UdpStreamAnalysis {
@@ -1178,7 +1197,7 @@ impl<P> Inspect<P> {
                 let Some(analyzer) = slot else {
                     continue;
                 };
-                match analyzer.feed(transport.payload, reverse) {
+                match analyzer.feed_timed(transport.payload, reverse, packet.capture_time) {
                     UdpStreamAnalysis::Pending => {}
                     UdpStreamAnalysis::Observations(observations) => {
                         if !self.udp_rules.is_empty() {
@@ -1298,6 +1317,7 @@ impl<P: Policy> Policy for Inspect<P> {
                 original_len: replacement.len(),
                 checksum_ready: true,
                 scope: packet.scope,
+                capture_time: packet.capture_time,
             },
         };
         let Ok(t) = packet::parse(packet.bytes) else {
@@ -1395,7 +1415,12 @@ impl<P: Policy> Policy for Inspect<P> {
                     continue;
                 };
                 if collect_tcp_analysis(
-                    analyzer.feed(t.tcp_sequence.unwrap(), t.payload, reverse),
+                    analyzer.feed_timed(
+                        t.tcp_sequence.unwrap(),
+                        t.payload,
+                        reverse,
+                        packet.capture_time,
+                    ),
                     &|_| false,
                     &mut flow.facts,
                     &mut flow.blocked,
@@ -2033,6 +2058,7 @@ mod tests {
             original_len: bytes.len(),
             checksum_ready: true,
             scope: FlowScope(scope),
+            capture_time: None,
         })
     }
 
@@ -2042,6 +2068,7 @@ mod tests {
             original_len: bytes.len(),
             checksum_ready: true,
             scope: FlowScope::default(),
+            capture_time: None,
         })
     }
 
@@ -2197,6 +2224,7 @@ mod tests {
             original_len: original.len(),
             checksum_ready: true,
             scope: FlowScope::default(),
+            capture_time: None,
         });
         let Decision::Replace(replaced) = decision else {
             panic!("expected a rewritten packet");
@@ -2209,6 +2237,7 @@ mod tests {
                 original_len: later.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             }),
             Decision::Verdict(Verdict::Accept)
         );
@@ -2232,6 +2261,7 @@ mod tests {
             original_len: original.len(),
             checksum_ready: true,
             scope: FlowScope::default(),
+            capture_time: None,
         };
 
         let mut passthrough = Inspect::with_analyzers(inner(), Vec::new());
@@ -2405,6 +2435,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         assert_eq!(evaluate(&bytes), Verdict::Drop);
@@ -2513,6 +2544,7 @@ mod tests {
                     original_len: syn.len(),
                     checksum_ready: true,
                     scope: FlowScope::default(),
+                    capture_time: None,
                 }),
                 Verdict::Accept
             );
@@ -2523,6 +2555,7 @@ mod tests {
                     original_len: data.len(),
                     checksum_ready: true,
                     scope: FlowScope::default(),
+                    capture_time: None,
                 }),
                 Verdict::DropFlow
             );
@@ -2542,6 +2575,7 @@ mod tests {
                 original_len: packet.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             }),
             Verdict::DropFlow
         );
@@ -2571,6 +2605,7 @@ mod tests {
                 original_len: packet.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         assert_eq!(evaluate("custom.token"), Verdict::DropFlow);
@@ -2618,6 +2653,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope(scope),
+                capture_time: None,
             })
         };
         assert_eq!(feed(1, 100, 2, b""), Verdict::Accept);
@@ -2658,6 +2694,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope(scope),
+                capture_time: None,
             })
         };
         assert_eq!(feed(1, 100, 2, b""), Verdict::Accept);
@@ -2730,6 +2767,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         assert_eq!(feed(100, 2, b"", false), Verdict::Accept);
@@ -2776,6 +2814,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         assert_eq!(feed(100, 2, b"", false), Verdict::Accept);
@@ -2823,6 +2862,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         assert_eq!(feed(100, 2, b""), Verdict::Accept);
@@ -2849,6 +2889,7 @@ mod tests {
                 original_len: packet.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         assert_eq!(evaluate(FlowAction::Allow), Verdict::Accept);
@@ -2872,6 +2913,7 @@ mod tests {
                     original_len: self.bytes.len(),
                     checksum_ready: true,
                     scope: FlowScope::default(),
+                    capture_time: None,
                 }));
                 Ok(())
             }
@@ -2931,6 +2973,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         assert_eq!(feed(100, 2, b""), Verdict::Accept);
@@ -3111,6 +3154,7 @@ mod tests {
                 original_len: b.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         assert_eq!(feed(100, 2, b"", false), Verdict::Accept);
@@ -3136,6 +3180,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope(scope),
+                capture_time: None,
             })
         };
         assert_eq!(feed(1, 100, 2, b"", false), Verdict::Accept);
@@ -3186,6 +3231,7 @@ mod tests {
                 original_len: b.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         assert_eq!(feed(100, 2, b""), Verdict::Accept);
@@ -3232,6 +3278,7 @@ mod tests {
                 original_len: packet.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             }),
             Verdict::Accept
         );
@@ -3263,6 +3310,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         assert_eq!(feed(&first), Verdict::Accept);
@@ -3294,6 +3342,7 @@ mod tests {
                     original_len: packet.len(),
                     checksum_ready: true,
                     scope: FlowScope::default(),
+                    capture_time: None,
                 }),
                 expected
             );
@@ -3313,6 +3362,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         assert_eq!(feed(&mut p, 2, false), Verdict::Accept);
@@ -3340,6 +3390,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         }
         let mut p = Inspect::with_limits(

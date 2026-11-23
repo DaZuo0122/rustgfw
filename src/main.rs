@@ -752,6 +752,7 @@ mod tests {
             original_len: bytes.len(),
             checksum_ready: true,
             scope: FlowScope::default(),
+            capture_time: None,
         };
         for (limit, expected) in [(16, Verdict::Accept), (64, Verdict::DropFlow)] {
             let args = [
@@ -811,6 +812,7 @@ mod tests {
                     original_len: bytes.len(),
                     checksum_ready: true,
                     scope: FlowScope::default(),
+                    capture_time: None,
                 })
             };
             assert_eq!(evaluate(&mut policy, &first_packet), Verdict::Accept);
@@ -840,6 +842,7 @@ mod tests {
             original_len: bytes.len(),
             checksum_ready: true,
             scope: FlowScope::default(),
+            capture_time: None,
         };
         for (limit, expected) in [(16, Verdict::Accept), (64, Verdict::DropFlow)] {
             let args = [
@@ -902,6 +905,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         let blocked = udp(&query("blocked.test"), 53);
@@ -984,6 +988,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         assert_eq!(
@@ -1054,6 +1059,7 @@ mod tests {
                 original_len: packet.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             }),
             Verdict::Accept
         );
@@ -1067,6 +1073,7 @@ mod tests {
                 original_len: packet.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             }),
             Verdict::DropFlow
         );
@@ -1078,7 +1085,7 @@ mod tests {
 
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"random fragments","expr":"proto == udp && fresh.udp_shape.fragmented_random_candidate == true && udp_shape.origin_first_run == 2 && udp_shape.first_entropy_milli >= 4500","action":"drop_packet"}]}"#,
+            r#"{"rules":[{"name":"random fragments","expr":"proto == udp && fresh.udp_shape.fragmented_random_candidate == true && udp_shape.origin_first_run == 2 && udp_shape.first_entropy_milli >= 4500 && fresh.udp_shape.origin_first_span_us <= 5000","action":"drop_packet"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -1096,16 +1103,19 @@ mod tests {
         packet[22..24].copy_from_slice(&443u16.to_be_bytes());
         packet[24..26].copy_from_slice(&(8 + payload.len() as u16).to_be_bytes());
         packet[28..].copy_from_slice(&payload);
-        let mut evaluate = || {
+        let mut evaluate = |micros: u64| {
             policy.evaluate(Packet {
                 bytes: &packet,
                 original_len: packet.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: Some(rustgfw_core::CaptureTime::Kernel(
+                    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_micros(micros),
+                )),
             })
         };
-        assert_eq!(evaluate(), Verdict::Accept);
-        assert_eq!(evaluate(), Verdict::Drop);
+        assert_eq!(evaluate(100_000), Verdict::Accept);
+        assert_eq!(evaluate(103_000), Verdict::Drop);
     }
 
     #[test]
@@ -1156,6 +1166,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         assert_eq!(
@@ -1212,6 +1223,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         let client = [7 << 3, 1, 2, 3, 4, 5, 6, 7, 8];
@@ -1265,6 +1277,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         let client = [0, 9, 7 << 3, 1, 2, 3, 4, 5, 6, 7, 8];
@@ -1320,6 +1333,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         let greeting = b"\x05\x01\x00";
@@ -1388,6 +1402,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         assert_eq!(
@@ -1434,6 +1449,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         assert_eq!(evaluate(&mut policy, &tcp(100, &[0, 2])), Verdict::Accept);
@@ -1498,6 +1514,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         let mut first = vec![0, 0];
@@ -1547,6 +1564,7 @@ mod tests {
                 original_len: packet.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             }),
             Verdict::DropFlow
         );
@@ -1597,6 +1615,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         let mut client = vec![3, 3];
@@ -1651,6 +1670,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: rustgfw_core::FlowScope::default(),
+                capture_time: None,
             })
         };
         let request = tcp(
@@ -1704,6 +1724,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         let request = tcp(
@@ -1782,6 +1803,7 @@ mod tests {
                     original_len: bytes.len(),
                     checksum_ready: true,
                     scope: FlowScope::default(),
+                    capture_time: None,
                 })
             };
             assert_eq!(evaluate(&requests), Verdict::Accept, "{expression}");
@@ -1823,6 +1845,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         let first_two = b"POST /one HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 0\r\n\r\nGET /two HTTP/1.1\r\nHost: blocked.test\r\n\r\n";
@@ -1873,6 +1896,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: rustgfw_core::FlowScope::default(),
+                capture_time: None,
             })
         };
         assert_eq!(evaluate(&mut policy, &first), Verdict::Accept);
@@ -1913,7 +1937,7 @@ mod tests {
     fn tcp_shape_expression_uses_raw_packets_and_ignores_retransmission() {
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"early burst","expr":"proto == tcp && tcp_shape.first_random_like == true && fet.candidate == true && tcp_shape.packet_count == 3 && fresh.tcp_shape.signed_bursts == \"100,-500\"","action":"block"}]}"#,
+            r#"{"rules":[{"name":"early burst","expr":"proto == tcp && tcp_shape.first_random_like == true && fet.candidate == true && tcp_shape.packet_count == 3 && fresh.tcp_shape.signed_bursts == \"100,-500\" && tcp_shape.first_reply_delay_us >= 30000 && fresh.tcp_shape.last_gap_us >= 10000","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -1940,26 +1964,29 @@ mod tests {
             }
             bytes
         };
-        let evaluate = |policy: &mut dyn rustgfw_core::Policy, bytes: &[u8]| {
+        let evaluate = |policy: &mut dyn rustgfw_core::Policy, bytes: &[u8], micros: u64| {
             policy.evaluate(rustgfw_core::Packet {
                 bytes,
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: rustgfw_core::FlowScope::default(),
+                capture_time: Some(rustgfw_core::CaptureTime::Kernel(
+                    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_micros(micros),
+                )),
             })
         };
         let random = (0..100)
             .map(|index| (index * 73 + 151) as u8)
             .collect::<Vec<_>>();
         let first = tcp(100, &random, false);
-        assert_eq!(evaluate(&mut policy, &first), Verdict::Accept);
-        assert_eq!(evaluate(&mut policy, &first), Verdict::Accept);
+        assert_eq!(evaluate(&mut policy, &first, 100_000), Verdict::Accept);
+        assert_eq!(evaluate(&mut policy, &first, 105_000), Verdict::Accept);
         assert_eq!(
-            evaluate(&mut policy, &tcp(500, &[0; 200], true)),
+            evaluate(&mut policy, &tcp(500, &[0; 200], true), 130_000),
             Verdict::Accept
         );
         assert_eq!(
-            evaluate(&mut policy, &tcp(700, &[0; 300], true)),
+            evaluate(&mut policy, &tcp(700, &[0; 300], true), 145_000),
             Verdict::DropFlow
         );
     }
@@ -1992,6 +2019,7 @@ mod tests {
                 original_len: packet.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         assert_eq!(evaluate(&[0x0f; 64]), Verdict::DropFlow);
@@ -2040,6 +2068,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         let mut ccs = vec![20, 3, 3, 0, 1, 1];
@@ -2084,6 +2113,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             })
         };
         assert_eq!(evaluate(&mut policy, &udp(&payload)), Verdict::Drop);
@@ -2115,6 +2145,7 @@ mod tests {
                 original_len: bytes.len(),
                 checksum_ready: true,
                 scope: FlowScope::default(),
+                capture_time: None,
             }),
             Verdict::Accept
         );

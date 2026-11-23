@@ -21,6 +21,7 @@ pub mod ssh;
 pub mod tcp;
 pub mod tls;
 pub mod trojan;
+pub mod udp_shape;
 pub mod vless;
 pub mod wireguard;
 

@@ -18,6 +18,7 @@ type Error = Box<dyn std::error::Error>;
 fn observation_field_possible(field: &str, protocol: Protocol) -> bool {
     if rustgfw_core::wireguard::FIELDS.contains(&field)
         || rustgfw_core::quic::FIELDS.contains(&field)
+        || rustgfw_core::udp_shape::FIELDS.contains(&field)
         || rustgfw_core::http3::FIELDS.contains(&field)
     {
         protocol == Protocol::Udp
@@ -286,6 +287,12 @@ impl Options {
                     .iter()
                     .any(|field| rule.condition.references_field(field))
         });
+        let needs_udp_shape = self.expr_rules.iter().any(|rule| {
+            eligible(rule, Protocol::Udp)
+                && rustgfw_core::udp_shape::FIELDS
+                    .iter()
+                    .any(|field| rule.condition.references_field(field))
+        });
         let needs_openvpn_tcp = self.expr_rules.iter().any(|rule| {
             eligible(rule, Protocol::Tcp)
                 && rustgfw_core::openvpn::TCP_FIELDS
@@ -371,6 +378,11 @@ impl Options {
                     None,
                     || Box::new(rustgfw_core::quic::QuicInitial::default()),
                 )
+            }),
+            needs_udp_shape.then(|| {
+                UdpStreamRule::new(None, || {
+                    Box::new(rustgfw_core::udp_shape::UdpShape::default())
+                })
             }),
         ]
         .into_iter()
@@ -1044,6 +1056,42 @@ mod tests {
             }),
             Verdict::DropFlow
         );
+    }
+
+    #[test]
+    fn udp_shape_expression_uses_early_ciphertext_behavior() {
+        use rustgfw_core::{FlowScope, Packet, Policy};
+
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"random fragments","expr":"proto == udp && fresh.udp_shape.fragmented_random_candidate == true && udp_shape.origin_first_run == 2 && udp_shape.first_entropy_milli >= 4500","action":"drop_packet"}]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let payload = (0..700)
+            .map(|index| (index * 73 + 151) as u8)
+            .collect::<Vec<_>>();
+        let mut packet = vec![0; 28 + payload.len()];
+        let packet_len = packet.len() as u16;
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&packet_len.to_be_bytes());
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        packet[16..20].copy_from_slice(&[198, 51, 100, 2]);
+        packet[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&443u16.to_be_bytes());
+        packet[24..26].copy_from_slice(&(8 + payload.len() as u16).to_be_bytes());
+        packet[28..].copy_from_slice(&payload);
+        let mut evaluate = || {
+            policy.evaluate(Packet {
+                bytes: &packet,
+                original_len: packet.len(),
+                checksum_ready: true,
+                scope: FlowScope::default(),
+            })
+        };
+        assert_eq!(evaluate(), Verdict::Accept);
+        assert_eq!(evaluate(), Verdict::Drop);
     }
 
     #[test]
@@ -1815,6 +1863,36 @@ mod tests {
         };
         assert_eq!(evaluate(&mut policy, &first), Verdict::Accept);
         assert_eq!(evaluate(&mut policy, &second), Verdict::DropFlow);
+    }
+
+    #[test]
+    fn decoded_stream_reuses_vless_analyzer_and_expression() {
+        use rustgfw_core::{FlowScope, inspect::DecodedStream};
+
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"inner VLESS target","expr":"proto == tcp && vless.candidate == true && vless.target_host == blocked.test","action":"block"}]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let mut request = vec![0];
+        request.extend([0x42; 16]);
+        request.extend([0, 1, 1, 187, 2, 12]);
+        request.extend(b"blocked.test");
+        let origin = "192.0.2.1:12345".parse().unwrap();
+        let target = "198.51.100.2:443".parse().unwrap();
+        let mut feed = |bytes: &[u8]| {
+            policy.feed_decoded(DecodedStream {
+                scope: FlowScope(7),
+                stream_id: 19,
+                origin,
+                target,
+                reverse: false,
+                bytes,
+            })
+        };
+        assert_eq!(feed(&request[..20]), Verdict::Accept);
+        assert_eq!(feed(&request[20..]), Verdict::DropFlow);
     }
 
     #[test]

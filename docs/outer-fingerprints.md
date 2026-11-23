@@ -5,6 +5,7 @@
 - [IMC 2020 Shadowsocks 测量](https://gfw.report/publications/imc20/en/)报告首个客户端数据包的长度与随机性被用于挑选主动探测目标；这说明包首统计可以提供候选，不能单独认证具体协议。
 - [USENIX Security 2023 全加密流量测量](https://gfw.report/publications/usenixsecurity23/en/)发现首包的平均置位数、可打印字符比例及明文前缀可用于筛除一部分正常流量。已有 `fet.*` 把这组启发式用于 TCP 首次载荷；UDP 不应复用 TCP 分段模型，因此单独按数据报边界采样。
 - [USENIX Security 2024 嵌套 TLS 指纹](https://www.usenix.org/conference/usenixsecurity24/presentation/xue-fingerprinting)表明，加密代理的包长、方向和时序仍可泄露内层 TLS 握手。它支持保留早期双向序列供后续模型训练，但不意味着任何固定的两包规则就能识别代理。
+- [NDSS 2025 跨层 RTT 差异](https://www.ndss-symposium.org/wp-content/uploads/2025-966-paper.pdf)用 TCP SEQ/ACK 配对估计传输 RTT，再对多组双向载荷包的时间序列做互相关以估计应用 RTT。代理转发到远端服务的额外往返时间可能使两者拉开；论文也指出，复用并发流、上下行分流和代理靠近目标服务器会削弱这种信号。
 - [Hysteria2 协议规范](https://www.hy2.io/docs/developers/Protocol/#gecko-obfuscation)说明 Gecko 会把 QUIC 长头包拆成 2–8 个随机填充的 UDP 数据报，再通过 Salamander 混淆；默认 Hysteria2 则是标准 QUIC。由此推论：同一方向先出现多个随机外观数据报、累计超过 QUIC Initial 的 1200 字节下限、又没有标准 v1/v2 Initial 形状，可以作为**实验性随机碎片首轮候选**。这也可能出现在其他私有 UDP 协议或截断抓包中，不能命名为 Hysteria2 命中。
 
 ## 已实现的外层字段
@@ -16,6 +17,10 @@ TCP 序列按照**包到达顺序**记录，不是 TCP 重组后的字节块大�
 参考 [Xue 等人的特征提取方法](https://www.usenix.org/system/files/usenixsecurity24-xue-fingerprinting.pdf)，`tcp_shape.handshake_rtt_us` 取最初 SYN 到反向 SYN-ACK 后首个有效起始方向 ACK 的时间差；SYN-ACK 必须确认客户端初始序号加一，ACK 必须确认服务端初始序号加一，并按 TCP 的 32 位回绕计算。握手不完整、确认号不符、时间来源不一致或时间倒退时该字段缺失。`tcp_shape.timed_bursts` 仅在 RTT 与所有数据包间隔均可比较时生成：相邻同向包的间隔小于 3 倍握手 RTT 才合并，否则新建突发；无法计算时为 `?`。`signed_bursts` 继续只按方向合并，便于对照。`tcp_shape.size_trigram` 使用论文的 1–160、161–600、601–1210、1211+ 字节四档，正负号保留方向；每个新包报告迄今所有连续三包窗口，例如 `1,-4,-4`，表达式可匹配其中任一值。
 
 论文还用 SEQ/ACK 对包建立总序，并在有标签数据上训练三元组与突发分类器。当前已核对握手确认号，但数据包仍只保留到达顺序和前 16 个载荷包，也没有移植论文的训练参数；这些字段是可组合的特征，不等于论文分类器或其报告的准确率。
+
+`TcpRtt` 独立按需观察前 64 个载荷包，不依赖明文或 MITM。它把起始方向的数据包末序号与反向 ACK 精确对应，排除完全相同的重传，取最近三组出入方向载荷轮次内样本的 RTT 中位数作为 `tcp_rtt.transport_median_us`。应用 RTT 在 1–1000 毫秒范围按 1 毫秒步进寻找双向时间序列的最大相关分数；拉普拉斯权重的尺度取传输 RTT 的四分之一并限在 1–20 毫秒。只在至少三组出入轮次且窗口内有传输样本时报告应用 RTT、差值、轮次数、样本数和归一相关分数。时间缺失、来源变化或倒退会重置该分析器的时序窗口。
+
+这是按论文方法做的**实验性特征提取**，没有移植其带标签的序贯假设检验及先验分布。实际相关峰也可能来自普通服务端处理、复用流的交错、重传、ACK 合并或 CDN 距离；`tcp_rtt.diff_us` 可在表达式中同 TCP 外层字段组合，不能单独作为代理身份判定。当前把建流时首先看到的方向当作请求方向，仅按到达顺序处理包；中途接入、部分重叠重传与重排仍需标注抓包验证。
 
 `UdpShape` 在按需启用时观察同一 UDP 端点对的前 8 个数据报。它记录首包长度、前 64 字节的平均置位数、可打印字符比例与 Shannon 熵，以及相对首包方向的有符号包长序列、首次反向前的同向包数和累计字节数。`udp_shape.first_quic_initial_shape` 只检查 v1/v2 Initial 的可见头部形状，不进行 QUIC AEAD 验证；需要验证公开 Initial 时继续使用 `quic.*`。
 

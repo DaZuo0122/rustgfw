@@ -32,6 +32,7 @@ fn observation_field_possible(field: &str, protocol: Protocol) -> bool {
         || rustgfw_core::sing_mux::FIELDS.contains(&field)
         || rustgfw_core::sing_mux_frames::FIELDS.contains(&field)
         || rustgfw_core::fet::FIELDS.contains(&field)
+        || rustgfw_core::tcp_rtt::FIELDS.contains(&field)
         || rustgfw_core::tcp_shape::FIELDS.contains(&field)
         || rustgfw_core::tls::FIELDS.contains(&field)
         || rustgfw_core::trojan::FIELDS.contains(&field)
@@ -264,6 +265,9 @@ impl Options {
         let needs_tcp_shape = rustgfw_core::tcp_shape::FIELDS
             .iter()
             .any(|field| needs_tcp_field(field));
+        let needs_tcp_rtt = rustgfw_core::tcp_rtt::FIELDS
+            .iter()
+            .any(|field| needs_tcp_field(field));
         let needs_trojan = rustgfw_core::trojan::FIELDS
             .iter()
             .any(|field| needs_tcp_field(field));
@@ -471,14 +475,19 @@ impl Options {
             .collect(),
         )
         .with_tcp_packet_analyzers(
-            needs_tcp_shape
-                .then(|| {
+            [
+                needs_tcp_shape.then(|| {
                     TcpPacketRule::new(None, || {
                         Box::new(rustgfw_core::tcp_shape::TcpShape::default())
                     })
-                })
-                .into_iter()
-                .collect(),
+                }),
+                needs_tcp_rtt.then(|| {
+                    TcpPacketRule::new(None, || Box::new(rustgfw_core::tcp_rtt::TcpRtt::default()))
+                }),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
         )
         .with_flow_rules(tcp_rules)
         .with_udp_streams(udp_analyzers, udp_rules)
@@ -2014,6 +2023,84 @@ mod tests {
             evaluate(&mut policy, &tcp(700, &[0; 300], true, 0x18), 145_000),
             Verdict::DropFlow
         );
+    }
+
+    #[test]
+    fn tcp_rtt_expression_uses_ack_and_three_response_rounds() {
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"rtt gap","expr":"proto == tcp && fresh.tcp_rtt.diff_us >= 40000 && tcp_rtt.completed_pairs == 3 && tcp_rtt.transport_samples == 3","action":"block"}]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let tcp = |sequence: u32, acknowledgment: u32, payload: &[u8], reverse: bool| {
+            let mut bytes = vec![0; 40 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 6;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&443u16.to_be_bytes());
+            bytes[24..28].copy_from_slice(&sequence.to_be_bytes());
+            bytes[28..32].copy_from_slice(&acknowledgment.to_be_bytes());
+            bytes[32] = 0x50;
+            bytes[33] = if payload.is_empty() { 0x10 } else { 0x18 };
+            bytes[40..].copy_from_slice(payload);
+            if reverse {
+                for offset in 0..4 {
+                    bytes.swap(12 + offset, 16 + offset);
+                }
+                bytes.swap(20, 22);
+                bytes.swap(21, 23);
+            }
+            bytes
+        };
+        let evaluate = |policy: &mut dyn rustgfw_core::Policy, bytes: &[u8], micros: u64| {
+            policy.evaluate(rustgfw_core::Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: rustgfw_core::FlowScope::default(),
+                capture_time: Some(rustgfw_core::CaptureTime::Kernel(
+                    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_micros(micros),
+                )),
+            })
+        };
+        for index in 0..3u32 {
+            let base = u64::from(index) * 100_000;
+            let request_sequence = 100 + index * 40;
+            let response_sequence = 500 + index * 40;
+            assert_eq!(
+                evaluate(
+                    &mut policy,
+                    &tcp(request_sequence, 500, &[1; 40], false),
+                    base
+                ),
+                Verdict::Accept
+            );
+            assert_eq!(
+                evaluate(
+                    &mut policy,
+                    &tcp(response_sequence, request_sequence + 40, &[], true),
+                    base + 10_000,
+                ),
+                Verdict::Accept
+            );
+            assert_eq!(
+                evaluate(
+                    &mut policy,
+                    &tcp(response_sequence, request_sequence + 40, &[2; 40], true),
+                    base + 50_000,
+                ),
+                if index == 2 {
+                    Verdict::DropFlow
+                } else {
+                    Verdict::Accept
+                }
+            );
+        }
     }
 
     #[test]

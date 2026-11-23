@@ -22,6 +22,7 @@ pub(crate) mod sing_mux_request;
 pub mod socks;
 pub mod ssh;
 pub mod tcp;
+pub mod tcp_rtt;
 pub mod tcp_shape;
 pub mod tls;
 pub mod trojan;

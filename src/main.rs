@@ -1533,14 +1533,19 @@ mod tests {
     fn tls_alpn_expression_enables_inspection_without_sni() {
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"HTTP/2 offer","expr":"proto == tcp && fresh.tls.alpn == h2 && tls.ech_extension == false && tls.client_cipher_suite == 0x1301 && tls.client_extension == 0x0010","action":"block"}]}"#,
+            r#"{"rules":[{"name":"HTTP/2 offer","expr":"proto == tcp && fresh.tls.alpn == h2 && tls.ech_extension == false && tls.client_cipher_suite == 0x1301 && tls.client_extension == 0x0010 && tls.client_supported_group == 0x001d && tls.client_signature_algorithm == 0x0804 && tls.client_key_share_group == 0x001d","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
         let mut body = vec![3, 3];
         body.extend([0; 32]);
         body.extend([0, 0, 2, 0x13, 1, 1, 0]);
-        body.extend([0, 9, 0, 16, 0, 5, 0, 3, 2, b'h', b'2']);
+        let mut extensions = vec![0, 16, 0, 5, 0, 3, 2, b'h', b'2'];
+        extensions.extend([0, 10, 0, 4, 0, 2, 0, 29]);
+        extensions.extend([0, 13, 0, 4, 0, 2, 8, 4]);
+        extensions.extend([0, 51, 0, 7, 0, 5, 0, 29, 0, 1, 1]);
+        body.extend((extensions.len() as u16).to_be_bytes());
+        body.extend(extensions);
         let mut handshake = vec![1, 0, 0, body.len() as u8];
         handshake.extend(body);
         let mut record = vec![22, 3, 1];

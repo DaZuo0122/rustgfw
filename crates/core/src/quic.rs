@@ -23,6 +23,15 @@ pub const FIELDS: &[&str] = &[
     "quic.tls_client_extension",
     "quic.tls_client_extensions",
     "quic.tls_client_extensions_no_grease",
+    "quic.tls_client_supported_group",
+    "quic.tls_client_supported_groups",
+    "quic.tls_client_supported_groups_no_grease",
+    "quic.tls_client_signature_algorithm",
+    "quic.tls_client_signature_algorithms",
+    "quic.tls_client_signature_algorithms_no_grease",
+    "quic.tls_client_key_share_group",
+    "quic.tls_client_key_share_groups",
+    "quic.tls_client_key_share_groups_no_grease",
 ];
 const QUIC_FINGERPRINT_FIELDS: ClientFingerprintFields = ClientFingerprintFields {
     legacy_version: "quic.tls_client_legacy_version",
@@ -32,6 +41,15 @@ const QUIC_FINGERPRINT_FIELDS: ClientFingerprintFields = ClientFingerprintFields
     extension: "quic.tls_client_extension",
     extensions: "quic.tls_client_extensions",
     extensions_no_grease: "quic.tls_client_extensions_no_grease",
+    supported_group: "quic.tls_client_supported_group",
+    supported_groups: "quic.tls_client_supported_groups",
+    supported_groups_no_grease: "quic.tls_client_supported_groups_no_grease",
+    signature_algorithm: "quic.tls_client_signature_algorithm",
+    signature_algorithms: "quic.tls_client_signature_algorithms",
+    signature_algorithms_no_grease: "quic.tls_client_signature_algorithms_no_grease",
+    key_share_group: "quic.tls_client_key_share_group",
+    key_share_groups: "quic.tls_client_key_share_groups",
+    key_share_groups_no_grease: "quic.tls_client_key_share_groups_no_grease",
 };
 const V1: u32 = 1;
 const V2: u32 = 0x6b33_43cf;
@@ -471,6 +489,12 @@ mod tests {
         extension.extend(vector(&vector(&protocols)));
         extension.extend([0, 43]);
         extension.extend(vector(&[4, 3, 4, 3, 3]));
+        extension.extend([0, 10]);
+        extension.extend(vector(&vector(&[0, 29])));
+        extension.extend([0, 13]);
+        extension.extend(vector(&vector(&[8, 4])));
+        extension.extend([0, 51]);
+        extension.extend(vector(&vector(&[0, 29, 0, 1, 1])));
         extension.extend([0xfe, 0x0d, 0, 1, 0]);
         if with_transport_parameters {
             extension.extend([0, 0x39, 0, 6, 0x0f, 0, 0x20, 2, 0x45, 0xb0]);
@@ -596,7 +620,19 @@ mod tests {
             );
             assert_eq!(
                 field(&result, "quic.tls_client_extensions"),
-                Some("0x0000,0x0010,0x002b,0xfe0d,0x0039")
+                Some("0x0000,0x0010,0x002b,0x000a,0x000d,0x0033,0xfe0d,0x0039")
+            );
+            assert_eq!(
+                field(&result, "quic.tls_client_supported_groups"),
+                Some("0x001d")
+            );
+            assert_eq!(
+                field(&result, "quic.tls_client_signature_algorithms"),
+                Some("0x0804")
+            );
+            assert_eq!(
+                field(&result, "quic.tls_client_key_share_groups"),
+                Some("0x001d")
             );
             if let UdpStreamAnalysis::FinalObservations(values) = &result {
                 assert!(
@@ -655,13 +691,49 @@ mod tests {
     fn decrypts_reference_client_initial_captures() {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../references/opengfw/analyzer/udp/testdata");
-        for (name, count, expected) in [
-            ("chrome153", 2, "chrome.sniff.test"),
-            ("firefox153esr", 2, "firefox.sniff.test"),
-            ("curl8.14-openssl3.5", 2, "curl.sniff.test"),
-            ("quiche", 3, "quiche.sniff.test"),
-            ("ngtcp2-1.11", 1, "ngtcp2.sniff.test"),
-            ("aioquic1.2", 1, "aioquic.sniff.test"),
+        for (name, count, expected, groups, shares) in [
+            (
+                "chrome153",
+                2,
+                "chrome.sniff.test",
+                "0x11ec,0x001d,0x0017,0x0018",
+                "0x11ec,0x001d",
+            ),
+            (
+                "firefox153esr",
+                2,
+                "firefox.sniff.test",
+                "0x11ec,0x001d,0x0017,0x0018,0x0019",
+                "0x11ec,0x001d,0x0017",
+            ),
+            (
+                "curl8.14-openssl3.5",
+                2,
+                "curl.sniff.test",
+                "0x11ec,0x001d,0x0017,0x001e,0x0018,0x0019,0x0100,0x0101",
+                "0x11ec,0x001d",
+            ),
+            (
+                "quiche",
+                3,
+                "quiche.sniff.test",
+                "0x11ec,0xfe32,0x001d,0x0017,0x0018",
+                "0x11ec,0x001d",
+            ),
+            (
+                "ngtcp2-1.11",
+                1,
+                "ngtcp2.sniff.test",
+                "0x001d,0x0017,0x0018,0x0019",
+                "0x001d,0x0017",
+            ),
+            (
+                "aioquic1.2",
+                1,
+                "aioquic.sniff.test",
+                "0x0017,0x0018,0x001d,0x001e",
+                "0x0017,0x0018,0x001d,0x001e",
+            ),
         ] {
             let mut analyzer = QuicInitial::default();
             let mut result = UdpStreamAnalysis::Pending;
@@ -670,6 +742,21 @@ mod tests {
                 result = analyzer.feed(&bytes, false);
             }
             assert_eq!(field(&result, "quic.sni"), Some(expected), "{name}");
+            assert_eq!(
+                field(&result, "quic.tls_client_supported_groups"),
+                Some(groups),
+                "{name}"
+            );
+            assert_eq!(
+                field(&result, "quic.tls_client_key_share_groups"),
+                Some(shares),
+                "{name}"
+            );
+            assert!(
+                field(&result, "quic.tls_client_signature_algorithms")
+                    .is_some_and(|value| value.starts_with("0x")),
+                "{name}"
+            );
         }
         let read = |name: &str, index| {
             std::fs::read(base.join(format!("quic-{name}-{index}.bin"))).unwrap()

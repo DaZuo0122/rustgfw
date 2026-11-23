@@ -13,6 +13,15 @@ pub const FIELDS: &[&str] = &[
     "tls.client_extension",
     "tls.client_extensions",
     "tls.client_extensions_no_grease",
+    "tls.client_supported_group",
+    "tls.client_supported_groups",
+    "tls.client_supported_groups_no_grease",
+    "tls.client_signature_algorithm",
+    "tls.client_signature_algorithms",
+    "tls.client_signature_algorithms_no_grease",
+    "tls.client_key_share_group",
+    "tls.client_key_share_groups",
+    "tls.client_key_share_groups_no_grease",
     "tls.server_version",
     "tls.server_cipher",
     "tls.server_alpn",
@@ -189,6 +198,9 @@ pub(crate) struct ClientHelloMetadata {
     pub legacy_version: u16,
     pub cipher_suites: Vec<u16>,
     pub extension_types: Vec<u16>,
+    pub supported_groups: Vec<u16>,
+    pub signature_algorithms: Vec<u16>,
+    pub key_share_groups: Vec<u16>,
     pub sni: Option<String>,
     pub alpn: Vec<String>,
     pub supported_versions: Vec<u16>,
@@ -205,6 +217,15 @@ pub(crate) struct ClientFingerprintFields {
     pub extension: &'static str,
     pub extensions: &'static str,
     pub extensions_no_grease: &'static str,
+    pub supported_group: &'static str,
+    pub supported_groups: &'static str,
+    pub supported_groups_no_grease: &'static str,
+    pub signature_algorithm: &'static str,
+    pub signature_algorithms: &'static str,
+    pub signature_algorithms_no_grease: &'static str,
+    pub key_share_group: &'static str,
+    pub key_share_groups: &'static str,
+    pub key_share_groups_no_grease: &'static str,
 }
 
 const TLS_FINGERPRINT_FIELDS: ClientFingerprintFields = ClientFingerprintFields {
@@ -215,6 +236,15 @@ const TLS_FINGERPRINT_FIELDS: ClientFingerprintFields = ClientFingerprintFields 
     extension: "tls.client_extension",
     extensions: "tls.client_extensions",
     extensions_no_grease: "tls.client_extensions_no_grease",
+    supported_group: "tls.client_supported_group",
+    supported_groups: "tls.client_supported_groups",
+    supported_groups_no_grease: "tls.client_supported_groups_no_grease",
+    signature_algorithm: "tls.client_signature_algorithm",
+    signature_algorithms: "tls.client_signature_algorithms",
+    signature_algorithms_no_grease: "tls.client_signature_algorithms_no_grease",
+    key_share_group: "tls.client_key_share_group",
+    key_share_groups: "tls.client_key_share_groups",
+    key_share_groups_no_grease: "tls.client_key_share_groups_no_grease",
 };
 
 fn is_grease(value: u16) -> bool {
@@ -273,7 +303,64 @@ pub(crate) fn client_fingerprint_observations(
         fields.extensions,
         fields.extensions_no_grease,
     );
+    for (codes, item, ordered, without_grease) in [
+        (
+            &hello.supported_groups,
+            fields.supported_group,
+            fields.supported_groups,
+            fields.supported_groups_no_grease,
+        ),
+        (
+            &hello.signature_algorithms,
+            fields.signature_algorithm,
+            fields.signature_algorithms,
+            fields.signature_algorithms_no_grease,
+        ),
+        (
+            &hello.key_share_groups,
+            fields.key_share_group,
+            fields.key_share_groups,
+            fields.key_share_groups_no_grease,
+        ),
+    ] {
+        if !codes.is_empty() {
+            append_ordered_codes(&mut observations, codes, item, ordered, without_grease);
+        }
+    }
     observations
+}
+
+fn code_list(data: &[u8]) -> Option<Vec<u16>> {
+    let mut c = Cursor(data);
+    let bytes = c.vector()?;
+    if !c.0.is_empty() || bytes.is_empty() || bytes.len() % 2 != 0 {
+        return None;
+    }
+    Some(
+        bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_be_bytes(*pair))
+            .collect(),
+    )
+}
+
+fn key_share_groups(data: &[u8]) -> Option<Vec<u16>> {
+    let mut c = Cursor(data);
+    let mut shares = Cursor(c.vector()?);
+    if !c.0.is_empty() || shares.0.is_empty() {
+        return None;
+    }
+    let mut groups = Vec::new();
+    while !shares.0.is_empty() {
+        let group = shares.word()? as u16;
+        if shares.vector()?.is_empty() {
+            return None;
+        }
+        groups.push(group);
+    }
+    Some(groups)
 }
 
 fn quic_varint(cursor: &mut Cursor<'_>) -> Option<u64> {
@@ -340,6 +427,9 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
     let mut seen_alpn = false;
     let mut supported_versions = Vec::new();
     let mut seen_versions = false;
+    let mut supported_groups = None;
+    let mut signature_algorithms = None;
+    let mut key_shares = None;
     let mut ech_extension = false;
     let mut quic_transport_parameters = false;
     let mut quic_datagram_size = None;
@@ -390,6 +480,24 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
                     }
                 }
             }
+            10 => {
+                if supported_groups.is_some() {
+                    return None;
+                }
+                supported_groups = Some(code_list(data)?);
+            }
+            13 => {
+                if signature_algorithms.is_some() {
+                    return None;
+                }
+                signature_algorithms = Some(code_list(data)?);
+            }
+            51 => {
+                if key_shares.is_some() {
+                    return None;
+                }
+                key_shares = Some(key_share_groups(data)?);
+            }
             43 => {
                 if seen_versions {
                     return None;
@@ -420,6 +528,9 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
         legacy_version,
         cipher_suites,
         extension_types,
+        supported_groups: supported_groups.unwrap_or_default(),
+        signature_algorithms: signature_algorithms.unwrap_or_default(),
+        key_share_groups: key_shares.unwrap_or_default(),
         sni: name,
         alpn,
         supported_versions,
@@ -623,6 +734,16 @@ mod tests {
     #[test]
     fn client_fingerprint_keeps_wire_order_and_exposes_grease_free_order() {
         let mut extensions = vec![0x1a, 0x1a, 0, 0, 0, 43, 0, 3, 2, 3, 4];
+        extensions.extend([0, 10]);
+        extensions.extend(vector(&vector(&[0x0a, 0x0a, 0, 29, 0, 23])));
+        extensions.extend([0, 13]);
+        extensions.extend(vector(&vector(&[0x08, 0x04, 0x08, 0x05])));
+        let mut shares = vec![0, 29];
+        shares.extend(vector(&[1, 2, 3]));
+        shares.extend([0x2a, 0x2a]);
+        shares.extend(vector(&[4]));
+        extensions.extend([0, 51]);
+        extensions.extend(vector(&vector(&shares)));
         extensions.extend([0x2a, 0x2a, 0, 0]);
         let mut body = vec![3, 3];
         body.extend([0; 32]);
@@ -651,8 +772,31 @@ mod tests {
             field("tls.client_cipher_suites_no_grease"),
             Some("0x1301,0xc02f")
         );
-        assert_eq!(field("tls.client_extensions"), Some("0x1a1a,0x002b,0x2a2a"));
-        assert_eq!(field("tls.client_extensions_no_grease"), Some("0x002b"));
+        assert_eq!(
+            field("tls.client_extensions"),
+            Some("0x1a1a,0x002b,0x000a,0x000d,0x0033,0x2a2a")
+        );
+        assert_eq!(
+            field("tls.client_extensions_no_grease"),
+            Some("0x002b,0x000a,0x000d,0x0033")
+        );
+        assert_eq!(
+            field("tls.client_supported_groups"),
+            Some("0x0a0a,0x001d,0x0017")
+        );
+        assert_eq!(
+            field("tls.client_supported_groups_no_grease"),
+            Some("0x001d,0x0017")
+        );
+        assert_eq!(
+            field("tls.client_signature_algorithms"),
+            Some("0x0804,0x0805")
+        );
+        assert_eq!(field("tls.client_key_share_groups"), Some("0x001d,0x2a2a"));
+        assert_eq!(
+            field("tls.client_key_share_groups_no_grease"),
+            Some("0x001d")
+        );
         assert_eq!(
             values
                 .iter()
@@ -665,7 +809,7 @@ mod tests {
                 .iter()
                 .filter(|item| item.field == "tls.client_extension")
                 .count(),
-            3
+            6
         );
     }
     #[test]

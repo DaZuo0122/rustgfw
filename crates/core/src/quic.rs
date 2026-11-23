@@ -20,6 +20,10 @@ pub const FIELDS: &[&str] = &[
     "quic.transport_parameters",
     "quic.datagram_max_size",
     "quic.tls_client_legacy_version",
+    "quic.tls_client_random",
+    "quic.tls_client_session_id",
+    "quic.tls_client_session_id_len",
+    "quic.tls_client_compression_methods",
     "quic.tls_client_cipher_suite",
     "quic.tls_client_cipher_suites",
     "quic.tls_client_cipher_suites_no_grease",
@@ -46,6 +50,10 @@ pub const SERVER_FIELDS: &[&str] = &[
 ];
 const QUIC_FINGERPRINT_FIELDS: ClientFingerprintFields = ClientFingerprintFields {
     legacy_version: "quic.tls_client_legacy_version",
+    random: "quic.tls_client_random",
+    session_id: "quic.tls_client_session_id",
+    session_id_len: "quic.tls_client_session_id_len",
+    compression_methods: "quic.tls_client_compression_methods",
     cipher_suite: "quic.tls_client_cipher_suite",
     cipher_suites: "quic.tls_client_cipher_suites",
     cipher_suites_no_grease: "quic.tls_client_cipher_suites_no_grease",
@@ -1139,6 +1147,15 @@ mod tests {
                 field(&result, "quic.tls_client_legacy_version"),
                 Some("0x0303")
             );
+            assert_eq!(field(&result, "quic.tls_client_session_id_len"), Some("0"));
+            assert_eq!(
+                field(&result, "quic.tls_client_compression_methods"),
+                Some("0x00")
+            );
+            assert_eq!(
+                field(&result, "quic.tls_client_random").map(str::len),
+                Some(64)
+            );
             assert_eq!(
                 field(&result, "quic.tls_client_cipher_suites"),
                 Some("0x1301")
@@ -1387,6 +1404,21 @@ mod tests {
                 result = analyzer.feed(&bytes, false);
             }
             assert_eq!(field(&result, "quic.sni"), Some(expected), "{name}");
+            assert_eq!(
+                field(&result, "quic.tls_client_session_id_len"),
+                Some("0"),
+                "{name}"
+            );
+            assert_eq!(
+                field(&result, "quic.tls_client_compression_methods"),
+                Some("0x00"),
+                "{name}"
+            );
+            assert_eq!(
+                field(&result, "quic.tls_client_random").map(str::len),
+                Some(64),
+                "{name}"
+            );
             assert_eq!(
                 field(&result, "quic.tls_client_supported_groups"),
                 Some(groups),

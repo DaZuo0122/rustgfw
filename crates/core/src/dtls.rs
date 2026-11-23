@@ -18,6 +18,10 @@ pub const FIELDS: &[&str] = &[
     "dtls.server_cipher",
     "dtls.server_alpn",
     "dtls.client_legacy_version",
+    "dtls.client_random",
+    "dtls.client_session_id",
+    "dtls.client_session_id_len",
+    "dtls.client_compression_methods",
     "dtls.client_cipher_suite",
     "dtls.client_cipher_suites",
     "dtls.client_cipher_suites_no_grease",
@@ -37,6 +41,10 @@ pub const FIELDS: &[&str] = &[
 
 const FINGERPRINT_FIELDS: ClientFingerprintFields = ClientFingerprintFields {
     legacy_version: "dtls.client_legacy_version",
+    random: "dtls.client_random",
+    session_id: "dtls.client_session_id",
+    session_id_len: "dtls.client_session_id_len",
+    compression_methods: "dtls.client_compression_methods",
     cipher_suite: "dtls.client_cipher_suite",
     cipher_suites: "dtls.client_cipher_suites",
     cipher_suites_no_grease: "dtls.client_cipher_suites_no_grease",
@@ -440,6 +448,11 @@ mod tests {
         assert_eq!(field(&first, "dtls.sni"), Some("dtls.example"));
         assert_eq!(field(&first, "dtls.alpn"), Some("h2"));
         assert_eq!(field(&first, "dtls.client_cookie_present"), Some("false"));
+        assert_eq!(field(&first, "dtls.client_session_id_len"), Some("0"));
+        assert_eq!(
+            field(&first, "dtls.client_compression_methods"),
+            Some("0x00")
+        );
         assert_eq!(field(&first, "dtls.client_cipher_suites"), Some("0x1301"));
 
         let verify_body = [0xfe, 0xfd, 3, 1, 2, 3];
@@ -522,6 +535,8 @@ mod tests {
             let result = analyzer.feed(packets[1], false);
             assert_eq!(field(&result, "dtls.sni"), Some("dtls.example"));
             assert_eq!(field(&result, "dtls.alpn"), Some("h2"));
+            assert_eq!(field(&result, "dtls.client_session_id_len"), Some("0"));
+            assert_eq!(field(&result, "dtls.client_random").map(str::len), Some(64));
             assert_eq!(field(&result, "dtls.client_legacy_version"), Some("0xfefd"));
         }
     }

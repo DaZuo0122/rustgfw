@@ -2221,7 +2221,7 @@ mod tests {
 
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"DTLS SNI","expr":"proto == udp && fresh.dtls.sni == dtls.example && dtls.alpn == h2","action":"drop_packet"}]}"#,
+            r#"{"rules":[{"name":"DTLS SNI","expr":"proto == udp && fresh.dtls.sni == dtls.example && dtls.alpn == h2 && dtls.client_session_id_len == 0 && dtls.client_compression_methods == 0x00","action":"drop_packet"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();

@@ -7,6 +7,10 @@ pub const FIELDS: &[&str] = &[
     "tls.supported_version",
     "tls.ech_extension",
     "tls.client_legacy_version",
+    "tls.client_random",
+    "tls.client_session_id",
+    "tls.client_session_id_len",
+    "tls.client_compression_methods",
     "tls.client_cipher_suite",
     "tls.client_cipher_suites",
     "tls.client_cipher_suites_no_grease",
@@ -196,6 +200,9 @@ impl<'a> Cursor<'a> {
 }
 pub(crate) struct ClientHelloMetadata {
     pub legacy_version: u16,
+    pub random: [u8; 32],
+    pub session_id: Vec<u8>,
+    pub compression_methods: Vec<u8>,
     pub cipher_suites: Vec<u16>,
     pub extension_types: Vec<u16>,
     pub supported_groups: Vec<u16>,
@@ -211,6 +218,10 @@ pub(crate) struct ClientHelloMetadata {
 
 pub(crate) struct ClientFingerprintFields {
     pub legacy_version: &'static str,
+    pub random: &'static str,
+    pub session_id: &'static str,
+    pub session_id_len: &'static str,
+    pub compression_methods: &'static str,
     pub cipher_suite: &'static str,
     pub cipher_suites: &'static str,
     pub cipher_suites_no_grease: &'static str,
@@ -230,6 +241,10 @@ pub(crate) struct ClientFingerprintFields {
 
 const TLS_FINGERPRINT_FIELDS: ClientFingerprintFields = ClientFingerprintFields {
     legacy_version: "tls.client_legacy_version",
+    random: "tls.client_random",
+    session_id: "tls.client_session_id",
+    session_id_len: "tls.client_session_id_len",
+    compression_methods: "tls.client_compression_methods",
     cipher_suite: "tls.client_cipher_suite",
     cipher_suites: "tls.client_cipher_suites",
     cipher_suites_no_grease: "tls.client_cipher_suites_no_grease",
@@ -249,6 +264,16 @@ const TLS_FINGERPRINT_FIELDS: ClientFingerprintFields = ClientFingerprintFields 
 
 fn is_grease(value: u16) -> bool {
     value & 0x0f0f == 0x0a0a && (value >> 8) == (value & 0xff)
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        value.push(DIGITS[usize::from(byte >> 4)] as char);
+        value.push(DIGITS[usize::from(byte & 0xf)] as char);
+    }
+    value
 }
 
 fn append_ordered_codes(
@@ -285,10 +310,33 @@ pub(crate) fn client_fingerprint_observations(
     hello: &ClientHelloMetadata,
     fields: ClientFingerprintFields,
 ) -> Vec<Observation> {
-    let mut observations = vec![Observation {
-        field: fields.legacy_version,
-        value: format!("0x{:04x}", hello.legacy_version),
-    }];
+    let mut observations = vec![
+        Observation {
+            field: fields.legacy_version,
+            value: format!("0x{:04x}", hello.legacy_version),
+        },
+        Observation {
+            field: fields.random,
+            value: hex_bytes(&hello.random),
+        },
+        Observation {
+            field: fields.session_id,
+            value: hex_bytes(&hello.session_id),
+        },
+        Observation {
+            field: fields.session_id_len,
+            value: hello.session_id.len().to_string(),
+        },
+        Observation {
+            field: fields.compression_methods,
+            value: hello
+                .compression_methods
+                .iter()
+                .map(|method| format!("0x{method:02x}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        },
+    ];
     append_ordered_codes(
         &mut observations,
         &hello.cipher_suites,
@@ -397,12 +445,12 @@ fn quic_datagram_max_size(bytes: &[u8]) -> Option<Option<u64>> {
 pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> {
     let mut c = Cursor(body);
     let legacy_version = c.word()? as u16;
-    c.take(32)?;
+    let random = c.take(32)?.try_into().ok()?;
     let session = c.byte()?;
     if session > 32 {
         return None;
     }
-    c.take(session)?;
+    let session_id = c.take(session)?.to_vec();
     let suites = c.vector()?;
     if suites.is_empty() || suites.len() % 2 != 0 {
         return None;
@@ -417,7 +465,7 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
     if compression == 0 {
         return None;
     }
-    c.take(compression)?;
+    let compression_methods = c.take(compression)?.to_vec();
     let mut extensions = Cursor(c.vector()?);
     if !c.0.is_empty() {
         return None;
@@ -526,6 +574,9 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
     }
     Some(ClientHelloMetadata {
         legacy_version,
+        random,
+        session_id,
+        compression_methods,
         cipher_suites,
         extension_types,
         supported_groups: supported_groups.unwrap_or_default(),
@@ -764,6 +815,10 @@ mod tests {
                 .map(|item| item.value.as_str())
         };
         assert_eq!(field("tls.client_legacy_version"), Some("0x0303"));
+        assert_eq!(field("tls.client_random"), Some("00".repeat(32).as_str()));
+        assert_eq!(field("tls.client_session_id"), Some(""));
+        assert_eq!(field("tls.client_session_id_len"), Some("0"));
+        assert_eq!(field("tls.client_compression_methods"), Some("0x00"));
         assert_eq!(
             field("tls.client_cipher_suites"),
             Some("0x0a0a,0x1301,0xc02f")
@@ -811,6 +866,30 @@ mod tests {
                 .count(),
             6
         );
+    }
+    #[test]
+    fn client_hello_exposes_session_id_and_compression_order() {
+        let mut body = vec![3, 3];
+        body.extend(0..32);
+        body.extend([2, 0xa1, 0xb2]);
+        body.extend(vector(&[0x00, 0x2f]));
+        body.extend([2, 0x00, 0x01]);
+        body.extend([0, 0]);
+        let hello = client_hello_metadata(&body).unwrap();
+        let values = client_fingerprint_observations(&hello, TLS_FINGERPRINT_FIELDS);
+        let field = |name| {
+            values
+                .iter()
+                .find(|item| item.field == name)
+                .map(|item| item.value.as_str())
+        };
+        assert_eq!(
+            field("tls.client_random"),
+            Some("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+        );
+        assert_eq!(field("tls.client_session_id"), Some("a1b2"));
+        assert_eq!(field("tls.client_session_id_len"), Some("2"));
+        assert_eq!(field("tls.client_compression_methods"), Some("0x00,0x01"));
     }
     #[test]
     fn truncation_and_malformed_lengths() {

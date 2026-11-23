@@ -67,6 +67,18 @@ const SALT_V2: [u8; 20] = [
     0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb,
     0xf9, 0xbd, 0x2e, 0xd9,
 ];
+const RETRY_KEY_V1: [u8; 16] = [
+    0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
+];
+const RETRY_NONCE_V1: [u8; 12] = [
+    0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
+];
+const RETRY_KEY_V2: [u8; 16] = [
+    0x8f, 0xb4, 0xb0, 0x1b, 0x56, 0xac, 0x48, 0xe2, 0x60, 0xfb, 0xcb, 0xce, 0xad, 0x7c, 0xcc, 0x92,
+];
+const RETRY_NONCE_V2: [u8; 12] = [
+    0xd8, 0x69, 0x69, 0xbc, 0x2d, 0x7c, 0x6d, 0x99, 0x90, 0xef, 0xb0, 0x4a,
+];
 const MAX_CRYPTO_BYTES: usize = 65536;
 const MAX_FRAMES: usize = 256;
 const MAX_CLIENT_DATAGRAMS: usize = 8;
@@ -148,6 +160,7 @@ struct Header<'a> {
     version: u32,
     dcid: &'a [u8],
     scid: &'a [u8],
+    token: &'a [u8],
     packet_len: usize,
     pn_offset: usize,
     initial: bool,
@@ -182,11 +195,14 @@ fn parse_header(bytes: &[u8]) -> Option<Header<'_>> {
     }
     let scid = bytes.get(cursor..cursor + scid_len)?;
     cursor += scid_len;
-    if initial {
+    let token = if initial {
         let token_len = usize::try_from(varint(bytes, &mut cursor)?).ok()?;
-        bytes.get(cursor..cursor.checked_add(token_len)?)?;
+        let token = bytes.get(cursor..cursor.checked_add(token_len)?)?;
         cursor += token_len;
-    }
+        token
+    } else {
+        &[]
+    };
     let length = usize::try_from(varint(bytes, &mut cursor)?).ok()?;
     let packet_len = cursor.checked_add(length)?;
     if length < 17 || packet_len > bytes.len() {
@@ -196,10 +212,71 @@ fn parse_header(bytes: &[u8]) -> Option<Header<'_>> {
         version,
         dcid,
         scid,
+        token,
         packet_len,
         pn_offset: cursor,
         initial,
     })
+}
+
+struct VerifiedRetry<'a> {
+    scid: &'a [u8],
+    token: &'a [u8],
+}
+
+fn verified_retry<'a>(
+    packet: &'a [u8],
+    version: u32,
+    original_dcid: &[u8],
+    client_scid: &[u8],
+) -> Option<VerifiedRetry<'a>> {
+    let first = *packet.first()?;
+    if first & 0xc0 != 0xc0
+        || (first >> 4) & 3 != if version == V2 { 0 } else { 3 }
+        || u32::from_be_bytes(packet.get(1..5)?.try_into().ok()?) != version
+    {
+        return None;
+    }
+    let mut cursor = 5;
+    let dcid_len = usize::from(*packet.get(cursor)?);
+    cursor += 1;
+    if dcid_len > 20 || packet.get(cursor..cursor + dcid_len)? != client_scid {
+        return None;
+    }
+    cursor += dcid_len;
+    let scid_len = usize::from(*packet.get(cursor)?);
+    cursor += 1;
+    if scid_len > 20 {
+        return None;
+    }
+    let scid = packet.get(cursor..cursor + scid_len)?;
+    if scid == original_dcid {
+        return None;
+    }
+    cursor += scid_len;
+    let tag_offset = packet.len().checked_sub(16)?;
+    let token = packet.get(cursor..tag_offset)?;
+    if token.is_empty() {
+        return None;
+    }
+    let (key, nonce) = if version == V2 {
+        (&RETRY_KEY_V2, RETRY_NONCE_V2)
+    } else {
+        (&RETRY_KEY_V1, RETRY_NONCE_V1)
+    };
+    let key = aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, key).ok()?);
+    let mut pseudo = Vec::with_capacity(original_dcid.len() + 1 + tag_offset);
+    pseudo.push(original_dcid.len() as u8);
+    pseudo.extend_from_slice(original_dcid);
+    pseudo.extend_from_slice(&packet[..tag_offset]);
+    let mut tag = packet[tag_offset..].to_vec();
+    key.open_in_place(
+        aead::Nonce::assume_unique_for_key(nonce),
+        aead::Aad::from(pseudo),
+        &mut tag,
+    )
+    .ok()?;
+    Some(VerifiedRetry { scid, token })
 }
 
 fn packet_number(truncated: u64, width: usize, largest: Option<u64>) -> u64 {
@@ -347,6 +424,8 @@ fn crypto_frames(plaintext: &[u8]) -> Option<Vec<Fragment>> {
 #[derive(Default)]
 pub struct QuicInitial {
     connection: Option<(u32, Vec<u8>)>,
+    client_scid: Option<Vec<u8>>,
+    retry_token: Option<Vec<u8>>,
     crypto: CryptoBuffer,
     largest_number: Option<u64>,
     client_direction: Option<bool>,
@@ -363,6 +442,15 @@ impl UdpStreamAnalyzer for QuicInitial {
             .client_direction
             .is_some_and(|direction| direction != reverse)
         {
+            if self.retry_token.is_none()
+                && let (Some((version, dcid)), Some(client_scid)) =
+                    (&self.connection, &self.client_scid)
+                && let Some(retry) = verified_retry(payload, *version, dcid, client_scid)
+            {
+                self.connection = Some((*version, retry.scid.to_vec()));
+                self.retry_token = Some(retry.token.to_vec());
+                self.crypto = CryptoBuffer::default();
+            }
             return UdpStreamAnalysis::Pending;
         }
         self.client_datagrams += 1;
@@ -388,6 +476,11 @@ impl UdpStreamAnalyzer for QuicInitial {
             }) {
                 continue;
             }
+            if self.retry_token.as_ref().is_some_and(|token| {
+                token.as_slice() != header.token || self.client_scid.as_deref() != Some(header.scid)
+            }) {
+                continue;
+            }
             let Some(keys) = initial_keys(header.version, header.dcid) else {
                 continue;
             };
@@ -401,6 +494,7 @@ impl UdpStreamAnalyzer for QuicInitial {
             };
             if self.connection.is_none() {
                 self.connection = Some((header.version, header.dcid.to_vec()));
+                self.client_scid = Some(header.scid.to_vec());
                 self.client_direction = Some(reverse);
             }
             self.largest_number = Some(self.largest_number.map_or(number, |old| old.max(number)));
@@ -482,6 +576,7 @@ struct ServerConnection {
     initial_dcid: Vec<u8>,
     client_scid: Vec<u8>,
     client_direction: bool,
+    retry_token: Option<Vec<u8>>,
 }
 
 /// Observes a server's first TLS ServerHello from the public QUIC Initial space.
@@ -556,6 +651,20 @@ impl UdpStreamAnalyzer for QuicServerInitial {
         {
             return UdpStreamAnalysis::Pending;
         }
+        if let Some(connection) = &mut self.connection
+            && connection.retry_token.is_none()
+            && self.largest_number.is_none()
+            && let Some(retry) = verified_retry(
+                payload,
+                connection.version,
+                &connection.initial_dcid,
+                &connection.client_scid,
+            )
+        {
+            connection.initial_dcid = retry.scid.to_vec();
+            connection.retry_token = Some(retry.token.to_vec());
+            return UdpStreamAnalysis::Pending;
+        }
         let mut datagram = payload;
         let mut packets = 0;
         let mut accepted = false;
@@ -611,6 +720,7 @@ impl UdpStreamAnalyzer for QuicServerInitial {
                     initial_dcid: header.dcid.to_vec(),
                     client_scid: header.scid.to_vec(),
                     client_direction: reverse,
+                    retry_token: None,
                 });
             }
         }
@@ -700,6 +810,7 @@ mod tests {
         data: &[u8],
         cids: (&[u8], &[u8], &[u8]),
         server: bool,
+        token: &[u8],
     ) -> Vec<u8> {
         let (dcid, scid, key_dcid) = cids;
         let keys = initial_keys_for(version, key_dcid, server).unwrap();
@@ -715,7 +826,8 @@ mod tests {
         header.extend(dcid);
         header.push(scid.len() as u8);
         header.extend(scid);
-        header.push(0); // Empty token.
+        header.extend(encode_varint(token.len()));
+        header.extend(token);
         header.extend(encode_varint(1 + plaintext.len() + 16));
         let pn_offset = header.len();
         header.push(number);
@@ -738,7 +850,15 @@ mod tests {
 
     fn initial(version: u32, number: u8, offset: usize, data: &[u8]) -> Vec<u8> {
         let dcid = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
-        initial_packet(version, number, offset, data, (&dcid, &[], &dcid), false)
+        initial_packet(
+            version,
+            number,
+            offset,
+            data,
+            (&dcid, &[], &dcid),
+            false,
+            &[],
+        )
     }
 
     fn server_hello() -> Vec<u8> {
@@ -804,6 +924,183 @@ mod tests {
             assert_eq!(actual.1.as_slice(), hex(iv));
             assert_eq!(actual.2.as_slice(), hex(hp));
         }
+    }
+
+    #[test]
+    fn validates_v1_v2_retry_integrity_vectors() {
+        // RFC 9001 A.4 and RFC 9369 A.4 use the same original client DCID.
+        let original_dcid = hex("8394c8f03e515708");
+        for (version, wire) in [
+            (
+                V1,
+                "ff000000010008f067a5502a4262b5746f6b656e04a265ba2eff4d829058fb3f0f2496ba",
+            ),
+            (
+                V2,
+                "cf6b3343cf0008f067a5502a4262b5746f6b656ec8646ce8bfe33952d955543665dcc7b6",
+            ),
+        ] {
+            let packet = hex(wire);
+            let retry = verified_retry(&packet, version, &original_dcid, &[]).unwrap();
+            assert_eq!(retry.scid, hex("f067a5502a4262b5"));
+            assert_eq!(retry.token, b"token");
+            let mut corrupt = packet.clone();
+            *corrupt.last_mut().unwrap() ^= 1;
+            assert!(verified_retry(&corrupt, version, &original_dcid, &[]).is_none());
+            assert!(verified_retry(&packet, version, &[0; 8], &[]).is_none());
+        }
+    }
+
+    #[test]
+    fn retry_rekeys_both_initial_analyzers() {
+        let original_dcid = hex("8394c8f03e515708");
+        let retry_dcid = hex("f067a5502a4262b5");
+        for (version, wire) in [
+            (
+                V1,
+                "ff000000010008f067a5502a4262b5746f6b656e04a265ba2eff4d829058fb3f0f2496ba",
+            ),
+            (
+                V2,
+                "cf6b3343cf0008f067a5502a4262b5746f6b656ec8646ce8bfe33952d955543665dcc7b6",
+            ),
+        ] {
+            let hello = client_hello("after-retry.test", true);
+            let before = initial_packet(
+                version,
+                0,
+                0,
+                &hello[..8],
+                (&original_dcid, &[], &original_dcid),
+                false,
+                &[],
+            );
+            let retry = hex(wire);
+            let after = initial_packet(
+                version,
+                1,
+                0,
+                &hello,
+                (&retry_dcid, &[], &retry_dcid),
+                false,
+                b"token",
+            );
+            let wrong_token = initial_packet(
+                version,
+                1,
+                0,
+                &hello,
+                (&retry_dcid, &[], &retry_dcid),
+                false,
+                b"wrong",
+            );
+            let reply = initial_packet(
+                version,
+                0,
+                0,
+                &server_hello(),
+                (&[], &[0xaa], &retry_dcid),
+                true,
+                &[],
+            );
+            let mut client = QuicInitial::default();
+            assert!(matches!(
+                client.feed(&before, false),
+                UdpStreamAnalysis::Pending
+            ));
+            assert!(matches!(
+                client.feed(&retry, true),
+                UdpStreamAnalysis::Pending
+            ));
+            assert!(matches!(
+                client.feed(&wrong_token, false),
+                UdpStreamAnalysis::Pending
+            ));
+            assert_eq!(
+                field(&client.feed(&after, false), "quic.sni"),
+                Some("after-retry.test")
+            );
+
+            let mut server = QuicServerInitial::default();
+            assert!(matches!(
+                server.feed(&before, false),
+                UdpStreamAnalysis::Pending
+            ));
+            assert!(matches!(
+                server.feed(&retry, true),
+                UdpStreamAnalysis::Pending
+            ));
+            assert!(matches!(
+                server.feed(&after, false),
+                UdpStreamAnalysis::Pending
+            ));
+            assert_eq!(
+                field(&server.feed(&reply, true), "quic.server_cipher"),
+                Some("0x1301")
+            );
+        }
+    }
+
+    #[test]
+    fn corrupted_retry_does_not_change_initial_keys() {
+        let original_dcid = hex("8394c8f03e515708");
+        let hello = client_hello("no-retry.test", true);
+        let before = initial_packet(
+            V1,
+            0,
+            0,
+            &hello[..8],
+            (&original_dcid, &[], &original_dcid),
+            false,
+            &[],
+        );
+        let continued = initial_packet(
+            V1,
+            1,
+            0,
+            &hello,
+            (&original_dcid, &[], &original_dcid),
+            false,
+            &[],
+        );
+        let reply = initial_packet(
+            V1,
+            0,
+            0,
+            &server_hello(),
+            (&[], &[0xaa], &original_dcid),
+            true,
+            &[],
+        );
+        let mut corrupt =
+            hex("ff000000010008f067a5502a4262b5746f6b656e04a265ba2eff4d829058fb3f0f2496ba");
+        *corrupt.last_mut().unwrap() ^= 1;
+        let mut client = QuicInitial::default();
+        let mut server = QuicServerInitial::default();
+        assert!(matches!(
+            client.feed(&before, false),
+            UdpStreamAnalysis::Pending
+        ));
+        assert!(matches!(
+            server.feed(&before, false),
+            UdpStreamAnalysis::Pending
+        ));
+        assert!(matches!(
+            client.feed(&corrupt, true),
+            UdpStreamAnalysis::Pending
+        ));
+        assert!(matches!(
+            server.feed(&corrupt, true),
+            UdpStreamAnalysis::Pending
+        ));
+        assert_eq!(
+            field(&client.feed(&continued, false), "quic.sni"),
+            Some("no-retry.test")
+        );
+        assert_eq!(
+            field(&server.feed(&reply, true), "quic.server_cipher"),
+            Some("0x1301")
+        );
     }
 
     #[test]
@@ -918,6 +1215,7 @@ mod tests {
                 &client_hello("example.test", true),
                 (&initial_dcid, &client_scid, &initial_dcid),
                 false,
+                &[],
             );
             let hello = server_hello();
             let split = hello.len() / 2;
@@ -928,6 +1226,7 @@ mod tests {
                 &hello[split..],
                 (&client_scid, &server_scid, &initial_dcid),
                 true,
+                &[],
             );
             let earlier = initial_packet(
                 version,
@@ -936,6 +1235,7 @@ mod tests {
                 &hello[..split],
                 (&client_scid, &server_scid, &initial_dcid),
                 true,
+                &[],
             );
             let mut analyzer = QuicServerInitial::default();
             assert!(matches!(
@@ -981,6 +1281,7 @@ mod tests {
             &client_hello("example.test", true),
             (&initial_dcid, &client_scid, &initial_dcid),
             false,
+            &[],
         );
         let valid = initial_packet(
             V1,
@@ -989,6 +1290,7 @@ mod tests {
             &server_hello(),
             (&client_scid, &[0xaa], &initial_dcid),
             true,
+            &[],
         );
         let wrong_cid = initial_packet(
             V1,
@@ -997,6 +1299,7 @@ mod tests {
             &server_hello(),
             (&[0xff], &[0xaa], &initial_dcid),
             true,
+            &[],
         );
         let mut corrupt = valid.clone();
         *corrupt.last_mut().unwrap() ^= 1;

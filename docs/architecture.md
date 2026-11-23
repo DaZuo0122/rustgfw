@@ -49,7 +49,7 @@ TCP 包形态：表达式引用 `tcp_shape.*` 时按需在重组前观察前 16 
 
 Trojan：表达式引用 `trojan.*` 字段时按需启用双向 TCP 长度序列分析器。它从客户端兼容性 ChangeCipherSpec 开始累计前四段交替方向的字节数，报告序列和统计候选标记；树模型移植自 OpenGFW，单独附带 MPL-2.0 许可。特征依赖交付分段及换向时机，不验证加密内层协议；规则可将候选标记与 TLS、FET 或端点信息组合。
 
-QUIC：表达式引用 `quic.*` 字段时按需启用双向 UDP 流分析器，不限定端口。客户端与服务端 Initial 由独立分析器处理，按规则引用分别启用。它们使用 v1/v2 Initial 公开密钥派生和 `ring` 的首部保护、AEAD 接口；CRYPTO 帧按偏移重组。客户端分析器复用 TLS ClientHello 的 SNI、ALPN、版本列表、ECH 扩展标记和 DATAGRAM 接收上限解析；服务端分析器以首次客户端 Initial 的目标连接 ID 派生服务端密钥，在反向 Initial 中复用 TLS ServerHello 的版本与密码套件解析。通过完整性校验的 Retry 会切换后续 Initial 密钥和连接 ID，客户端路径同时检查重发的 token。首个能解开的客户端连接 ID 决定流内分析对象，其他连接的 Initial 不会覆盖已收集片段。Initial 的密钥与 Retry 完整性密钥公开，解密成功不认证对端身份。RFC 密钥向量、自构造加密包及 OpenGFW 只读抓包样本已在本地测试；Linux 后端只需转交 UDP 数据报，无协议专用 I/O 逻辑。Hysteria2 的可见范围和论文见[研究记录](hysteria2-quic.md)。
+QUIC：表达式引用 `quic.*` 字段时按需启用双向 UDP 流分析器，不限定端口。客户端与服务端 Initial 由独立分析器处理，按规则引用分别启用。它们使用 v1/v2 Initial 公开密钥派生和 `ring` 的首部保护、AEAD 接口；CRYPTO 帧按偏移重组。客户端分析器复用 TLS ClientHello 的 SNI、ALPN、版本列表、ECH 扩展标记和 DATAGRAM 接收上限解析；服务端分析器以首次客户端 Initial 的目标连接 ID 派生服务端密钥，在反向 Initial 中复用 TLS ServerHello 的版本与密码套件解析。通过完整性校验的 Retry 会切换后续 Initial 密钥和连接 ID，并在该数据报报告 `quic.retry_integrity_valid`；客户端路径同时检查重发的 token。首个能解开的客户端连接 ID 决定流内分析对象，其他连接的 Initial 不会覆盖已收集片段。Initial 的密钥与 Retry 完整性密钥公开，解密成功不认证对端身份。RFC 密钥向量、自构造加密包及 OpenGFW 只读抓包样本已在本地测试；Linux 后端只需转交 UDP 数据报，无协议专用 I/O 逻辑。Hysteria2 的可见范围和论文见[研究记录](hysteria2-quic.md)。
 
 UDP 外层形态：表达式引用 `udp_shape.*` 时按需观察同一端点对的前 8 个数据报，不限定端口。首包前缀统计、双向有符号包长及实验性随机碎片首轮候选由独立分析器产生，可与 `quic.*` 组合。它不解密，也不把候选命名为具体代理协议。依据及内层分析器的复用边界见[外层指纹研究](outer-fingerprints.md)。
 

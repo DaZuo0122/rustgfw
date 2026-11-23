@@ -37,8 +37,13 @@ pub const FIELDS: &[&str] = &[
     "quic.tls_client_key_share_groups_no_grease",
     "quic.server_version",
     "quic.server_cipher",
+    "quic.retry_integrity_valid",
 ];
-pub const SERVER_FIELDS: &[&str] = &["quic.server_version", "quic.server_cipher"];
+pub const SERVER_FIELDS: &[&str] = &[
+    "quic.server_version",
+    "quic.server_cipher",
+    "quic.retry_integrity_valid",
+];
 const QUIC_FINGERPRINT_FIELDS: ClientFingerprintFields = ClientFingerprintFields {
     legacy_version: "quic.tls_client_legacy_version",
     cipher_suite: "quic.tls_client_cipher_suite",
@@ -663,7 +668,10 @@ impl UdpStreamAnalyzer for QuicServerInitial {
         {
             connection.initial_dcid = retry.scid.to_vec();
             connection.retry_token = Some(retry.token.to_vec());
-            return UdpStreamAnalysis::Pending;
+            return UdpStreamAnalysis::Observations(vec![Observation {
+                field: "quic.retry_integrity_valid",
+                value: "true".into(),
+            }]);
         }
         let mut datagram = payload;
         let mut packets = 0;
@@ -874,7 +882,8 @@ mod tests {
 
     fn field<'a>(result: &'a UdpStreamAnalysis, name: &str) -> Option<&'a str> {
         match result {
-            UdpStreamAnalysis::FinalObservations(values) => values
+            UdpStreamAnalysis::FinalObservations(values)
+            | UdpStreamAnalysis::Observations(values) => values
                 .iter()
                 .find(|item| item.field == name)
                 .map(|item| item.value.as_str()),
@@ -1026,10 +1035,10 @@ mod tests {
                 server.feed(&before, false),
                 UdpStreamAnalysis::Pending
             ));
-            assert!(matches!(
-                server.feed(&retry, true),
-                UdpStreamAnalysis::Pending
-            ));
+            assert_eq!(
+                field(&server.feed(&retry, true), "quic.retry_integrity_valid"),
+                Some("true")
+            );
             assert!(matches!(
                 server.feed(&after, false),
                 UdpStreamAnalysis::Pending

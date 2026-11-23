@@ -98,6 +98,7 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 | `quic.tls_client_legacy_version`、`quic.tls_client_cipher_suite`、`quic.tls_client_extension`、有序复数字段及其 `_no_grease` 版本 | `quic.tls_client_extensions_no_grease contains "0x0039"` | QUIC Initial 解出的 ClientHello 使用与 TCP TLS 相同的套件/扩展序列观察方式；不包含加密后的握手或 1-RTT 内容 |
 | `quic.tls_client_supported_group`、`quic.tls_client_signature_algorithm`、`quic.tls_client_key_share_group`，以及各自的有序复数和 `_no_grease` 字段 | `quic.tls_client_supported_group == 0x001d` | QUIC Initial 中可见的 ClientHello 扩展内部列表；字段语义与 TCP TLS 相同 |
 | `quic.server_version`、`quic.server_cipher` | `fresh.quic.server_cipher == 0x1301` | 反向 QUIC v1/v2 Initial 中 ServerHello 的 TLS 协商版本和密码套件；需先看到客户端 Initial 才能派生服务端密钥，TLS 1.3 的 ALPN 不在此阶段明文中 |
+| `quic.retry_integrity_valid` | `fresh.quic.retry_integrity_valid == true` | 已先看到客户端 Initial，且反向 v1/v2 Retry 的连接 ID、非空 token 和完整性标签通过检查时报告；固定公开校验密钥不提供服务端身份认证 |
 | `fresh.` 加字段名 | `fresh.dns.qname == "blocked.test"` | 该字段必须由当前包更新 |
 | 观察字段加 `exists` | `fresh.wireguard.type exists` | 字段至少有一个值；`fresh.` 还要求当前包更新 |
 | 数值观察字段 | `fresh.openvpn.tx_packets > 10` | `>`、`>=`、`<`、`<=` 按无符号十进制整数比较；非数字值不匹配 |

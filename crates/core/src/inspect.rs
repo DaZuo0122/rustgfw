@@ -51,6 +51,12 @@ pub trait BidirectionalStreamAnalyzer {
     fn feed(&mut self, bytes: &[u8], reverse: bool) -> Analysis;
 }
 
+/// Observes payload-bearing TCP packets before stream reassembly. Packet
+/// boundaries and sequence numbers are preserved for wire-shape models.
+pub trait TcpPacketAnalyzer {
+    fn feed(&mut self, sequence: u32, payload: &[u8], reverse: bool) -> Analysis;
+}
+
 pub enum DatagramAnalysis {
     Observations(Vec<Observation>),
     Malformed,
@@ -101,11 +107,17 @@ struct Direction {
     reassembly: Reassembler,
     analyzers: Vec<Option<Box<dyn StreamAnalyzer>>>,
 }
+struct TcpAnalyzerSets<'a> {
+    directional: &'a [AnalyzerRule],
+    bidirectional: &'a [BidirectionalAnalyzerRule],
+    packets: &'a [TcpPacketRule],
+}
 struct Flow {
     directions: [Direction; 2],
     origin: SocketAddr,
     target: SocketAddr,
     bidirectional: Vec<Option<Box<dyn BidirectionalStreamAnalyzer>>>,
+    packet_analyzers: Vec<Option<Box<dyn TcpPacketAnalyzer>>>,
     facts: HashMap<&'static str, Vec<String>>,
     allowed: bool,
     blocked: bool,
@@ -145,8 +157,7 @@ impl Flow {
         origin: SocketAddr,
         target: SocketAddr,
         initial_syn: Option<(usize, u32)>,
-        analyzers: &[AnalyzerRule],
-        bidirectional: &[BidirectionalAnalyzerRule],
+        analyzers: TcpAnalyzerSets<'_>,
         reorder_bytes: usize,
         now: Instant,
     ) -> Self {
@@ -156,13 +167,20 @@ impl Flow {
             directions: std::array::from_fn(|_| Direction {
                 reassembly: Reassembler::new(reorder_bytes),
                 analyzers: analyzers
+                    .directional
                     .iter()
                     .map(|rule| port_matches(rule.port).then(|| (rule.factory)()))
                     .collect(),
             }),
             origin,
             target,
-            bidirectional: bidirectional
+            bidirectional: analyzers
+                .bidirectional
+                .iter()
+                .map(|rule| port_matches(rule.port).then(|| (rule.factory)()))
+                .collect(),
+            packet_analyzers: analyzers
+                .packets
                 .iter()
                 .map(|rule| port_matches(rule.port).then(|| (rule.factory)()))
                 .collect(),
@@ -180,6 +198,7 @@ impl Flow {
             && !self.blocked
             && !self.allowed
             && self.bidirectional.iter().all(Option::is_none)
+            && self.packet_analyzers.iter().all(Option::is_none)
             && self
                 .directions
                 .iter()
@@ -532,6 +551,23 @@ impl UdpStreamRule {
     }
 }
 
+/// Register a raw TCP packet analyzer whose observations feed flow rules.
+pub struct TcpPacketRule {
+    pub port: Option<u16>,
+    pub factory: Box<dyn Fn() -> Box<dyn TcpPacketAnalyzer> + Send + Sync>,
+}
+impl TcpPacketRule {
+    pub fn new(
+        port: Option<u16>,
+        factory: impl Fn() -> Box<dyn TcpPacketAnalyzer> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            port,
+            factory: Box::new(factory),
+        }
+    }
+}
+
 pub struct DatagramRule {
     pub port: Option<DatagramPort>,
     pub analyzer: Box<dyn DatagramAnalyzer>,
@@ -662,6 +698,7 @@ pub struct Inspect<P> {
     transport: P,
     analyzers: Vec<AnalyzerRule>,
     bidirectional_analyzers: Vec<BidirectionalAnalyzerRule>,
+    tcp_packet_analyzers: Vec<TcpPacketRule>,
     flow_rules: Vec<FlowRule>,
     datagrams: Vec<DatagramRule>,
     udp_analyzers: Vec<UdpStreamRule>,
@@ -701,6 +738,7 @@ impl<P> Inspect<P> {
             transport,
             analyzers,
             bidirectional_analyzers: Vec::new(),
+            tcp_packet_analyzers: Vec::new(),
             flow_rules: Vec::new(),
             datagrams,
             udp_analyzers: Vec::new(),
@@ -736,6 +774,12 @@ impl<P> Inspect<P> {
     ) -> Self {
         self.clear_flows();
         self.bidirectional_analyzers = analyzers;
+        self
+    }
+
+    pub fn with_tcp_packet_analyzers(mut self, analyzers: Vec<TcpPacketRule>) -> Self {
+        self.clear_flows();
+        self.tcp_packet_analyzers = analyzers;
         self
     }
 
@@ -827,8 +871,11 @@ impl<P> Inspect<P> {
                 input.origin,
                 input.target,
                 None,
-                &self.analyzers,
-                &self.bidirectional_analyzers,
+                TcpAnalyzerSets {
+                    directional: &self.analyzers,
+                    bidirectional: &self.bidirectional_analyzers,
+                    packets: &[],
+                },
                 self.limits.reorder_bytes,
                 now,
             )
@@ -1236,6 +1283,7 @@ impl<P: Policy> Policy for Inspect<P> {
         if verdict != Verdict::Accept
             || (self.analyzers.is_empty()
                 && self.bidirectional_analyzers.is_empty()
+                && self.tcp_packet_analyzers.is_empty()
                 && self.datagrams.is_empty()
                 && self.flow_rules.is_empty()
                 && self.udp_analyzers.is_empty()
@@ -1263,6 +1311,7 @@ impl<P: Policy> Policy for Inspect<P> {
         }
         if self.analyzers.is_empty()
             && self.bidirectional_analyzers.is_empty()
+            && self.tcp_packet_analyzers.is_empty()
             && self.flow_rules.is_empty()
         {
             return transport_decision;
@@ -1303,6 +1352,10 @@ impl<P: Policy> Policy for Inspect<P> {
                 a.port
                     .is_none_or(|port| t.source.port() == port || t.destination.port() == port)
             })
+            && !self.tcp_packet_analyzers.iter().any(|a| {
+                a.port
+                    .is_none_or(|port| t.source.port() == port || t.destination.port() == port)
+            })
         {
             return transport_decision;
         }
@@ -1321,8 +1374,11 @@ impl<P: Policy> Policy for Inspect<P> {
                 t.source,
                 t.destination,
                 initial_syn,
-                &self.analyzers,
-                &self.bidirectional_analyzers,
+                TcpAnalyzerSets {
+                    directional: &self.analyzers,
+                    bidirectional: &self.bidirectional_analyzers,
+                    packets: &self.tcp_packet_analyzers,
+                },
                 self.limits.reorder_bytes,
                 now,
             )
@@ -1332,6 +1388,25 @@ impl<P: Policy> Policy for Inspect<P> {
             return Verdict::DropFlow.into();
         }
         let mut analysis = TcpAnalysis::default();
+        if !flow.allowed && !t.payload.is_empty() {
+            let reverse = t.source != flow.origin;
+            for slot in &mut flow.packet_analyzers {
+                let Some(analyzer) = slot else {
+                    continue;
+                };
+                if collect_tcp_analysis(
+                    analyzer.feed(t.tcp_sequence.unwrap(), t.payload, reverse),
+                    &|_| false,
+                    &mut flow.facts,
+                    &mut flow.blocked,
+                    &mut analysis.updated,
+                    &mut analysis.batches,
+                    !self.flow_rules.is_empty(),
+                ) {
+                    *slot = None;
+                }
+            }
+        }
         if !flow.allowed {
             let has_analyzers = flow.directions[direction]
                 .analyzers
@@ -1346,7 +1421,7 @@ impl<P: Policy> Policy for Inspect<P> {
                 ) {
                     Ok(bytes) => {
                         let reverse = t.source != flow.origin;
-                        analysis = analyze_tcp_bytes(
+                        let stream_analysis = analyze_tcp_bytes(
                             flow,
                             &bytes,
                             direction,
@@ -1355,6 +1430,8 @@ impl<P: Policy> Policy for Inspect<P> {
                             &self.bidirectional_analyzers,
                             !self.flow_rules.is_empty(),
                         );
+                        analysis.updated.extend(stream_analysis.updated);
+                        analysis.batches.extend(stream_analysis.batches);
                     }
                     Err(_) => {
                         flow.blocked = true;

@@ -66,6 +66,7 @@ pub fn compile(source: &str) -> Result<Vec<MatchRule>, String> {
                     && !rustgfw_core::tls::FIELDS.contains(&field)
                     && !rustgfw_core::trojan::FIELDS.contains(&field)
                     && !rustgfw_core::fet::FIELDS.contains(&field)
+                    && !rustgfw_core::tcp_shape::FIELDS.contains(&field)
                     && !rustgfw_core::wireguard::FIELDS.contains(&field)
                     && !rustgfw_core::openvpn::FIELDS.contains(&field)
                     && !rustgfw_core::socks::FIELDS.contains(&field)

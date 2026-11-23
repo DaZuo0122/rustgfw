@@ -19,10 +19,12 @@ pub(crate) mod sing_mux_request;
 pub mod socks;
 pub mod ssh;
 pub mod tcp;
+pub mod tcp_shape;
 pub mod tls;
 pub mod trojan;
 pub mod udp_shape;
 pub mod vless;
+pub(crate) mod wire_stats;
 pub mod wireguard;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,5 +1,6 @@
 //! Early UDP wire shape for opaque QUIC and randomized proxy traffic.
 use crate::inspect::{Observation, UdpStreamAnalysis, UdpStreamAnalyzer};
+use crate::wire_stats::PrefixStats;
 
 pub const FIELDS: &[&str] = &[
     "udp_shape.first_len",
@@ -17,7 +18,6 @@ pub const FIELDS: &[&str] = &[
 ];
 
 const MAX_PACKETS: usize = 8;
-const PREFIX_BYTES: usize = 64;
 
 #[derive(Default)]
 pub struct UdpShape {
@@ -38,32 +38,23 @@ impl UdpStreamAnalyzer for UdpShape {
         let first = self.lengths.is_empty();
         let mut observations = Vec::new();
         if first {
-            let prefix = &payload[..payload.len().min(PREFIX_BYTES)];
-            let bits = prefix.iter().map(|byte| byte.count_ones()).sum::<u32>();
-            let popcount = if prefix.is_empty() {
-                0
-            } else {
-                1000 * bits as usize / prefix.len()
-            };
-            let printable = prefix
-                .iter()
-                .filter(|&&byte| (0x20..=0x7e).contains(&byte))
-                .count();
-            let printable = if prefix.is_empty() {
-                0
-            } else {
-                1000 * printable / prefix.len()
-            };
+            let stats = PrefixStats::sample(payload);
             self.first_quic = quic_initial_shape(payload);
             self.origin_first_random_like = true;
             for (field, value) in [
                 ("udp_shape.first_len", payload.len().to_string()),
-                ("udp_shape.first_prefix_len", prefix.len().to_string()),
-                ("udp_shape.first_popcount_milli", popcount.to_string()),
-                ("udp_shape.first_printable_per_mille", printable.to_string()),
+                ("udp_shape.first_prefix_len", stats.len.to_string()),
+                (
+                    "udp_shape.first_popcount_milli",
+                    stats.popcount_milli.to_string(),
+                ),
+                (
+                    "udp_shape.first_printable_per_mille",
+                    stats.printable_per_mille.to_string(),
+                ),
                 (
                     "udp_shape.first_entropy_milli",
-                    entropy_milli(prefix).to_string(),
+                    stats.entropy_milli.to_string(),
                 ),
                 (
                     "udp_shape.first_quic_initial_shape",
@@ -124,18 +115,7 @@ impl UdpStreamAnalyzer for UdpShape {
 }
 
 fn random_like(payload: &[u8]) -> bool {
-    let prefix = &payload[..payload.len().min(PREFIX_BYTES)];
-    if prefix.len() < 32 || quic_initial_shape(payload) {
-        return false;
-    }
-    let bits = prefix.iter().map(|byte| byte.count_ones()).sum::<u32>() as usize;
-    let printable = prefix
-        .iter()
-        .filter(|&&byte| (0x20..=0x7e).contains(&byte))
-        .count();
-    (3400..=4600).contains(&(1000 * bits / prefix.len()))
-        && 1000 * printable / prefix.len() < 500
-        && entropy_milli(prefix) >= 4500
+    !quic_initial_shape(payload) && PrefixStats::sample(payload).random_like()
 }
 
 fn quic_initial_shape(payload: &[u8]) -> bool {
@@ -148,26 +128,6 @@ fn quic_initial_shape(payload: &[u8]) -> bool {
         0x6b33_43cf => header[0] & 0xf0 == 0xd0,
         _ => false,
     }
-}
-
-fn entropy_milli(prefix: &[u8]) -> usize {
-    if prefix.is_empty() {
-        return 0;
-    }
-    let mut counts = [0usize; 256];
-    for &byte in prefix {
-        counts[usize::from(byte)] += 1;
-    }
-    let n = prefix.len() as f64;
-    let bits = counts
-        .into_iter()
-        .filter(|&count| count > 0)
-        .map(|count| {
-            let probability = count as f64 / n;
-            -probability * probability.log2()
-        })
-        .sum::<f64>();
-    (bits * 1000.0).round() as usize
 }
 
 #[cfg(test)]

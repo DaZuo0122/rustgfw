@@ -3,7 +3,7 @@ use rustgfw_core::{
     conditions::MatchRule,
     inspect::{
         AnalyzerRule, BidirectionalAnalyzerRule, DatagramPort, DatagramRule, InspectLimits,
-        UdpStreamRule,
+        TcpPacketRule, UdpStreamRule,
     },
     packet::Protocol,
     rules::{Rule, RulesLimits},
@@ -32,6 +32,7 @@ fn observation_field_possible(field: &str, protocol: Protocol) -> bool {
         || rustgfw_core::sing_mux::FIELDS.contains(&field)
         || rustgfw_core::sing_mux_frames::FIELDS.contains(&field)
         || rustgfw_core::fet::FIELDS.contains(&field)
+        || rustgfw_core::tcp_shape::FIELDS.contains(&field)
         || rustgfw_core::tls::FIELDS.contains(&field)
         || rustgfw_core::trojan::FIELDS.contains(&field)
     {
@@ -260,6 +261,9 @@ impl Options {
         let needs_fet = rustgfw_core::fet::FIELDS
             .iter()
             .any(|field| needs_tcp_field(field));
+        let needs_tcp_shape = rustgfw_core::tcp_shape::FIELDS
+            .iter()
+            .any(|field| needs_tcp_field(field));
         let needs_trojan = rustgfw_core::trojan::FIELDS
             .iter()
             .any(|field| needs_tcp_field(field));
@@ -465,6 +469,16 @@ impl Options {
             .into_iter()
             .flatten()
             .collect(),
+        )
+        .with_tcp_packet_analyzers(
+            needs_tcp_shape
+                .then(|| {
+                    TcpPacketRule::new(None, || {
+                        Box::new(rustgfw_core::tcp_shape::TcpShape::default())
+                    })
+                })
+                .into_iter()
+                .collect(),
         )
         .with_flow_rules(tcp_rules)
         .with_udp_streams(udp_analyzers, udp_rules)
@@ -1893,6 +1907,61 @@ mod tests {
         };
         assert_eq!(feed(&request[..20]), Verdict::Accept);
         assert_eq!(feed(&request[20..]), Verdict::DropFlow);
+    }
+
+    #[test]
+    fn tcp_shape_expression_uses_raw_packets_and_ignores_retransmission() {
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"early burst","expr":"proto == tcp && tcp_shape.first_random_like == true && fet.candidate == true && tcp_shape.packet_count == 3 && fresh.tcp_shape.signed_bursts == \"100,-500\"","action":"block"}]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let tcp = |sequence: u32, payload: &[u8], reverse: bool| {
+            let mut bytes = vec![0; 40 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 6;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&12345u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&443u16.to_be_bytes());
+            bytes[24..28].copy_from_slice(&sequence.to_be_bytes());
+            bytes[32] = 0x50;
+            bytes[33] = 0x18;
+            bytes[40..].copy_from_slice(payload);
+            if reverse {
+                for offset in 0..4 {
+                    bytes.swap(12 + offset, 16 + offset);
+                }
+                bytes.swap(20, 22);
+                bytes.swap(21, 23);
+            }
+            bytes
+        };
+        let evaluate = |policy: &mut dyn rustgfw_core::Policy, bytes: &[u8]| {
+            policy.evaluate(rustgfw_core::Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: rustgfw_core::FlowScope::default(),
+            })
+        };
+        let random = (0..100)
+            .map(|index| (index * 73 + 151) as u8)
+            .collect::<Vec<_>>();
+        let first = tcp(100, &random, false);
+        assert_eq!(evaluate(&mut policy, &first), Verdict::Accept);
+        assert_eq!(evaluate(&mut policy, &first), Verdict::Accept);
+        assert_eq!(
+            evaluate(&mut policy, &tcp(500, &[0; 200], true)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            evaluate(&mut policy, &tcp(700, &[0; 300], true)),
+            Verdict::DropFlow
+        );
     }
 
     #[test]

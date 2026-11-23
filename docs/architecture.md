@@ -45,6 +45,8 @@ HTTP/1 Upgrade：表达式引用 `http.upgrade_offer` 或 `http.upgrade_selected
 
 FET：表达式引用 `fet.*` 字段时按需分析首方向首次交付的 TCP 数据，最多采样 8192 字节。分析器按 OpenGFW 的五组豁免条件报告 `fet.candidate` 与各项统计值；这是统计启发式，不是加密真实性验证或具体代理协议识别。首次采样受 TCP 分段影响，可在规则中约束 `fet.sample_len` 并与其他字段组合。
 
+TCP 包形态：表达式引用 `tcp_shape.*` 时按需在重组前观察前 16 个带载荷包，报告首包前缀统计、方向包长与相邻同向突发。相同方向、序号和长度的重传只计一次。`TcpPacketAnalyzer` 与流分析器共享流级观察值和表达式，仍保留原始包边界；已解码流没有原始包边界，因此不运行该入口。研究依据、误报边界见[外层指纹研究](outer-fingerprints.md)。
+
 Trojan：表达式引用 `trojan.*` 字段时按需启用双向 TCP 长度序列分析器。它从客户端兼容性 ChangeCipherSpec 开始累计前四段交替方向的字节数，报告序列和统计候选标记；树模型移植自 OpenGFW，单独附带 MPL-2.0 许可。特征依赖交付分段及换向时机，不验证加密内层协议；规则可将候选标记与 TLS、FET 或端点信息组合。
 
 QUIC：表达式引用 `quic.*` 字段时按需启用双向 UDP 流分析器，不限定端口。它用 v1/v2 Initial 公开密钥派生和 `ring` 的首部保护、AEAD 接口检查客户端 Initial，把 CRYPTO 帧按偏移重组后复用 TLS ClientHello 的 SNI、ALPN、版本列表、ECH 扩展标记和 DATAGRAM 接收上限解析。首个能解开的客户端连接 ID 决定流内分析对象，其他连接的 Initial 不会覆盖已收集片段；完整 ClientHello 后结束分析。Initial 的密钥公开，解密成功不认证客户端身份。RFC 密钥向量、自构造加密包及 OpenGFW 只读抓包样本已在本地测试；Linux 后端只需转交 UDP 数据报，无协议专用 I/O 逻辑。Hysteria2 的可见范围和论文见[研究记录](hysteria2-quic.md)。

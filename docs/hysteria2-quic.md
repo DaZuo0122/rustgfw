@@ -22,6 +22,6 @@ Initial 的公开密钥派生与后续密钥的分界见 [RFC 9001](https://www.
 
 ## 后续路线
 
-1. 先用 `quic.datagram_max_size` 与 `quic.alpn`、目标、协议版本等字段写**候选规则**，在普通 HTTP/3、WebTransport、MASQUE、Hysteria2 默认与混淆模式的真实样本上评估误报与漏报。示例：`fresh.quic.alpn == h3 && quic.datagram_max_size > 0`。它只表达客户端同时提出 `h3` 且允许接收 DATAGRAM。
+1. 先用 `quic.datagram_max_size` 与 `quic.alpn`、目标、协议版本等字段写**候选规则**，在普通 HTTP/3、WebTransport、MASQUE、Hysteria2 默认与混淆模式的真实样本上评估误报与漏报。示例：`fresh.quic.alpn == h3 && quic.datagram_max_size > 0`。它只表达客户端同时提出 `h3` 且允许接收 DATAGRAM。本地官方客户端默认模式的 16 次首轮握手全部满足该组合；与一份 Chrome QUIC 样本的去 GREASE 扩展及传输参数集合相同，而且客户端每次启动的顺序都变化，因此不能把该组合或单条顺序解释成 Hysteria2 身份。
 2. 若能在受控终端或代理处接入已解密的 QUIC 流，可用 `fresh.http3.status == 233 && http3.method == POST && http3.path == /auth && http3.authority == hysteria && http3.request_header_name == hysteria-auth` 标记符合 Hysteria2 认证形状的请求与成功响应。这个条件不校验认证凭据；若需确认身份或解析内部目标，还要接入认证结果及 Hysteria2 代理帧解码。单靠路径上的 NFQUEUE 无法恢复 1-RTT 密钥。
 3. 若测试显示连接级包形状有稳定价值，再设计可选统计分析器。先采集带标签样本，覆盖不同客户端、网络、拥塞算法、混淆模式和连接迁移；在独立样本上量化误报，避免把特定测试环境的阈值写进核心。

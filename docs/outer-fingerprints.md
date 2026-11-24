@@ -34,6 +34,8 @@ QUIC v1/v2 客户端 Initial 中，`quic.transport_parameter_ids` 保存 ClientH
 
 又用 [Hysteria2 v2.14.0 官方客户端](https://hy2.io/docs/getting-started/Installation/) 分别以默认、Salamander、Gecko 配置连本机无响应 UDP 端口，每种模式独立启动 16 次，采集启动后约 0.25 秒的数据报；客户端配置与二进制样本均留在 Git 忽略目录。默认模式首轮发出两个 1250 字节的标准 QUIC v1 Initial；Salamander 首轮发出两个 1258 字节的随机外观包；Gecko 首轮发出多枚 512–1200 字节范围内、长度变化的随机外观包。原条件会把 Salamander 的两包首轮误判为碎片，因此加入首轮同向包长变化条件。选择性测试得到默认 0/16、Salamander 0/16、Gecko 16/16 的碎片候选结果。样本全部来自同一台机器的本机无响应目标，不能据此估计不同网络或普通高熵 UDP 背景下的误报率。
 
+默认模式的 16 条首轮轨迹均可由 `QuicInitial` 解出 `h3`、`quic.datagram_max_size == 65536` 及 ClientHello/transport parameters。与 OpenGFW 只读 Chrome 153 QUIC Initial 样本比较，去 GREASE 后的密码套件、支持组、TLS 扩展和传输参数**集合**相同；Hysteria2 自身的 16 条轨迹则有 16 种 TLS 扩展顺序和 16 种传输参数顺序。这个对照只有一份 Chrome 握手，不能量化两种实现的顺序分布差异，也不支持把某一条精确顺序写成 Hysteria2 签名。
+
 Salamander 重复样本中有一轮的前两包未同时通过严格的随机外观阈值，因此等长随机首轮规则可用 `origin_first_random_like_packets >= 1` 组合首包长度、`origin_first_varied_lengths == false` 和 `first_quic_initial_shape == false`。例如：`proto == udp && fresh.udp_shape.origin_first_run == 2 && udp_shape.first_len >= 1200 && udp_shape.first_len <= 1500 && udp_shape.origin_first_random_like_packets >= 1 && udp_shape.origin_first_varied_lengths == false && udp_shape.first_quic_initial_shape == false`。这个组合仍只是外层候选；随机填充和其他加密 UDP 协议会影响检出率与误报率。
 
 本地只读对照测试已检查 OpenGFW 提供的 Chrome、Firefox、curl、quiche、ngtcp2、aioquic 客户端 QUIC Initial 抓包；这些首包均被标为标准 Initial 形状，未触发随机碎片候选。这组对照只覆盖握手首包，不代表整个正常 UDP 背景流量。

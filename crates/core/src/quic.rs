@@ -1532,4 +1532,75 @@ mod tests {
             Some("chrome.sniff.test")
         );
     }
+
+    #[test]
+    #[ignore = "requires the locally captured official Hysteria2 client first flight"]
+    fn decrypts_official_hysteria2_plain_client_initial() {
+        use std::collections::{BTreeSet, HashSet};
+
+        let ids = |value: &str| value.split(',').map(str::to_owned).collect::<BTreeSet<_>>();
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../references/opengfw/analyzer/udp/testdata");
+        let mut chrome = QuicInitial::default();
+        let mut comparison = UdpStreamAnalysis::Pending;
+        for index in 0..2 {
+            let packet = std::fs::read(base.join(format!("quic-chrome153-{index}.bin"))).unwrap();
+            comparison = chrome.feed(&packet, false);
+        }
+        let capture_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/hy2-capture");
+        let mut extension_orders = HashSet::new();
+        let mut parameter_orders = HashSet::new();
+        for run in 0..16 {
+            let capture =
+                std::fs::read(capture_dir.join(format!("client-plain-{run}.bin"))).unwrap();
+            assert_eq!(&capture[..4], b"HY2C");
+            let mut cursor = 6;
+            let mut analyzer = QuicInitial::default();
+            let mut result = UdpStreamAnalysis::Pending;
+            for _ in 0..capture[5] {
+                let length =
+                    u16::from_be_bytes(capture[cursor..cursor + 2].try_into().unwrap()) as usize;
+                cursor += 2;
+                result = analyzer.feed(&capture[cursor..cursor + length], false);
+                cursor += length;
+                if matches!(result, UdpStreamAnalysis::FinalObservations(_)) {
+                    break;
+                }
+            }
+            assert_eq!(field(&result, "quic.alpn"), Some("h3"), "run {run}");
+            assert_eq!(field(&result, "quic.sni"), Some("example.com"), "run {run}");
+            for name in [
+                "quic.datagram_max_size",
+                "quic.tls_client_cipher_suites_no_grease",
+                "quic.tls_client_supported_groups_no_grease",
+            ] {
+                assert_eq!(
+                    field(&result, name),
+                    field(&comparison, name),
+                    "{name} run {run}"
+                );
+            }
+            for (name, orders) in [
+                (
+                    "quic.tls_client_extensions_no_grease",
+                    &mut extension_orders,
+                ),
+                (
+                    "quic.transport_parameter_ids_no_grease",
+                    &mut parameter_orders,
+                ),
+            ] {
+                let value = field(&result, name).unwrap();
+                assert_eq!(
+                    ids(value),
+                    ids(field(&comparison, name).unwrap()),
+                    "{name} run {run}"
+                );
+                orders.insert(value.to_owned());
+            }
+        }
+        assert!(extension_orders.len() > 1);
+        assert!(parameter_orders.len() > 1);
+    }
 }

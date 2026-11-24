@@ -56,6 +56,8 @@ Salamander 重复样本中有一轮的前两包未同时通过严格的随机外
 
 本地 16 条官方 Hysteria2 默认模式 Client Initial 与一条 Chrome 153 QUIC 样本在目前提取的全部整数值上相同：例如空闲超时均为 30000 毫秒、最大 UDP 载荷均为 1472 字节、初始连接级数据上限均为 15728640 字节。另六种只读 QUIC 客户端样本的这组数值组合各不相同。前一个结果说明这批 Hysteria2 客户端不能靠传输参数值与该 Chrome 样本区分；后一个结果说明字段可以反映实现差异，但样本量不足以估计真实网络中的误报率。
 
+用 aioquic 1.9.1 在本机完成一条普通 HTTP/3 GET，请求得到 200 和预期正文；双向抓包只保存在 Git 忽略目录。客户端前两个 UDP 数据报均为 1200 字节，握手后出现短首部形态。相同环境下官方 Hysteria2 v2.14.0 默认客户端的前两个数据报为 1250 字节，后续同样出现短首部形态。选择性测试确认普通 HTTP/3 样本也能解出 `h3`、SNI 和 transport parameters。两条连接来自不同 QUIC 实现，包长差异可能只是实现或配置差异，不能由这一组样本推断 Hysteria2 的检出率或误报率。
+
 ## 内层复用边界
 
 `Inspect::feed_decoded` 用与逐包 TCP 路径相同的 `AnalyzerRule`、`BidirectionalAnalyzerRule` 和 `FlowRule`；单元测试已验证裸 VLESS 请求头经该入口分段输入后，原有 `vless.*` 表达式会阻断对应逻辑流。其他 HTTP/1、TLS、SOCKS、SSH 和复用协议分析器同样通过注册工厂复用。调用方必须先解密、解复用，并剥离代理封装头；当前 Linux NFQUEUE 与 Windows WinDivert 路径没有这些密钥，也不会自动得到内层明文。HTTP/3 的解码入口 `feed_http3` 单独接收 QUIC 请求流及 QPACK 状态。

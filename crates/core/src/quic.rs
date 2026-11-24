@@ -1697,4 +1697,33 @@ mod tests {
         assert!(extension_orders.len() > 1);
         assert!(parameter_orders.len() > 1);
     }
+
+    #[test]
+    #[ignore = "requires a locally captured ordinary HTTP/3 session"]
+    fn decrypts_local_aioquic_http3_initial() {
+        let capture = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/hy2-capture/h3-baseline.bin"),
+        )
+        .unwrap();
+        assert_eq!(&capture[..4], b"H3B1");
+        let count = u16::from_be_bytes(capture[4..6].try_into().unwrap());
+        let mut cursor = 6;
+        let mut analyzer = QuicInitial::default();
+        let mut result = UdpStreamAnalysis::Pending;
+        for _ in 0..count {
+            let direction = capture[cursor];
+            let length =
+                u16::from_be_bytes(capture[cursor + 9..cursor + 11].try_into().unwrap()) as usize;
+            cursor += 11;
+            if direction == 0 && !matches!(result, UdpStreamAnalysis::FinalObservations(_)) {
+                result = analyzer.feed(&capture[cursor..cursor + length], false);
+            }
+            cursor += length;
+        }
+        assert_eq!(cursor, capture.len());
+        assert_eq!(field(&result, "quic.sni"), Some("example.com"));
+        assert_eq!(field(&result, "quic.alpn"), Some("h3"));
+        assert_eq!(field(&result, "quic.transport_parameters"), Some("true"));
+    }
 }

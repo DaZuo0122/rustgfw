@@ -176,6 +176,7 @@ fn varint(bytes: &[u8], cursor: &mut usize) -> Option<u64> {
 
 struct Header<'a> {
     version: u32,
+    kind: u8,
     dcid: &'a [u8],
     scid: &'a [u8],
     token: &'a [u8],
@@ -228,6 +229,7 @@ fn parse_header(bytes: &[u8]) -> Option<Header<'_>> {
     }
     Some(Header {
         version,
+        kind,
         dcid,
         scid,
         token,
@@ -235,6 +237,33 @@ fn parse_header(bytes: &[u8]) -> Option<Header<'_>> {
         pn_offset: cursor,
         initial,
     })
+}
+
+/// Visible v1/v2 long-header packet types within one UDP datagram. These are
+/// wire shapes only; the non-Initial packets cannot be authenticated here.
+#[derive(Default)]
+pub(crate) struct WireShape {
+    pub zero_rtt: bool,
+    pub handshake: bool,
+    pub coalesced: bool,
+}
+
+pub(crate) fn wire_shape(mut datagram: &[u8]) -> WireShape {
+    let mut shape = WireShape::default();
+    let mut packets = 0;
+    while let Some(header) = parse_header(datagram) {
+        packets += 1;
+        if packets > MAX_COALESCED_PACKETS {
+            break;
+        }
+        let kind = header.kind;
+        let version = header.version;
+        datagram = &datagram[header.packet_len..];
+        shape.zero_rtt |= kind == if version == V2 { 2 } else { 1 };
+        shape.handshake |= kind == if version == V2 { 3 } else { 2 };
+    }
+    shape.coalesced = packets > 1;
+    shape
 }
 
 struct VerifiedRetry<'a> {

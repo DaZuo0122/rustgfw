@@ -3,6 +3,7 @@ use crate::wire_stats::PrefixStats;
 use crate::{
     CaptureTime,
     inspect::{Observation, UdpStreamAnalysis, UdpStreamAnalyzer},
+    quic,
 };
 
 pub const FIELDS: &[&str] = &[
@@ -16,6 +17,9 @@ pub const FIELDS: &[&str] = &[
     "udp_shape.packet_count",
     "udp_shape.short_header_form_packets",
     "udp_shape.short_header_fixed_bit_packets",
+    "udp_shape.quic_zero_rtt_shape_datagrams",
+    "udp_shape.quic_handshake_shape_datagrams",
+    "udp_shape.quic_coalesced_long_header_datagrams",
     "udp_shape.origin_first_run",
     "udp_shape.origin_first_bytes",
     "udp_shape.origin_first_varied_lengths",
@@ -37,6 +41,9 @@ pub struct UdpShape {
     lengths: Vec<i64>,
     short_header_form_packets: usize,
     short_header_fixed_bit_packets: usize,
+    quic_zero_rtt_shape_datagrams: usize,
+    quic_handshake_shape_datagrams: usize,
+    quic_coalesced_long_header_datagrams: usize,
     first_quic: bool,
     origin_first_run: usize,
     origin_first_bytes: usize,
@@ -158,6 +165,10 @@ impl UdpStreamAnalyzer for UdpShape {
                 }
             }
         }
+        let quic_shape = quic::wire_shape(payload);
+        self.quic_zero_rtt_shape_datagrams += usize::from(quic_shape.zero_rtt);
+        self.quic_handshake_shape_datagrams += usize::from(quic_shape.handshake);
+        self.quic_coalesced_long_header_datagrams += usize::from(quic_shape.coalesced);
         self.lengths.push(if reverse { -length } else { length });
         for (field, value) in [
             ("udp_shape.gaps_us", self.gaps.join(",")),
@@ -177,6 +188,18 @@ impl UdpStreamAnalyzer for UdpShape {
             (
                 "udp_shape.short_header_fixed_bit_packets",
                 self.short_header_fixed_bit_packets.to_string(),
+            ),
+            (
+                "udp_shape.quic_zero_rtt_shape_datagrams",
+                self.quic_zero_rtt_shape_datagrams.to_string(),
+            ),
+            (
+                "udp_shape.quic_handshake_shape_datagrams",
+                self.quic_handshake_shape_datagrams.to_string(),
+            ),
+            (
+                "udp_shape.quic_coalesced_long_header_datagrams",
+                self.quic_coalesced_long_header_datagrams.to_string(),
             ),
             (
                 "udp_shape.origin_first_run",
@@ -377,6 +400,61 @@ mod tests {
         );
         assert_eq!(
             field(&observed, "udp_shape.short_header_fixed_bit_packets"),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn observes_v1_and_v2_coalesced_long_header_shapes() {
+        fn long_packet(first: u8, version: u32, initial: bool) -> Vec<u8> {
+            let mut packet = vec![first];
+            packet.extend_from_slice(&version.to_be_bytes());
+            packet.extend_from_slice(&[0, 0]); // empty destination and source connection IDs
+            if initial {
+                packet.push(0); // empty Initial token
+            }
+            packet.push(17); // packet number plus protected payload
+            packet.extend_from_slice(&[0; 17]);
+            packet
+        }
+
+        let mut shape = UdpShape::default();
+        let mut v1 = long_packet(0xc0, 1, true);
+        v1.extend(long_packet(0xd0, 1, false));
+        v1.extend(long_packet(0xe0, 1, false));
+        let observed = values(shape.feed(&v1, false));
+        assert_eq!(
+            field(&observed, "udp_shape.quic_zero_rtt_shape_datagrams"),
+            Some("1")
+        );
+        assert_eq!(
+            field(&observed, "udp_shape.quic_handshake_shape_datagrams"),
+            Some("1")
+        );
+        assert_eq!(
+            field(&observed, "udp_shape.quic_coalesced_long_header_datagrams"),
+            Some("1")
+        );
+
+        let mut v2 = long_packet(0xd0, 0x6b33_43cf, true);
+        v2.extend(long_packet(0xe0, 0x6b33_43cf, false));
+        v2.extend(long_packet(0xf0, 0x6b33_43cf, false));
+        let observed = values(shape.feed(&v2, true));
+        assert_eq!(
+            field(&observed, "udp_shape.quic_zero_rtt_shape_datagrams"),
+            Some("2")
+        );
+        assert_eq!(
+            field(&observed, "udp_shape.quic_handshake_shape_datagrams"),
+            Some("2")
+        );
+        assert_eq!(
+            field(&observed, "udp_shape.quic_coalesced_long_header_datagrams"),
+            Some("2")
+        );
+        let observed = values(shape.feed(&v1[..10], false));
+        assert_eq!(
+            field(&observed, "udp_shape.quic_zero_rtt_shape_datagrams"),
             Some("2")
         );
     }

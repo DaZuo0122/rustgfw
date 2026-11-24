@@ -26,6 +26,8 @@ TCP 序列按照**包到达顺序**记录，不是 TCP 重组后的字节块大�
 
 `udp_shape.short_header_form_packets` 计数首字节最高位为 0、长度至少 18 字节的数据报；`short_header_fixed_bit_packets` 进一步要求首字节次高位为 1。二者只读取每个数据报的第一个字节，前者覆盖 [RFC 9287](https://www.rfc-editor.org/rfc/rfc9287.html) 协商后 fixed bit 变为 0 的情况，后者对应 [RFC 9000 §17.3.1](https://www.rfc-editor.org/rfc/rfc9000.html#section-17.3.1) 的普通短首部外形。两者都不校验连接 ID、包号或 AEAD；其他 UDP 协议也可能具有同样的首字节。对 [QUICstep](https://arxiv.org/html/2304.01073) 一类只在直连侧看到短首部的路径，可用这些计数和包长、方向、时间字段做候选观察，不能用它们把新五元组绑定到旧连接。
 
+`udp_shape.quic_zero_rtt_shape_datagrams`、`quic_handshake_shape_datagrams` 和 `quic_coalesced_long_header_datagrams` 分别计数前 8 个数据报中出现过对应长首部包类型、以及可解析出至少两个长首部包的数据报。包边界按公开 Length 字段走，支持 QUIC v1/v2 不同的包类型编码；一个数据报中同类包只计一次。依据 [RFC 9000 §12.2](https://www.rfc-editor.org/rfc/rfc9000.html#section-12.2)、[§17.2.3](https://www.rfc-editor.org/rfc/rfc9000.html#section-17.2.3) 与 [RFC 9369 §3.2](https://www.rfc-editor.org/rfc/rfc9369.html#section-3.2)，这些字段描述握手外层包形态。0-RTT 包的载荷仍受应用密钥保护；看到 0-RTT 外形不表示服务端接受了早期数据，更不表示其中是 HTTP/3 或代理流量。可与 `quic.*` 中经过公开 Initial 密钥验证的握手事实组合，但这些形态计数本身不做 AEAD 验证。
+
 在本机用官方 Hysteria2 v2.14.0 客户端、服务端和 UDP 转发器完成的一条默认模式连接中，客户端成功认证；握手后连续 8 个双向数据报均符合上述两项短首部计数。可选测试从保存在 Git 忽略目录的完整会话抓包中截取这段数据并验证 8/8。这个实验没有改变路径或连接 ID，因此只能验证真实 QUIC 数据报的字段行为，不能当成迁移识别率。
 
 DTLS 的 epoch 0 握手也有可见外层结构；需要区分它与随机外观 UDP 候选时使用 `dtls.*`。`DtlsHello` 可在分片跨多个数据报时重组 ClientHello，提取 SNI、ALPN、扩展序列及 cookie 交换事实；这些字段描述载体握手，不指认其内部隧道应用。

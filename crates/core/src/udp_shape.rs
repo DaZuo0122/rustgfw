@@ -397,26 +397,28 @@ mod tests {
     fn official_hysteria2_client_first_flights() {
         let base =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/hy2-capture");
-        for (mode, expected) in [("plain", false), ("salamander", false), ("gecko", true)] {
-            let capture = std::fs::read(base.join(format!("client-{mode}.bin"))).unwrap();
-            assert_eq!(&capture[..4], b"HY2C");
-            assert_eq!(capture[4], 1);
-            let mut cursor = 6;
-            let mut shape = UdpShape::default();
-            let mut candidate = false;
-            for index in 0..capture[5] {
-                let length =
-                    u16::from_be_bytes(capture[cursor..cursor + 2].try_into().unwrap()) as usize;
-                cursor += 2;
-                if index < MAX_PACKETS as u8 {
-                    let observed = values(shape.feed(&capture[cursor..cursor + length], false));
-                    candidate |=
-                        field(&observed, "udp_shape.fragmented_random_candidate") == Some("true");
+        for run in 0..16 {
+            for (mode, expected) in [("plain", false), ("salamander", false), ("gecko", true)] {
+                let capture = std::fs::read(base.join(format!("client-{mode}-{run}.bin"))).unwrap();
+                assert_eq!(&capture[..4], b"HY2C");
+                assert_eq!(capture[4], 1);
+                let mut cursor = 6;
+                let mut shape = UdpShape::default();
+                let mut candidate = false;
+                for index in 0..capture[5] {
+                    let length = u16::from_be_bytes(capture[cursor..cursor + 2].try_into().unwrap())
+                        as usize;
+                    cursor += 2;
+                    if index < MAX_PACKETS as u8 {
+                        let observed = values(shape.feed(&capture[cursor..cursor + length], false));
+                        candidate |= field(&observed, "udp_shape.fragmented_random_candidate")
+                            == Some("true");
+                    }
+                    cursor += length;
                 }
-                cursor += length;
+                assert_eq!(cursor, capture.len(), "{mode} run {run}");
+                assert_eq!(candidate, expected, "{mode} run {run}");
             }
-            assert_eq!(cursor, capture.len(), "{mode}");
-            assert_eq!(candidate, expected, "{mode}");
         }
     }
 

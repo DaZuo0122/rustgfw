@@ -32,7 +32,7 @@ QUIC v1/v2 客户端 Initial 中，`quic.transport_parameter_ids` 保存 ClientH
 
 用 [Hysteria extras/v2 v2.14.0 官方包装器](https://github.com/HyNetworks/hysteria/tree/extras/v2.14.0/extras/obfs) 对 OpenGFW 只读 ngtcp2 QUIC Initial 分别运行 Gecko 和 Salamander 16 次，外层数据报样本保存在本地 Git 忽略目录，可用选择性测试复核。Gecko 每条轨迹有 2–8 个随机填充的分片；候选初测命中 15/16。漏掉的一条在第二包前 64 字节恰有 32 个可打印字节，整数千分比为 500；把 0.5 边界纳入后命中 16/16。Salamander 每条只有一个外层数据报，均未触发该分片候选。这组包装器样本只验证混淆层，没有模拟完整客户端的首轮发包。
 
-又用 [Hysteria2 v2.14.0 官方客户端](https://hy2.io/docs/getting-started/Installation/) 分别以默认、Salamander、Gecko 配置连本机无响应 UDP 端口，采集启动后约 2.8 秒的数据报；客户端配置与二进制样本均留在 Git 忽略目录。默认模式首轮发出两个 1250 字节的标准 QUIC v1 Initial；Salamander 首轮发出两个 1258 字节的随机外观包；Gecko 首轮发出多枚 512–1200 字节范围内、长度变化的随机外观包。原条件会把 Salamander 的两包首轮误判为碎片，因此加入首轮同向包长变化条件。选择性测试在这三条完整客户端轨迹上分别得到默认 false、Salamander false、Gecko true。每种配置目前只有一条本地轨迹，不能据此估计不同网络或普通高熵 UDP 背景下的误报率。
+又用 [Hysteria2 v2.14.0 官方客户端](https://hy2.io/docs/getting-started/Installation/) 分别以默认、Salamander、Gecko 配置连本机无响应 UDP 端口，每种模式独立启动 16 次，采集启动后约 0.25 秒的数据报；客户端配置与二进制样本均留在 Git 忽略目录。默认模式首轮发出两个 1250 字节的标准 QUIC v1 Initial；Salamander 首轮发出两个 1258 字节的随机外观包；Gecko 首轮发出多枚 512–1200 字节范围内、长度变化的随机外观包。原条件会把 Salamander 的两包首轮误判为碎片，因此加入首轮同向包长变化条件。选择性测试得到默认 0/16、Salamander 0/16、Gecko 16/16 的碎片候选结果。样本全部来自同一台机器的本机无响应目标，不能据此估计不同网络或普通高熵 UDP 背景下的误报率。
 
 本地只读对照测试已检查 OpenGFW 提供的 Chrome、Firefox、curl、quiche、ngtcp2、aioquic 客户端 QUIC Initial 抓包；这些首包均被标为标准 Initial 形状，未触发随机碎片候选。这组对照只覆盖握手首包，不代表整个正常 UDP 背景流量。
 

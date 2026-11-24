@@ -17,6 +17,8 @@ pub const FIELDS: &[&str] = &[
     "udp_shape.origin_first_run",
     "udp_shape.origin_first_bytes",
     "udp_shape.origin_first_varied_lengths",
+    "udp_shape.origin_first_random_like",
+    "udp_shape.origin_first_random_like_packets",
     "udp_shape.reply_seen",
     "udp_shape.fragmented_random_candidate",
     "udp_shape.time_source",
@@ -36,6 +38,7 @@ pub struct UdpShape {
     origin_first_bytes: usize,
     origin_first_varied_lengths: bool,
     origin_first_random_like: bool,
+    origin_first_random_like_packets: usize,
     reply_seen: bool,
     candidate: bool,
     first_time: Option<CaptureTime>,
@@ -122,7 +125,9 @@ impl UdpStreamAnalyzer for UdpShape {
                 .lengths
                 .first()
                 .is_some_and(|&first_len| first_len != payload.len() as i64);
-            self.origin_first_random_like &= random_like(payload);
+            let packet_random_like = random_like(payload);
+            self.origin_first_random_like &= packet_random_like;
+            self.origin_first_random_like_packets += usize::from(packet_random_like);
             let span = capture_time
                 .zip(self.first_time)
                 .and_then(|(now, before)| now.elapsed_us_since(before));
@@ -163,6 +168,14 @@ impl UdpStreamAnalyzer for UdpShape {
             (
                 "udp_shape.origin_first_varied_lengths",
                 self.origin_first_varied_lengths.to_string(),
+            ),
+            (
+                "udp_shape.origin_first_random_like",
+                self.origin_first_random_like.to_string(),
+            ),
+            (
+                "udp_shape.origin_first_random_like_packets",
+                self.origin_first_random_like_packets.to_string(),
             ),
             ("udp_shape.reply_seen", self.reply_seen.to_string()),
             (
@@ -259,6 +272,14 @@ mod tests {
             field(&observed, "udp_shape.fragmented_random_candidate"),
             Some("true")
         );
+        assert_eq!(
+            field(&observed, "udp_shape.origin_first_random_like"),
+            Some("true")
+        );
+        assert_eq!(
+            field(&observed, "udp_shape.origin_first_random_like_packets"),
+            Some("2")
+        );
         let observed = values(shape.feed(&first[..120], true));
         assert_eq!(
             field(&observed, "udp_shape.signed_lengths"),
@@ -297,6 +318,10 @@ mod tests {
         assert_eq!(
             field(&observed, "udp_shape.first_quic_initial_shape"),
             Some("true")
+        );
+        assert_eq!(
+            field(&observed, "udp_shape.origin_first_random_like"),
+            Some("false")
         );
         let observed = values(shape.feed(&quic, false));
         assert_eq!(
@@ -411,6 +436,26 @@ mod tests {
                     cursor += 2;
                     if index < MAX_PACKETS as u8 {
                         let observed = values(shape.feed(&capture[cursor..cursor + length], false));
+                        if index == 1 && mode == "salamander" {
+                            let random_packets =
+                                field(&observed, "udp_shape.origin_first_random_like_packets")
+                                    .unwrap()
+                                    .parse::<usize>()
+                                    .unwrap();
+                            assert!(random_packets >= 1, "{mode} run {run}");
+                            assert_eq!(
+                                field(&observed, "udp_shape.origin_first_varied_lengths"),
+                                Some("false"),
+                                "{mode} run {run}"
+                            );
+                        }
+                        if index == 1 && mode == "plain" {
+                            assert_eq!(
+                                field(&observed, "udp_shape.origin_first_random_like_packets"),
+                                Some("0"),
+                                "{mode} run {run}"
+                            );
+                        }
                         candidate |= field(&observed, "udp_shape.fragmented_random_candidate")
                             == Some("true");
                     }

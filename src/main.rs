@@ -1116,7 +1116,7 @@ mod tests {
 
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"random fragments","expr":"proto == udp && fresh.udp_shape.fragmented_random_candidate == true && udp_shape.origin_first_varied_lengths == true && udp_shape.origin_first_run == 2 && udp_shape.first_entropy_milli >= 4500 && fresh.udp_shape.origin_first_span_us <= 5000","action":"drop_packet"}]}"#,
+            r#"{"rules":[{"name":"random fragments","expr":"proto == udp && fresh.udp_shape.fragmented_random_candidate == true && udp_shape.origin_first_varied_lengths == true && udp_shape.origin_first_random_like_packets >= 2 && udp_shape.origin_first_run == 2 && udp_shape.first_entropy_milli >= 4500 && fresh.udp_shape.origin_first_span_us <= 5000","action":"drop_packet"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();

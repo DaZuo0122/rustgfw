@@ -16,6 +16,7 @@ pub const FIELDS: &[&str] = &[
     "udp_shape.packet_count",
     "udp_shape.origin_first_run",
     "udp_shape.origin_first_bytes",
+    "udp_shape.origin_first_varied_lengths",
     "udp_shape.reply_seen",
     "udp_shape.fragmented_random_candidate",
     "udp_shape.time_source",
@@ -33,6 +34,7 @@ pub struct UdpShape {
     first_quic: bool,
     origin_first_run: usize,
     origin_first_bytes: usize,
+    origin_first_varied_lengths: bool,
     origin_first_random_like: bool,
     reply_seen: bool,
     candidate: bool,
@@ -116,6 +118,10 @@ impl UdpStreamAnalyzer for UdpShape {
         } else if !self.reply_seen {
             self.origin_first_run += 1;
             self.origin_first_bytes += payload.len();
+            self.origin_first_varied_lengths |= self
+                .lengths
+                .first()
+                .is_some_and(|&first_len| first_len != payload.len() as i64);
             self.origin_first_random_like &= random_like(payload);
             let span = capture_time
                 .zip(self.first_time)
@@ -126,6 +132,7 @@ impl UdpStreamAnalyzer for UdpShape {
             });
             if self.origin_first_run >= 2
                 && self.origin_first_bytes >= 1200
+                && self.origin_first_varied_lengths
                 && self.origin_first_random_like
                 && !self.first_quic
             {
@@ -152,6 +159,10 @@ impl UdpStreamAnalyzer for UdpShape {
             (
                 "udp_shape.origin_first_bytes",
                 self.origin_first_bytes.to_string(),
+            ),
+            (
+                "udp_shape.origin_first_varied_lengths",
+                self.origin_first_varied_lengths.to_string(),
             ),
             ("udp_shape.reply_seen", self.reply_seen.to_string()),
             (
@@ -229,14 +240,20 @@ mod tests {
             field(&observed, "udp_shape.fragmented_random_candidate"),
             Some("false")
         );
-        let observed = values(shape.feed(&first, false));
+        let mut second = first.clone();
+        second.push(0x67);
+        let observed = values(shape.feed(&second, false));
         assert_eq!(
             field(&observed, "udp_shape.signed_lengths"),
-            Some("700,700")
+            Some("700,701")
         );
         assert_eq!(
             field(&observed, "udp_shape.origin_first_bytes"),
-            Some("1400")
+            Some("1401")
+        );
+        assert_eq!(
+            field(&observed, "udp_shape.origin_first_varied_lengths"),
+            Some("true")
         );
         assert_eq!(
             field(&observed, "udp_shape.fragmented_random_candidate"),
@@ -245,7 +262,7 @@ mod tests {
         let observed = values(shape.feed(&first[..120], true));
         assert_eq!(
             field(&observed, "udp_shape.signed_lengths"),
-            Some("700,700,-120")
+            Some("700,701,-120")
         );
         assert_eq!(field(&observed, "udp_shape.reply_seen"), Some("true"));
     }
@@ -307,6 +324,21 @@ mod tests {
             field(&observed, "udp_shape.fragmented_random_candidate"),
             Some("false")
         );
+
+        let random = (0..1258)
+            .map(|index| (index * 73 + 151) as u8)
+            .collect::<Vec<_>>();
+        let mut equal_lengths = UdpShape::default();
+        values(equal_lengths.feed(&random, false));
+        let observed = values(equal_lengths.feed(&random, false));
+        assert_eq!(
+            field(&observed, "udp_shape.origin_first_varied_lengths"),
+            Some("false")
+        );
+        assert_eq!(
+            field(&observed, "udp_shape.fragmented_random_candidate"),
+            Some("false")
+        );
     }
 
     #[test]
@@ -358,6 +390,34 @@ mod tests {
             assert_eq!(candidates, if mode == 1 { 16 } else { 0 });
         }
         assert_eq!(cursor, fixture.len());
+    }
+
+    #[test]
+    #[ignore = "requires local captures from the official Hysteria2 client"]
+    fn official_hysteria2_client_first_flights() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/hy2-capture");
+        for (mode, expected) in [("plain", false), ("salamander", false), ("gecko", true)] {
+            let capture = std::fs::read(base.join(format!("client-{mode}.bin"))).unwrap();
+            assert_eq!(&capture[..4], b"HY2C");
+            assert_eq!(capture[4], 1);
+            let mut cursor = 6;
+            let mut shape = UdpShape::default();
+            let mut candidate = false;
+            for index in 0..capture[5] {
+                let length =
+                    u16::from_be_bytes(capture[cursor..cursor + 2].try_into().unwrap()) as usize;
+                cursor += 2;
+                if index < MAX_PACKETS as u8 {
+                    let observed = values(shape.feed(&capture[cursor..cursor + length], false));
+                    candidate |=
+                        field(&observed, "udp_shape.fragmented_random_candidate") == Some("true");
+                }
+                cursor += length;
+            }
+            assert_eq!(cursor, capture.len(), "{mode}");
+            assert_eq!(candidate, expected, "{mode}");
+        }
     }
 
     #[test]

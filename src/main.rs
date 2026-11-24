@@ -1116,7 +1116,7 @@ mod tests {
 
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"random fragments","expr":"proto == udp && fresh.udp_shape.fragmented_random_candidate == true && udp_shape.origin_first_run == 2 && udp_shape.first_entropy_milli >= 4500 && fresh.udp_shape.origin_first_span_us <= 5000","action":"drop_packet"}]}"#,
+            r#"{"rules":[{"name":"random fragments","expr":"proto == udp && fresh.udp_shape.fragmented_random_candidate == true && udp_shape.origin_first_varied_lengths == true && udp_shape.origin_first_run == 2 && udp_shape.first_entropy_milli >= 4500 && fresh.udp_shape.origin_first_span_us <= 5000","action":"drop_packet"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -1135,6 +1135,13 @@ mod tests {
         packet[24..26].copy_from_slice(&(8 + payload.len() as u16).to_be_bytes());
         packet[28..].copy_from_slice(&payload);
         let mut evaluate = |micros: u64| {
+            let mut packet = packet.clone();
+            if micros == 103_000 {
+                packet.push(0x67);
+                let packet_len = packet.len() as u16;
+                packet[2..4].copy_from_slice(&packet_len.to_be_bytes());
+                packet[24..26].copy_from_slice(&(packet_len - 20).to_be_bytes());
+            }
             policy.evaluate(Packet {
                 bytes: &packet,
                 original_len: packet.len(),

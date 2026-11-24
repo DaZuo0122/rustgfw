@@ -45,7 +45,7 @@ HTTP/1 Upgrade：表达式引用 `http.upgrade_offer` 或 `http.upgrade_selected
 
 FET：表达式引用 `fet.*` 字段时按需分析首方向首次交付的 TCP 数据，最多采样 8192 字节。分析器按 OpenGFW 的五组豁免条件报告 `fet.candidate` 与各项统计值；这是统计启发式，不是加密真实性验证或具体代理协议识别。首次采样受 TCP 分段影响，可在规则中约束 `fet.sample_len` 并与其他字段组合。
 
-TCP 包形态：表达式引用 `tcp_shape.*` 时按需在重组前观察前 16 个带载荷包，报告首包前缀统计、方向包长、相邻同向突发和捕获时间间隔。相同方向、序号和长度的重传只计一次。原始包分析器也观察无载荷的 SYN、SYN-ACK、ACK，以估计握手 RTT 并将连续同向包按 3 倍 RTT 的时间门槛切分；四档长度三元组供表达式组合。`TcpPacketAnalyzer` 与流分析器共享流级观察值和表达式，仍保留原始包边界；已解码流没有原始包边界，因此不运行该入口。UDP 形态分析器同样可报告前 8 个数据报的时间间隔。`Packet.capture_time` 区分内核时间与接收线程时间；Linux NFQUEUE 优先使用可选内核时间戳。研究依据、误报边界见[外层指纹研究](outer-fingerprints.md)。
+TCP 包形态：表达式引用 `tcp_shape.*` 时按需在重组前观察前 16 个带载荷包，报告首包前缀统计、方向包长、相邻同向突发和捕获时间间隔。相同方向、序号和长度的重传只计一次。原始包分析器也观察无载荷的 SYN、SYN-ACK、ACK，以估计握手 RTT 并将连续同向包按 3 倍 RTT 的时间门槛切分；四档长度三元组供表达式组合。`TcpPacketAnalyzer` 与流分析器共享流级观察值和表达式，仍保留原始包边界；已解码流没有原始包边界，因此不运行该入口。UDP 形态分析器同样可报告前 16 个数据报的时间间隔。`Packet.capture_time` 区分内核时间与接收线程时间；Linux NFQUEUE 优先使用可选内核时间戳。研究依据、误报边界见[外层指纹研究](outer-fingerprints.md)。
 
 Trojan：表达式引用 `trojan.*` 字段时按需启用双向 TCP 长度序列分析器。它从客户端兼容性 ChangeCipherSpec 开始累计前四段交替方向的字节数，报告序列和统计候选标记；树模型移植自 OpenGFW，单独附带 MPL-2.0 许可。特征依赖交付分段及换向时机，不验证加密内层协议；规则可将候选标记与 TLS、FET 或端点信息组合。
 
@@ -53,7 +53,7 @@ QUIC：表达式引用 `quic.*` 字段时按需启用双向 UDP 流分析器，�
 
 DTLS：表达式引用 `dtls.*` 时按需在任意 UDP 端口观察 epoch 0 的明文握手记录。分析器按 DTLS 的 `message_seq` 与分片偏移重组 ClientHello、HelloVerifyRequest 和 ServerHello，剥离 ClientHello 特有的 cookie 字段后复用 TLS 的套件、扩展、SNI、ALPN 和版本解析。ClientHello 的 cookie 交换可作为前后两个观察批次，ServerHello 后结束；DTLS 1.3 的服务端 ALPN 位于加密的 EncryptedExtensions。已用 OpenSSL 3.6.3 的真实 DTLS 1.2 双数据报 ClientHello 验证正序与乱序重组。此分析器识别 DTLS 载体与可见握手事实，不验证 OpenConnect 等隧道身份；依据 [RFC 6347](https://www.rfc-editor.org/rfc/rfc6347.html) 与 [RFC 9147](https://www.rfc-editor.org/rfc/rfc9147.html)。
 
-UDP 外层形态：表达式引用 `udp_shape.*` 时按需观察同一端点对的前 8 个数据报，不限定端口。首包前缀统计、双向有符号包长及实验性随机碎片首轮候选由独立分析器产生，可与 `quic.*` 组合。它不解密，也不把候选命名为具体代理协议。依据及内层分析器的复用边界见[外层指纹研究](outer-fingerprints.md)。
+UDP 外层形态：表达式引用 `udp_shape.*` 时按需观察同一端点对的前 16 个数据报，不限定端口。首包前缀统计、双向有符号包长及实验性随机碎片首轮候选由独立分析器产生，可与 `quic.*` 组合。对 QUIC v1/v2，可计数短首部目的 CID 前缀与反向 Initial 源 CID 的匹配，但该匹配不验证密文，也不合并不同五元组。依据及内层分析器的复用边界见[外层指纹研究](outer-fingerprints.md)。
 
 HTTP 通过 `BidirectionalAnalyzerRule` 注册，TLS/DNS TCP/SSH 通过 `AnalyzerRule` 注册，共享流表及每方向 TCP 重组。UDP DNS 通过 `DatagramRule` 注册，逐个数据报分析，不占用 TCP 流表；数据报规则可限制源端口、目的端口或任一端口，畸形结果可要求丢弃该包。WireGuard 和表达式 DNS UDP 通过 `UdpStreamRule` 注册，保留跨数据报的双向状态。分析器报告带字段名的观察值，由规则回调匹配；新增同类分析器无需修改引擎中的协议匹配分支。TCP 观察结果区分完成与可继续分析，TLS/SSH 报告后释放分析器，DNS TCP 与 HTTP/1 可在同一流内报告后续消息。HTTP/1 同包多消息以分批观察结果逐条求值；响应批次恢复对应请求字段作为上下文，不将其计为新观察值。带端口限制的 TCP 分析器只为匹配端口的连接建立检查状态，其他 TCP 连接不占用检查流表。任一分析器匹配即阻断，其他分析器不能撤销这一决定。相同初始 SYN 重传保持状态，新的初始序号触发端点复用重建；这是被动流识别，不是内核 TCP 状态机的等价实现。
 

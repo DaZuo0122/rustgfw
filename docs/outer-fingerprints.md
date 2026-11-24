@@ -22,11 +22,13 @@ TCP 序列按照**包到达顺序**记录，不是 TCP 重组后的字节块大�
 
 这是按论文方法做的**实验性特征提取**，没有移植其带标签的序贯假设检验及先验分布。实际相关峰也可能来自普通服务端处理、复用流的交错、重传、ACK 合并或 CDN 距离；`tcp_rtt.diff_us` 可在表达式中同 TCP 外层字段组合，不能单独作为代理身份判定。当前把建流时首先看到的方向当作请求方向，仅按到达顺序处理包；中途接入、部分重叠重传与重排仍需标注抓包验证。
 
-`UdpShape` 在按需启用时观察同一 UDP 端点对的前 8 个数据报。它记录首包长度、前 64 字节的平均置位数、可打印字符比例与 Shannon 熵，以及相对首包方向的有符号包长序列、首次反向前的同向包数和累计字节数。`udp_shape.first_quic_initial_shape` 只检查 v1/v2 Initial 的可见头部形状，不进行 QUIC AEAD 验证；需要验证公开 Initial 时继续使用 `quic.*`。
+`UdpShape` 在按需启用时观察同一 UDP 端点对的前 16 个数据报。它记录首包长度、前 64 字节的平均置位数、可打印字符比例与 Shannon 熵，以及相对首包方向的有符号包长序列、首次反向前的同向包数和累计字节数。`udp_shape.first_quic_initial_shape` 只检查 v1/v2 Initial 的可见头部形状，不进行 QUIC AEAD 验证；需要验证公开 Initial 时继续使用 `quic.*`。
 
 `udp_shape.short_header_form_packets` 计数首字节最高位为 0、长度至少 18 字节的数据报；`short_header_fixed_bit_packets` 进一步要求首字节次高位为 1。二者只读取每个数据报的第一个字节，前者覆盖 [RFC 9287](https://www.rfc-editor.org/rfc/rfc9287.html) 协商后 fixed bit 变为 0 的情况，后者对应 [RFC 9000 §17.3.1](https://www.rfc-editor.org/rfc/rfc9000.html#section-17.3.1) 的普通短首部外形。两者都不校验连接 ID、包号或 AEAD；其他 UDP 协议也可能具有同样的首字节。对 [QUICstep](https://arxiv.org/html/2304.01073) 一类只在直连侧看到短首部的路径，可用这些计数和包长、方向、时间字段做候选观察，不能用它们把新五元组绑定到旧连接。
 
-`udp_shape.quic_zero_rtt_shape_datagrams`、`quic_handshake_shape_datagrams` 和 `quic_coalesced_long_header_datagrams` 分别计数前 8 个数据报中出现过对应长首部包类型、以及可解析出至少两个长首部包的数据报。包边界按公开 Length 字段走，支持 QUIC v1/v2 不同的包类型编码；一个数据报中同类包只计一次。依据 [RFC 9000 §12.2](https://www.rfc-editor.org/rfc/rfc9000.html#section-12.2)、[§17.2.3](https://www.rfc-editor.org/rfc/rfc9000.html#section-17.2.3) 与 [RFC 9369 §3.2](https://www.rfc-editor.org/rfc/rfc9369.html#section-3.2)，这些字段描述握手外层包形态。0-RTT 包的载荷仍受应用密钥保护；看到 0-RTT 外形不表示服务端接受了早期数据，更不表示其中是 HTTP/3 或代理流量。可与 `quic.*` 中经过公开 Initial 密钥验证的握手事实组合，但这些形态计数本身不做 AEAD 验证。
+`udp_shape.short_header_initial_cid_matches` 计数短首部首字节之后与反向 Initial 的非空源 CID 前缀相同的数据报，`short_header_initial_cid_match_bytes` 记录已匹配 CID 的最大长度。Initial 可与其他长首部包合并，解析按公开 Length 字段遍历。依据 [RFC 9000 §7.2](https://www.rfc-editor.org/rfc/rfc9000.html#section-7.2)，两端会把对方发出的源 CID 用作后续包的目的 CID。这里仅比较同一五元组内的可见字节，不验证 Initial 或短首部 AEAD；CID 可在加密的 `NEW_CONNECTION_ID` 后更换，零长度 CID 也无法提供匹配。匹配不是 QUIC 身份或连接迁移认证，未匹配也不能排除 QUIC。普通 aioquic HTTP/3 本机首轮会话的首次可匹配短首部在第 10 个数据报；因此观察窗口延至 16 包。已有本机首次与 0-RTT 恢复会话抓包都至少出现 4 次匹配，官方 Hysteria2 抓包也用原有 8 包短首部窗口做了回归；样本不足以给代理协议设识别阈值。
+
+`udp_shape.quic_zero_rtt_shape_datagrams`、`quic_handshake_shape_datagrams` 和 `quic_coalesced_long_header_datagrams` 分别计数前 16 个数据报中出现过对应长首部包类型、以及可解析出至少两个长首部包的数据报。包边界按公开 Length 字段走，支持 QUIC v1/v2 不同的包类型编码；一个数据报中同类包只计一次。依据 [RFC 9000 §12.2](https://www.rfc-editor.org/rfc/rfc9000.html#section-12.2)、[§17.2.3](https://www.rfc-editor.org/rfc/rfc9000.html#section-17.2.3) 与 [RFC 9369 §3.2](https://www.rfc-editor.org/rfc/rfc9369.html#section-3.2)，这些字段描述握手外层包形态。0-RTT 包的载荷仍受应用密钥保护；看到 0-RTT 外形不表示服务端接受了早期数据，更不表示其中是 HTTP/3 或代理流量。可与 `quic.*` 中经过公开 Initial 密钥验证的握手事实组合，但这些形态计数本身不做 AEAD 验证。
 
 在本机用官方 Hysteria2 v2.14.0 客户端、服务端和 UDP 转发器完成的一条默认模式连接中，客户端成功认证；握手后连续 8 个双向数据报均符合上述两项短首部计数。可选测试从保存在 Git 忽略目录的完整会话抓包中截取这段数据并验证 8/8。这个实验没有改变路径或连接 ID，因此只能验证真实 QUIC 数据报的字段行为，不能当成迁移识别率。
 
@@ -46,7 +48,7 @@ Salamander 重复样本中有一轮的前两包未同时通过严格的随机外
 
 本地只读对照测试已检查 OpenGFW 提供的 Chrome、Firefox、curl、quiche、ngtcp2、aioquic 客户端 QUIC Initial 抓包；这些首包均被标为标准 Initial 形状，未触发随机碎片候选。这组对照只覆盖握手首包，不代表整个正常 UDP 背景流量。
 
-每个字段的观察值属于外层数据报，不要求 MITM。包长序列只保留前 8 个数据报，并以首个看到的方向为正；在中途开始抓包时，正方向不一定是客户端。`udp_shape.gaps_us`、`last_gap_us`、`origin_first_span_us` 和 `first_reply_delay_us` 与 TCP 同义，可用于检验 Gecko 首轮分片的时间聚集性。
+每个字段的观察值属于外层数据报，不要求 MITM。包长序列只保留前 16 个数据报，并以首个看到的方向为正；在中途开始抓包时，正方向不一定是客户端。`udp_shape.gaps_us`、`last_gap_us`、`origin_first_span_us` 和 `first_reply_delay_us` 与 TCP 同义，可用于检验 Gecko 首轮分片的时间聚集性。
 
 `Packet.capture_time` 保留来源：Linux NFQUEUE 有 `NFQA_TIMESTAMP` 时用内核包时间，否则用独立接收线程刚收到包时的单调时钟。`time_source` 为 `kernel`、`receive` 或 `none`。不同来源、缺失时间或时间倒退时，相应间隔记为 `?`，数值比较不会匹配。接收线程时间包含内核排队延迟，不能当作真实线上间隔；内核时间戳也受抓包点、时钟及转发路径影响。现阶段不把这些时间字段固化成协议判定阈值，先用带标签抓包校准。
 

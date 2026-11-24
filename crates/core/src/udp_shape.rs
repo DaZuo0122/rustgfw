@@ -17,6 +17,8 @@ pub const FIELDS: &[&str] = &[
     "udp_shape.packet_count",
     "udp_shape.short_header_form_packets",
     "udp_shape.short_header_fixed_bit_packets",
+    "udp_shape.short_header_initial_cid_matches",
+    "udp_shape.short_header_initial_cid_match_bytes",
     "udp_shape.quic_zero_rtt_shape_datagrams",
     "udp_shape.quic_handshake_shape_datagrams",
     "udp_shape.quic_coalesced_long_header_datagrams",
@@ -34,13 +36,16 @@ pub const FIELDS: &[&str] = &[
     "udp_shape.first_reply_delay_us",
 ];
 
-const MAX_PACKETS: usize = 8;
+const MAX_PACKETS: usize = 16;
 
 #[derive(Default)]
 pub struct UdpShape {
     lengths: Vec<i64>,
     short_header_form_packets: usize,
     short_header_fixed_bit_packets: usize,
+    short_header_initial_cid_matches: usize,
+    short_header_initial_cid_match_bytes: usize,
+    initial_scids: [Option<Vec<u8>>; 2],
     quic_zero_rtt_shape_datagrams: usize,
     quic_handshake_shape_datagrams: usize,
     quic_coalesced_long_header_datagrams: usize,
@@ -156,6 +161,11 @@ impl UdpStreamAnalyzer for UdpShape {
             }
         }
         let length = payload.len() as i64;
+        let quic_shape = quic::wire_shape(payload);
+        let direction = usize::from(reverse);
+        if let Some(scid) = quic_shape.initial_scid.filter(|scid| !scid.is_empty()) {
+            self.initial_scids[direction].get_or_insert_with(|| scid.to_vec());
+        }
         if payload.len() >= 18 {
             let first_byte = payload[0];
             if first_byte & 0x80 == 0 {
@@ -163,9 +173,15 @@ impl UdpStreamAnalyzer for UdpShape {
                 if first_byte & 0x40 != 0 {
                     self.short_header_fixed_bit_packets += 1;
                 }
+                if let Some(scid) = self.initial_scids[1 - direction].as_deref()
+                    && payload[1..].starts_with(scid)
+                {
+                    self.short_header_initial_cid_matches += 1;
+                    self.short_header_initial_cid_match_bytes =
+                        self.short_header_initial_cid_match_bytes.max(scid.len());
+                }
             }
         }
-        let quic_shape = quic::wire_shape(payload);
         self.quic_zero_rtt_shape_datagrams += usize::from(quic_shape.zero_rtt);
         self.quic_handshake_shape_datagrams += usize::from(quic_shape.handshake);
         self.quic_coalesced_long_header_datagrams += usize::from(quic_shape.coalesced);
@@ -188,6 +204,14 @@ impl UdpStreamAnalyzer for UdpShape {
             (
                 "udp_shape.short_header_fixed_bit_packets",
                 self.short_header_fixed_bit_packets.to_string(),
+            ),
+            (
+                "udp_shape.short_header_initial_cid_matches",
+                self.short_header_initial_cid_matches.to_string(),
+            ),
+            (
+                "udp_shape.short_header_initial_cid_match_bytes",
+                self.short_header_initial_cid_match_bytes.to_string(),
             ),
             (
                 "udp_shape.quic_zero_rtt_shape_datagrams",
@@ -460,6 +484,59 @@ mod tests {
     }
 
     #[test]
+    fn short_headers_match_opposite_initial_source_cid_after_handshake() {
+        fn initial(first: u8, version: u32, dcid: &[u8], scid: &[u8]) -> Vec<u8> {
+            let mut bytes = vec![first];
+            bytes.extend(version.to_be_bytes());
+            bytes.push(dcid.len() as u8);
+            bytes.extend(dcid);
+            bytes.push(scid.len() as u8);
+            bytes.extend(scid);
+            bytes.extend([0, 17]);
+            bytes.extend([0; 17]);
+            bytes
+        }
+        for (first, version) in [(0xc0, 1), (0xd0, 0x6b33_43cf)] {
+            let mut shape = UdpShape::default();
+            let client_scid = [1, 2, 3, 4];
+            let server_scid = [5, 6, 7, 8, 9, 10];
+            values(shape.feed(&[0x40; 24], false));
+            values(shape.feed(&initial(first, version, &[11; 8], &client_scid), false));
+            values(shape.feed(&initial(first, version, &client_scid, &server_scid), true));
+
+            let mut client_short = vec![0x40];
+            client_short.extend(server_scid);
+            client_short.extend([0xaa; 20]);
+            let observed = values(shape.feed(&client_short, false));
+            assert_eq!(
+                field(&observed, "udp_shape.short_header_initial_cid_matches"),
+                Some("1")
+            );
+            assert_eq!(
+                field(&observed, "udp_shape.short_header_initial_cid_match_bytes"),
+                Some("6")
+            );
+
+            let mut wrong = client_short.clone();
+            wrong[1] ^= 1;
+            let observed = values(shape.feed(&wrong, false));
+            assert_eq!(
+                field(&observed, "udp_shape.short_header_initial_cid_matches"),
+                Some("1")
+            );
+
+            let mut server_short = vec![0x40];
+            server_short.extend(client_scid);
+            server_short.extend([0xbb; 20]);
+            let observed = values(shape.feed(&server_short, true));
+            assert_eq!(
+                field(&observed, "udp_shape.short_header_initial_cid_matches"),
+                Some("2")
+            );
+        }
+    }
+
+    #[test]
     fn standard_quic_initial_and_short_dns_do_not_match_fragment_candidate() {
         let mut quic = vec![0xc0, 0, 0, 0, 1];
         quic.extend([0x96, 0xa5].repeat(350));
@@ -640,7 +717,7 @@ mod tests {
         }
         assert_eq!(cursor, capture.len());
         let window = packets
-            .windows(MAX_PACKETS)
+            .windows(8)
             .find(|window| {
                 window
                     .iter()
@@ -694,13 +771,23 @@ mod tests {
                 cursor += length;
             }
             assert_eq!(cursor, capture.len());
-            field(&observed, "udp_shape.quic_zero_rtt_shape_datagrams")
-                .unwrap()
-                .parse::<usize>()
-                .unwrap()
+            (
+                field(&observed, "udp_shape.quic_zero_rtt_shape_datagrams")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap(),
+                field(&observed, "udp_shape.short_header_initial_cid_matches")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap(),
+            )
         };
-        assert_eq!(count_zero_rtt("h3-baseline.bin"), 0);
-        assert!(count_zero_rtt("h3-zero-rtt.bin") >= 1);
+        let baseline = count_zero_rtt("h3-baseline.bin");
+        let resumed = count_zero_rtt("h3-zero-rtt.bin");
+        assert_eq!(baseline.0, 0);
+        assert!(resumed.0 >= 1);
+        assert!(baseline.1 >= 4);
+        assert!(resumed.1 >= 4);
     }
 
     #[test]

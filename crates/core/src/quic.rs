@@ -252,13 +252,14 @@ fn parse_header(bytes: &[u8]) -> Option<Header<'_>> {
 /// Visible v1/v2 long-header packet types within one UDP datagram. These are
 /// wire shapes only; the non-Initial packets cannot be authenticated here.
 #[derive(Default)]
-pub(crate) struct WireShape {
+pub(crate) struct WireShape<'a> {
     pub zero_rtt: bool,
     pub handshake: bool,
     pub coalesced: bool,
+    pub initial_scid: Option<&'a [u8]>,
 }
 
-pub(crate) fn wire_shape(mut datagram: &[u8]) -> WireShape {
+pub(crate) fn wire_shape(mut datagram: &[u8]) -> WireShape<'_> {
     let mut shape = WireShape::default();
     let mut packets = 0;
     while let Some(header) = parse_header(datagram) {
@@ -268,6 +269,9 @@ pub(crate) fn wire_shape(mut datagram: &[u8]) -> WireShape {
         }
         let kind = header.kind;
         let version = header.version;
+        if header.initial && shape.initial_scid.is_none() {
+            shape.initial_scid = Some(header.scid);
+        }
         datagram = &datagram[header.packet_len..];
         shape.zero_rtt |= kind == if version == V2 { 2 } else { 1 };
         shape.handshake |= kind == if version == V2 { 3 } else { 2 };

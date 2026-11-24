@@ -6,7 +6,7 @@ QUIC 连接不等于 UDP 五元组。NAT 重新绑定或主动迁移会改变地
 
 QUICstep 的实验实现正好覆盖这个场景：通过 WireGuard 隧道传送握手，再将短首部流量送到直连路径。它用首部首位区分长、短首部做路由，不依赖旁路观察者把直连包与隧道里的握手关联。因此，Linux NFQUEUE 只看到直连侧时，现有 Initial 分析器不会得到隧道里的 SNI；不能把未知的短首部流量默认为已通过 SNI 规则。即使观察到相同的连接 ID，未解密的短首部也不能作为可信的身份凭证。
 
-`udp_shape.short_header_form_packets` 和 `short_header_fixed_bit_packets` 可在前 8 个数据报中计数短首部首字节形状，供表达式与包长、方向、时间组合。后者只覆盖 fixed bit 为 1 的包；[RFC 9287](https://www.rfc-editor.org/rfc/rfc9287.html) 允许协商后清除该位。计数不是 QUIC 身份验证，也不改变下面的五元组隔离和卸载行为。
+`udp_shape.short_header_form_packets` 和 `short_header_fixed_bit_packets` 可在前 16 个数据报中计数短首部首字节形状，供表达式与包长、方向、时间组合。后者只覆盖 fixed bit 为 1 的包；[RFC 9287](https://www.rfc-editor.org/rfc/rfc9287.html) 允许协商后清除该位。`short_header_initial_cid_matches` 进一步计数短首部目的 CID 前缀与反向 Initial 源 CID 相同的数据报，`short_header_initial_cid_match_bytes` 给出最大匹配长度。这些 CID 由未认证的可见首部读取，且加密的 `NEW_CONNECTION_ID` 可以让真实连接换用新 CID，因此匹配只增加当前五元组内的外层相关性证据；它不改变下面的五元组隔离和卸载行为。[RFC 9000 §5.1](https://www.rfc-editor.org/rfc/rfc9000.html#section-5.1)。
 
 本机官方 Hysteria2 客户端与服务端的一条正常连接在握手后出现连续 8 个符合普通短首部形状的双向数据报，已用本地可选测试验证。另在 UDP 转发器里把服务端看到的源端口从旧端口切到新端口，随后通过客户端 SOCKS 入口发送 TCP 回显请求，客户端成功收到回显；新路径上观测到双向短首部包。将这条会话抓包按新旧端口重放到核心时，旧路径的 UDP 形态计数没有传给新五元组，新路径第四个符合形状的数据报才命中测试规则。抓包、证书和转发脚本只保存在 Git 忽略目录。这个实验验证了受控 NAT 重新绑定及逐包状态隔离，没有获得加密的连接 ID 增退或路径验证事实，也未复现 QUICstep 的隧道握手。
 

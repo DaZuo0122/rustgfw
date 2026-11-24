@@ -21,7 +21,7 @@ Xray 的代理协议、传输和安全层可自由组合；“支持 VLESS”不
 ## 下一步
 
 1. 对已补上的明文 VLESS 结构候选采集 Xray、sing-box、mihomo 客户端样本，验证不同实现与误报。HTTP/1 WebSocket/HTTPUpgrade 已有载体字段，后续可用实际客户端握手验证互通与误报；不能因为 `Upgrade: websocket` 就判定代理。
-2. 对 QUIC 家族采集标注流量：普通 H3、WebTransport/MASQUE、Hysteria2 默认与混淆、TUIC、ShadowQUIC。已有 Initial 字段、前 8 包形态和实验性随机碎片候选；下一步用对照样本校准阈值、评估误报，再决定是否加入内核时间戳和时序模型。不同客户端、拥塞控制和迁移路径要分开验证。
+2. 对 QUIC 家族采集标注流量：普通 H3、WebTransport/MASQUE、Hysteria2 默认与混淆、TUIC、ShadowQUIC。已有 Initial 字段、前 8 包形态和实验性随机碎片候选；官方 Gecko/Salamander 包装器生成的初轮样本已用于检验候选边界，仍需完整客户端与正常 UDP 对照测量误报，再决定是否加入内核时间戳和时序模型。不同客户端、拥塞控制和迁移路径要分开验证。
 3. 保持“载体事实”和“具体代理候选”分层。Shadowsocks/VMess 等没有密钥时不承诺确定识别；FET 与 Trojan 长度模型在规则中保留候选含义。
 
 ## 主动探测的进入条件

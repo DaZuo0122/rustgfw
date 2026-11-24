@@ -10,7 +10,7 @@
 
 ## 已实现的外层字段
 
-`TcpShape` 通过 `TcpPacketAnalyzer` 在 TCP 重组之前观察前 16 个带载荷数据包。它记录首包前 64 字节的统计量、原始包的有符号长度序列、相邻同向包累计长度，以及首次反向之前的包数和总字节数。正值属于建流方向，负值属于反方向。相同方向、序号和载荷长度的重传不重复计数。`tcp_shape.first_random_like` 使用前缀平均置位数 3.4–4.6、可打印比例低于 0.5、Shannon 熵至少 4.5 bit/byte 的组合，表示随机外观；可与 `tls.*`、`fet.*`、`trojan.*` 和端点字段组成表达式。
+`TcpShape` 通过 `TcpPacketAnalyzer` 在 TCP 重组之前观察前 16 个带载荷数据包。它记录首包前 64 字节的统计量、原始包的有符号长度序列、相邻同向包累计长度，以及首次反向之前的包数和总字节数。正值属于建流方向，负值属于反方向。相同方向、序号和载荷长度的重传不重复计数。`tcp_shape.first_random_like` 使用前缀平均置位数 3.4–4.6、可打印比例不超过 0.5、Shannon 熵至少 4.5 bit/byte 的组合，表示随机外观；可与 `tls.*`、`fet.*`、`trojan.*` 和端点字段组成表达式。
 
 TCP 序列按照**包到达顺序**记录，不是 TCP 重组后的字节块大小。当前只跳过完全相同的重传；乱序、部分重叠和分段策略仍会改变序列。`tcp_shape.gaps_us` 逐项记录已计入包之间的微秒间隔，`last_gap_us` 报告当前包与前一包的间隔，`origin_first_span_us` 和 `first_reply_delay_us` 分别报告首方向首轮跨度及首次反向延迟。解码流入口不运行 `TcpPacketAnalyzer`，因为已解码字节没有原始包边界。
 
@@ -28,7 +28,9 @@ DTLS 的 epoch 0 握手也有可见外层结构；需要区分它与随机外观
 
 QUIC v1/v2 客户端 Initial 中，`quic.transport_parameter_ids` 保存 ClientHello transport parameters 的线缆顺序，`_no_grease` 版本删去 RFC 9000 的保留 ID。`disable_active_migration` 与 `active_connection_id_limit` 是客户端声明；它们可与 ALPN、TLS 扩展序列及 UDP 包形态组合，不代表后续迁移已经发生。
 
-`udp_shape.fragmented_random_candidate` 在首次反向之前至少两个同向数据报累计达到 1200 字节、每个被检查数据报前缀至少 32 字节、平均置位数位于 3.4–4.6、可打印比例低于 0.5、前缀熵至少 4.5 bit/byte，且没有标准 v1/v2 Initial 形状时置为 `true`。数值门槛是据论文和 Gecko 线缆格式提出的工程假设，尚未用带标签的 Hysteria2 Gecko、普通 H3、游戏及语音 UDP 样本校准；规则应结合端点、`quic.*` 和双向序列评估误报。
+`udp_shape.fragmented_random_candidate` 在首次反向之前至少两个同向数据报累计达到 1200 字节、每个被检查数据报前缀至少 32 字节、平均置位数位于 3.4–4.6、可打印比例不超过 0.5、前缀熵至少 4.5 bit/byte，且没有标准 v1/v2 Initial 形状时置为 `true`。数值门槛是据论文和 Gecko 线缆格式提出的工程假设；规则应结合端点、`quic.*` 和双向序列评估误报。
+
+用 [Hysteria extras/v2 v2.14.0 官方包装器](https://github.com/HyNetworks/hysteria/tree/extras/v2.14.0/extras/obfs) 对 OpenGFW 只读 ngtcp2 QUIC Initial 分别运行 Gecko 和 Salamander 16 次，外层数据报样本保存在本地 Git 忽略目录，可用选择性测试复核。Gecko 每条轨迹有 2–8 个随机填充的分片；现有候选初测命中 15/16。漏掉的一条在第二包前 64 字节恰有 32 个可打印字节，整数千分比为 500；把 0.5 边界纳入后命中 16/16。Salamander 每条只有一个外层数据报，均未触发该分片候选。**这是官方混淆层包裹真实 QUIC Initial 的样本，不是完整 Hysteria2 客户端连接，也不能据此估计普通随机 UDP 的误报率。**
 
 本地只读对照测试已检查 OpenGFW 提供的 Chrome、Firefox、curl、quiche、ngtcp2、aioquic 客户端 QUIC Initial 抓包；这些首包均被标为标准 Initial 形状，未触发随机碎片候选。这组对照只覆盖握手首包，不代表整个正常 UDP 背景流量。
 
@@ -40,4 +42,4 @@ QUIC v1/v2 客户端 Initial 中，`quic.transport_parameter_ids` 保存 ClientH
 
 `Inspect::feed_decoded` 用与逐包 TCP 路径相同的 `AnalyzerRule`、`BidirectionalAnalyzerRule` 和 `FlowRule`；单元测试已验证裸 VLESS 请求头经该入口分段输入后，原有 `vless.*` 表达式会阻断对应逻辑流。其他 HTTP/1、TLS、SOCKS、SSH 和复用协议分析器同样通过注册工厂复用。调用方必须先解密、解复用，并剥离代理封装头；当前 Linux NFQUEUE 与 Windows WinDivert 路径没有这些密钥，也不会自动得到内层明文。HTTP/3 的解码入口 `feed_http3` 单独接收 QUIC 请求流及 QPACK 状态。
 
-下一轮需要用带标签抓包比较 Hysteria2 默认/Salamander/Gecko、普通 H3 与其他高熵 UDP，在不同分片、丢包和中途抓包条件下统计召回率与误报率，再决定是否固化更强的协议候选或训练时序模型。
+下一轮需要用完整客户端抓包比较 Hysteria2 默认/Salamander/Gecko、普通 H3 与其他高熵 UDP，在不同分片、丢包和中途抓包条件下统计召回率与误报率，再决定是否固化更强的协议候选或训练时序模型。

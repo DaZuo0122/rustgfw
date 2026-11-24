@@ -310,6 +310,57 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the locally generated Hysteria2 obfuscation sample"]
+    fn official_hysteria2_obfuscation_samples() {
+        // Hysteria extras/v2 v2.14.0 wraps an ngtcp2 QUIC Initial from the
+        // read-only OpenGFW fixtures. Each mode contains 16 independent runs.
+        let fixture = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/hy2-capture/hy2-obfs-v2.14.bin"),
+        )
+        .unwrap();
+        let mut cursor = 0;
+        let mut take = |length: usize| {
+            let bytes = &fixture[cursor..cursor + length];
+            cursor += length;
+            bytes
+        };
+        assert_eq!(take(4), b"HY2O");
+        assert_eq!(take(1), [1]);
+        assert_eq!(take(1), [16]);
+        for mode in [1, 2] {
+            assert_eq!(take(1), [mode]);
+            let mut candidates = 0;
+            for _ in 0..16 {
+                let count = usize::from(take(1)[0]);
+                assert!(if mode == 1 {
+                    (2..=8).contains(&count)
+                } else {
+                    count == 1
+                });
+                let mut shape = UdpShape::default();
+                let mut candidate = false;
+                for index in 0..count {
+                    let length = u16::from_be_bytes(take(2).try_into().unwrap()) as usize;
+                    let packet = take(length);
+                    let observed = values(shape.feed(packet, false));
+                    if index == 0 {
+                        assert_eq!(
+                            field(&observed, "udp_shape.first_quic_initial_shape"),
+                            Some("false")
+                        );
+                    }
+                    candidate |=
+                        field(&observed, "udp_shape.fragmented_random_candidate") == Some("true");
+                }
+                candidates += usize::from(candidate);
+            }
+            assert_eq!(candidates, if mode == 1 { 16 } else { 0 });
+        }
+        assert_eq!(cursor, fixture.len());
+    }
+
+    #[test]
     #[ignore = "requires the read-only OpenGFW QUIC capture fixtures"]
     fn real_quic_initials_do_not_trigger_fragment_candidate() {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

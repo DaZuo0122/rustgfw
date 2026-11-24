@@ -47,7 +47,7 @@ impl PrefixStats {
     pub fn random_like(&self) -> bool {
         self.len >= 32
             && (3400..=4600).contains(&self.popcount_milli)
-            && self.printable_per_mille < 500
+            && self.printable_per_mille <= 500
             && self.entropy_milli >= 4500
     }
 }

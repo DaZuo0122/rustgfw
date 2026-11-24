@@ -214,6 +214,7 @@ pub(crate) struct ClientHelloMetadata {
     pub ech_extension: bool,
     pub quic_transport_parameters: bool,
     pub quic_transport_parameter_ids: Vec<u64>,
+    pub quic_transport_parameter_integers: Vec<(u64, u64)>,
     pub quic_datagram_max_size: Option<u64>,
     pub quic_disable_active_migration: bool,
     pub quic_active_connection_id_limit: Option<u64>,
@@ -427,6 +428,7 @@ fn quic_varint(cursor: &mut Cursor<'_>) -> Option<u64> {
 #[derive(Default, PartialEq, Eq, Debug)]
 struct QuicTransportParameters {
     ids: Vec<u64>,
+    integers: Vec<(u64, u64)>,
     datagram_max_size: Option<u64>,
     disable_active_migration: bool,
     active_connection_id_limit: Option<u64>,
@@ -447,18 +449,17 @@ fn quic_transport_parameters(bytes: &[u8]) -> Option<QuicTransportParameters> {
                 }
                 result.disable_active_migration = true;
             }
-            0x0e | 0x20 => {
+            0x01 | 0x03..=0x0b | 0x0e | 0x20 => {
                 let mut encoded = Cursor(value);
                 let number = quic_varint(&mut encoded)?;
-                if !encoded.0.is_empty() {
+                if !encoded.0.is_empty() || result.integers.iter().any(|(seen, _)| *seen == id) {
                     return None;
                 }
+                result.integers.push((id, number));
                 if id == 0x0e {
-                    if result.active_connection_id_limit.replace(number).is_some() {
-                        return None;
-                    }
-                } else if result.datagram_max_size.replace(number).is_some() {
-                    return None;
+                    result.active_connection_id_limit = Some(number);
+                } else if id == 0x20 {
+                    result.datagram_max_size = Some(number);
                 }
             }
             _ => {}
@@ -613,6 +614,7 @@ pub(crate) fn client_hello_metadata(body: &[u8]) -> Option<ClientHelloMetadata> 
         ech_extension,
         quic_transport_parameters,
         quic_transport_parameter_ids: quic_parameters.ids,
+        quic_transport_parameter_integers: quic_parameters.integers,
         quic_datagram_max_size: quic_parameters.datagram_max_size,
         quic_disable_active_migration: quic_parameters.disable_active_migration,
         quic_active_connection_id_limit: quic_parameters.active_connection_id_limit,
@@ -1012,6 +1014,25 @@ mod tests {
         assert!(parsed.disable_active_migration);
         assert_eq!(parsed.active_connection_id_limit, Some(4));
         assert_eq!(parsed.datagram_max_size, Some(1456));
+        assert_eq!(parsed.integers, [(0x0e, 4), (0x20, 1456)]);
+        let parsed = quic_transport_parameters(&[
+            0x01, 2, 0x40, 0x64, // max_idle_timeout = 100 ms
+            0x03, 2, 0x45, 0xb0, // max_udp_payload_size = 1456
+            0x04, 1, 0x20, // initial_max_data = 32
+            0x08, 1, 0x10, // initial_max_streams_bidi = 16
+            0x0b, 1, 0x19, // max_ack_delay = 25 ms
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed.integers,
+            [
+                (0x01, 100),
+                (0x03, 1456),
+                (0x04, 32),
+                (0x08, 16),
+                (0x0b, 25)
+            ]
+        );
         assert_eq!(
             quic_transport_parameters(&[]),
             Some(QuicTransportParameters::default())
@@ -1029,6 +1050,7 @@ mod tests {
         );
         assert_eq!(quic_transport_parameters(&[0x0c, 1, 0]), None);
         assert_eq!(quic_transport_parameters(&[0x0e, 2, 0, 0]), None);
+        assert_eq!(quic_transport_parameters(&[0x01, 1, 1, 0x01, 1, 2]), None);
     }
     #[test]
     fn server_hello_reports_selected_version_cipher_and_visible_alpn() {

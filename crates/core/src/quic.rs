@@ -22,6 +22,16 @@ pub const FIELDS: &[&str] = &[
     "quic.transport_parameter_ids",
     "quic.transport_parameter_ids_no_grease",
     "quic.datagram_max_size",
+    "quic.max_idle_timeout_ms",
+    "quic.max_udp_payload_size",
+    "quic.initial_max_data",
+    "quic.initial_max_stream_data_bidi_local",
+    "quic.initial_max_stream_data_bidi_remote",
+    "quic.initial_max_stream_data_uni",
+    "quic.initial_max_streams_bidi",
+    "quic.initial_max_streams_uni",
+    "quic.ack_delay_exponent",
+    "quic.max_ack_delay_ms",
     "quic.disable_active_migration",
     "quic.active_connection_id_limit",
     "quic.tls_client_legacy_version",
@@ -629,6 +639,25 @@ impl UdpStreamAnalyzer for QuicInitial {
                     field: "quic.transport_parameter_ids_no_grease",
                     value: without_grease.join(","),
                 });
+                for (id, value) in hello.quic_transport_parameter_integers {
+                    let field = match id {
+                        0x01 => "quic.max_idle_timeout_ms",
+                        0x03 => "quic.max_udp_payload_size",
+                        0x04 => "quic.initial_max_data",
+                        0x05 => "quic.initial_max_stream_data_bidi_local",
+                        0x06 => "quic.initial_max_stream_data_bidi_remote",
+                        0x07 => "quic.initial_max_stream_data_uni",
+                        0x08 => "quic.initial_max_streams_bidi",
+                        0x09 => "quic.initial_max_streams_uni",
+                        0x0a => "quic.ack_delay_exponent",
+                        0x0b => "quic.max_ack_delay_ms",
+                        _ => continue,
+                    };
+                    observations.push(Observation {
+                        field,
+                        value: value.to_string(),
+                    });
+                }
                 observations.push(Observation {
                     field: "quic.disable_active_migration",
                     value: hello.quic_disable_active_migration.to_string(),
@@ -866,7 +895,8 @@ mod tests {
         extension.extend([0xfe, 0x0d, 0, 1, 0]);
         if with_transport_parameters {
             extension.extend([
-                0, 0x39, 0, 13, 0x0f, 0, 0x1b, 0, 0x0c, 0, 0x0e, 1, 4, 0x20, 2, 0x45, 0xb0,
+                0, 0x39, 0, 16, 0x0f, 0, 0x1b, 0, 0x0c, 0, 0x0e, 1, 4, 0x20, 2, 0x45, 0xb0, 0x01,
+                1, 50,
             ]);
         }
         let mut body = vec![3, 3];
@@ -1213,11 +1243,11 @@ mod tests {
             assert_eq!(field(&result, "quic.transport_parameters"), Some("true"));
             assert_eq!(
                 field(&result, "quic.transport_parameter_ids"),
-                Some("0xf,0x1b,0xc,0xe,0x20")
+                Some("0xf,0x1b,0xc,0xe,0x20,0x1")
             );
             assert_eq!(
                 field(&result, "quic.transport_parameter_ids_no_grease"),
-                Some("0xf,0xc,0xe,0x20")
+                Some("0xf,0xc,0xe,0x20,0x1")
             );
             assert_eq!(
                 field(&result, "quic.disable_active_migration"),
@@ -1225,6 +1255,7 @@ mod tests {
             );
             assert_eq!(field(&result, "quic.active_connection_id_limit"), Some("4"));
             assert_eq!(field(&result, "quic.datagram_max_size"), Some("1456"));
+            assert_eq!(field(&result, "quic.max_idle_timeout_ms"), Some("50"));
             assert_eq!(
                 field(&result, "quic.tls_client_legacy_version"),
                 Some("0x0303")
@@ -1435,6 +1466,7 @@ mod tests {
     fn decrypts_reference_client_initial_captures() {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../references/opengfw/analyzer/udp/testdata");
+        let mut numeric_signatures = std::collections::HashSet::new();
         for (name, count, expected, groups, shares) in [
             (
                 "chrome153",
@@ -1486,6 +1518,17 @@ mod tests {
                 result = analyzer.feed(&bytes, false);
             }
             assert_eq!(field(&result, "quic.sni"), Some(expected), "{name}");
+            numeric_signatures.insert(
+                [
+                    "quic.max_idle_timeout_ms",
+                    "quic.max_udp_payload_size",
+                    "quic.initial_max_data",
+                    "quic.initial_max_streams_bidi",
+                    "quic.initial_max_streams_uni",
+                ]
+                .map(|field_name| field(&result, field_name).unwrap_or("?"))
+                .join(","),
+            );
             assert!(
                 field(&result, "quic.transport_parameter_ids")
                     .is_some_and(|ids| ids.split(',').any(|id| id == "0xf")),
@@ -1526,6 +1569,7 @@ mod tests {
                 "{name}"
             );
         }
+        assert_eq!(numeric_signatures.len(), 6);
         let read = |name: &str, index| {
             std::fs::read(base.join(format!("quic-{name}-{index}.bin"))).unwrap()
         };
@@ -1576,6 +1620,20 @@ mod tests {
             let packet = std::fs::read(base.join(format!("quic-chrome153-{index}.bin"))).unwrap();
             comparison = chrome.feed(&packet, false);
         }
+        let numeric_fields = [
+            "quic.max_idle_timeout_ms",
+            "quic.max_udp_payload_size",
+            "quic.initial_max_data",
+            "quic.initial_max_stream_data_bidi_local",
+            "quic.initial_max_stream_data_bidi_remote",
+            "quic.initial_max_stream_data_uni",
+            "quic.initial_max_streams_bidi",
+            "quic.initial_max_streams_uni",
+            "quic.ack_delay_exponent",
+            "quic.max_ack_delay_ms",
+            "quic.active_connection_id_limit",
+            "quic.datagram_max_size",
+        ];
         let capture_dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/hy2-capture");
         let mut extension_orders = HashSet::new();
@@ -1599,6 +1657,13 @@ mod tests {
             }
             assert_eq!(field(&result, "quic.alpn"), Some("h3"), "run {run}");
             assert_eq!(field(&result, "quic.sni"), Some("example.com"), "run {run}");
+            for name in numeric_fields {
+                assert_eq!(
+                    field(&result, name),
+                    field(&comparison, name),
+                    "{name} run {run}"
+                );
+            }
             for name in [
                 "quic.datagram_max_size",
                 "quic.tls_client_cipher_suites_no_grease",

@@ -50,6 +50,12 @@ Salamander 重复样本中有一轮的前两包未同时通过严格的随机外
 
 `Packet.capture_time` 保留来源：Linux NFQUEUE 有 `NFQA_TIMESTAMP` 时用内核包时间，否则用独立接收线程刚收到包时的单调时钟。`time_source` 为 `kernel`、`receive` 或 `none`。不同来源、缺失时间或时间倒退时，相应间隔记为 `?`，数值比较不会匹配。接收线程时间包含内核排队延迟，不能当作真实线上间隔；内核时间戳也受抓包点、时钟及转发路径影响。现阶段不把这些时间字段固化成协议判定阈值，先用带标签抓包校准。
 
+## QUIC 传输参数数值
+
+公开 Initial 可解析客户端传输参数的整数值。`quic.max_idle_timeout_ms`、`max_udp_payload_size`、各项 `initial_max_*`、`ack_delay_exponent` 和 `max_ack_delay_ms` 只在客户端显式提供时输出；[RFC 9000 §18.2](https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2) 定义了它们的单位和缺省语义。规则可以按范围组合这些数值，但它们是客户端声明，不是代理协议身份。
+
+本地 16 条官方 Hysteria2 默认模式 Client Initial 与一条 Chrome 153 QUIC 样本在目前提取的全部整数值上相同：例如空闲超时均为 30000 毫秒、最大 UDP 载荷均为 1472 字节、初始连接级数据上限均为 15728640 字节。另六种只读 QUIC 客户端样本的这组数值组合各不相同。前一个结果说明这批 Hysteria2 客户端不能靠传输参数值与该 Chrome 样本区分；后一个结果说明字段可以反映实现差异，但样本量不足以估计真实网络中的误报率。
+
 ## 内层复用边界
 
 `Inspect::feed_decoded` 用与逐包 TCP 路径相同的 `AnalyzerRule`、`BidirectionalAnalyzerRule` 和 `FlowRule`；单元测试已验证裸 VLESS 请求头经该入口分段输入后，原有 `vless.*` 表达式会阻断对应逻辑流。其他 HTTP/1、TLS、SOCKS、SSH 和复用协议分析器同样通过注册工厂复用。调用方必须先解密、解复用，并剥离代理封装头；当前 Linux NFQUEUE 与 Windows WinDivert 路径没有这些密钥，也不会自动得到内层明文。HTTP/3 的解码入口 `feed_http3` 单独接收 QUIC 请求流及 QPACK 状态。

@@ -44,6 +44,30 @@ fn untracked_scope(indev: u32, outdev: u32, mark: u32) -> FlowScope {
     )
 }
 
+// Several UDP datagrams can reach NFQUEUE before the first verdict allows
+// conntrack confirmation. They can carry different provisional IDs while
+// belonging to one endpoint pair, so UDP inspection uses the zone and
+// interface pair as its scope. Inspect also keys flows by both endpoints.
+fn udp_zone_scope(zone: nfq::ConntrackZone, indev: u32, outdev: u32) -> FlowScope {
+    let direction = match zone.direction {
+        nfq::ZoneDirection::Both => 0,
+        nfq::ZoneDirection::Original => 1,
+        nfq::ZoneDirection::Reply => 2,
+    };
+    let (first, second) = if indev <= outdev {
+        (indev, outdev)
+    } else {
+        (outdev, indev)
+    };
+    FlowScope(
+        (2u128 << 96)
+            | (u128::from(zone.id) << 80)
+            | (direction << 78)
+            | (u128::from(first) << 32)
+            | u128::from(second),
+    )
+}
+
 struct PacketReader {
     packets: Option<Receiver<io::Result<(nfq::Message, Instant)>>>,
     stop: Arc<AtomicBool>,
@@ -359,18 +383,40 @@ impl PacketIo for NfQueue {
                     id: ct.get_id(),
                     zone: ct.get_zone(),
                 });
-        let scope = conntrack_key.map_or_else(
-            || {
-                untracked_scope(
-                    message.get_indev(),
-                    message.get_outdev(),
-                    message.get_nfmark(),
-                )
-            },
-            conntrack::ConntrackKey::scope,
+        let parsed = rustgfw_core::packet::parse(bytes).ok();
+        let scope = if parsed
+            .as_ref()
+            .is_some_and(|packet| packet.protocol == rustgfw_core::packet::Protocol::Udp)
+        {
+            conntrack.map_or_else(
+                || {
+                    untracked_scope(
+                        message.get_indev(),
+                        message.get_outdev(),
+                        message.get_nfmark(),
+                    )
+                },
+                |ct| udp_zone_scope(ct.get_zone(), message.get_indev(), message.get_outdev()),
+            )
+        } else {
+            conntrack_key.map_or_else(
+                || {
+                    untracked_scope(
+                        message.get_indev(),
+                        message.get_outdev(),
+                        message.get_nfmark(),
+                    )
+                },
+                conntrack::ConntrackKey::scope,
+            )
+        };
+        tracing::trace!(
+            scope = scope.0,
+            conntrack = ?conntrack_key,
+            packet_len = bytes.len(),
+            "NFQUEUE packet received"
         );
-        let tcp_flags = rustgfw_core::packet::parse(bytes)
-            .ok()
+        let tcp_flags = parsed
             .filter(|p| p.protocol == rustgfw_core::packet::Protocol::Tcp)
             .map(|p| p.tcp_flags);
         let is_tcp = tcp_flags.is_some();
@@ -473,6 +519,22 @@ mod tests {
             }
             .scope()
         );
+    }
+
+    #[test]
+    fn udp_scope_survives_provisional_conntrack_id_changes() {
+        let zone = nfq::ConntrackZone::default();
+        let first = conntrack::ConntrackKey { id: 7, zone };
+        let second = conntrack::ConntrackKey { id: 9, zone };
+        assert_ne!(first.scope(), second.scope());
+        let scope = udp_zone_scope(first.zone, 0, 3);
+        assert_eq!(scope, udp_zone_scope(second.zone, 3, 0));
+        assert_ne!(scope, udp_zone_scope(zone, 0, 4));
+        assert_ne!(
+            scope,
+            udp_zone_scope(nfq::ConntrackZone { id: 1, ..zone }, 0, 3)
+        );
+        assert_ne!(scope, untracked_scope(0, 3, 0));
     }
 
     #[test]

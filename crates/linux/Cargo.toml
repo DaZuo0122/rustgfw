@@ -7,3 +7,4 @@ edition = "2024"
 rustgfw-core = { path = "../core" }
 nfq = { version = "0.2.6", features = ["ct"] }
 libc = "0.2"
+tracing = "0.1"

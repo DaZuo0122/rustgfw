@@ -16,6 +16,8 @@
 
 核心按 QUIC 变长整数解析帧长度。HEADERS 的编码块限 64 KiB；DATA 与未知扩展帧的载荷会按长度逐段跳过，不要求一次提供完整帧。
 
+同一请求流可先收到一个或多个 1xx 临时响应，再收到最终响应。1xx 上命中的 `allow` 不会锁定该流，后续最终响应仍可触发规则；`block` 仍会立即阻断。即使响应先于请求头进入核心，QPACK 解码后的回放也保留 1xx 的临时性质。请求或最终响应之后的 trailer HEADERS 不会改写原有的 `method`、`path`、`authority` 或 `status` 规则事实。此顺序依据 [RFC 9114 §4.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1)。
+
 输出示例：
 
 ```json

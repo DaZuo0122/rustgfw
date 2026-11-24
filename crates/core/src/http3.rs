@@ -17,8 +17,8 @@ pub const FIELDS: &[&str] = &[
 pub struct Http3Event {
     pub stream_id: u64,
     pub reverse: bool,
-    /// A response observed before its request can be blocked immediately, but
-    /// an Allow must wait for the request context before becoming terminal.
+    /// A response before its request or a 1xx response can block immediately,
+    /// but its Allow must not become terminal.
     pub provisional: bool,
     pub batch: ObservationBatch,
 }
@@ -33,6 +33,8 @@ struct Stream {
     kind: Option<u64>,
     first_frame: bool,
     headers_seen: bool,
+    initial_decoded: bool,
+    final_response_seen: bool,
     skip: u64,
     ignored: bool,
 }
@@ -50,7 +52,7 @@ pub struct Http3Conversation {
     streams: HashMap<(u64, bool), Stream>,
     decoders: [QpackDecoder; 2],
     requests: HashMap<u64, Vec<Observation>>,
-    early_responses: HashMap<u64, Vec<Vec<Observation>>>,
+    early_responses: HashMap<u64, Vec<(Vec<Observation>, bool)>>,
     blocked: Vec<Blocked>,
 }
 
@@ -249,6 +251,15 @@ impl Http3Conversation {
                 return Vec::new();
             }
         };
+        let state = self.streams.get_mut(&(stream_id, reverse)).unwrap();
+        if !reverse {
+            if state.initial_decoded {
+                return Vec::new();
+            }
+            state.initial_decoded = true;
+        } else if state.final_response_seen {
+            return Vec::new();
+        }
         let mut values = vec![observation("http3.stream_id", stream_id.to_string())];
         for field in fields {
             let name = match field.name.as_slice() {
@@ -275,8 +286,21 @@ impl Http3Conversation {
             };
             values.push(observation(name, value));
         }
-        let is_request = values.iter().any(|item| item.field == "http3.method");
-        let is_response = values.iter().any(|item| item.field == "http3.status");
+        let is_request = !reverse && values.iter().any(|item| item.field == "http3.method");
+        let status = values
+            .iter()
+            .find(|item| item.field == "http3.status")
+            .map(|item| item.value.as_str());
+        let is_response = reverse && status.is_some();
+        let informational = status
+            .and_then(|value| value.parse::<u16>().ok())
+            .is_some_and(|code| (100..200).contains(&code));
+        if reverse && !informational {
+            self.streams
+                .get_mut(&(stream_id, reverse))
+                .unwrap()
+                .final_response_seen = true;
+        }
         if is_request {
             self.requests.insert(stream_id, values.clone());
             let mut events = vec![Http3Event {
@@ -290,15 +314,17 @@ impl Http3Conversation {
                 },
             }];
             if let Some(responses) = self.early_responses.remove(&stream_id) {
-                events.extend(responses.into_iter().map(|observations| Http3Event {
-                    stream_id,
-                    reverse: true,
-                    provisional: false,
-                    batch: ObservationBatch {
-                        clear_fields: FIELDS,
-                        context: values.clone(),
-                        observations,
-                    },
+                events.extend(responses.into_iter().map(|(observations, informational)| {
+                    Http3Event {
+                        stream_id,
+                        reverse: true,
+                        provisional: informational,
+                        batch: ObservationBatch {
+                            clear_fields: FIELDS,
+                            context: values.clone(),
+                            observations,
+                        },
+                    }
                 }));
             }
             return events;
@@ -310,12 +336,12 @@ impl Http3Conversation {
                 if pending.len() == MAX_EARLY_RESPONSES {
                     pending.remove(0);
                 }
-                pending.push(values.clone());
+                pending.push((values.clone(), informational));
             }
             return vec![Http3Event {
                 stream_id,
                 reverse,
-                provisional: context.is_empty(),
+                provisional: context.is_empty() || informational,
                 batch: ObservationBatch {
                     clear_fields: FIELDS,
                     context,
@@ -408,6 +434,62 @@ mod tests {
         assert_eq!(value(&response0[0].context, "http3.path"), Some("/one"));
         h3.close_stream(4);
         assert!(!h3.requests.contains_key(&4));
+    }
+
+    #[test]
+    fn informational_response_replays_before_final_and_trailers_do_not_replace_headers() {
+        let mut h3 = Http3Conversation::default();
+        let mut encoder = QpackEncoder::new();
+        let request = frame(
+            1,
+            &encoder.encode_field_section(&[
+                HeaderField::new(b":method", b"GET"),
+                HeaderField::new(b":path", b"/first"),
+            ]),
+        );
+        let informational = frame(
+            1,
+            &encoder.encode_field_section(&[HeaderField::new(b":status", b"103")]),
+        );
+        let final_response = frame(
+            1,
+            &encoder.encode_field_section(&[HeaderField::new(b":status", b"403")]),
+        );
+        let early = h3.feed_events(0, true, &informational);
+        assert_eq!(early.len(), 1);
+        assert!(early[0].provisional);
+        let early = h3.feed_events(0, true, &final_response);
+        assert_eq!(early.len(), 1);
+        assert!(early[0].provisional);
+        let events = h3.feed_events(0, false, &request);
+        assert_eq!(events.len(), 3);
+        assert!(!events[0].provisional);
+        assert!(events[1].provisional);
+        assert!(!events[2].provisional);
+        assert_eq!(
+            value(&events[1].batch.observations, "http3.status"),
+            Some("103")
+        );
+        assert_eq!(
+            value(&events[2].batch.observations, "http3.status"),
+            Some("403")
+        );
+        assert_eq!(
+            value(&events[2].batch.context, "http3.path"),
+            Some("/first")
+        );
+
+        let request_trailer = frame(
+            1,
+            &encoder.encode_field_section(&[HeaderField::new(b":method", b"POST")]),
+        );
+        let response_trailer = frame(
+            1,
+            &encoder.encode_field_section(&[HeaderField::new(b":status", b"200")]),
+        );
+        assert!(h3.feed_events(0, false, &request_trailer).is_empty());
+        assert!(h3.feed_events(0, true, &response_trailer).is_empty());
+        assert_eq!(value(&h3.requests[&0], "http3.method"), Some("GET"));
     }
 
     #[test]

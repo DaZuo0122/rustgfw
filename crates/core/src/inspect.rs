@@ -1627,6 +1627,65 @@ mod tests {
     }
 
     #[test]
+    fn http3_informational_allow_does_not_hide_final_block() {
+        use compcol::{hpack::HeaderField, qpack::QpackEncoder};
+
+        let mut inspect = Inspect::with_analyzers((), Vec::new()).with_udp_streams(
+            Vec::new(),
+            vec![FlowRule::new(|context| {
+                if !context.updated("http3.status") {
+                    return None;
+                }
+                match context.get("http3.status") {
+                    Some("103") => Some(FlowAction::Allow),
+                    Some("403") => Some(FlowAction::Block),
+                    _ => None,
+                }
+            })],
+        );
+        let mut encoder = QpackEncoder::new();
+        let frame = |fields: &[HeaderField], encoder: &mut QpackEncoder| {
+            let block = encoder.encode_field_section(fields);
+            let mut bytes = vec![1, block.len() as u8];
+            bytes.extend(block);
+            bytes
+        };
+        let origin = "192.0.2.1:12345".parse().unwrap();
+        let target = "198.51.100.2:443".parse().unwrap();
+        let feed = |inspect: &mut Inspect<()>, reverse, bytes: &[u8]| {
+            inspect.feed_http3(DecodedStream {
+                scope: FlowScope(109),
+                stream_id: 0,
+                origin,
+                target,
+                reverse,
+                bytes,
+            })
+        };
+        let request = frame(
+            &[
+                HeaderField::new(b":method", b"GET"),
+                HeaderField::new(b":path", b"/probe"),
+            ],
+            &mut encoder,
+        );
+        let informational = frame(&[HeaderField::new(b":status", b"103")], &mut encoder);
+        let final_response = frame(&[HeaderField::new(b":status", b"403")], &mut encoder);
+        assert_eq!(
+            feed(&mut inspect, false, &request)[0].verdict,
+            Verdict::Accept
+        );
+        assert_eq!(
+            feed(&mut inspect, true, &informational)[0].verdict,
+            Verdict::Accept
+        );
+        assert_eq!(
+            feed(&mut inspect, true, &final_response)[0].verdict,
+            Verdict::DropFlow
+        );
+    }
+
+    #[test]
     fn http3_expression_correlates_hysteria_auth_request_and_reply() {
         use crate::conditions::{MatchRule, parse_expression};
         use compcol::{hpack::HeaderField, qpack::QpackEncoder};

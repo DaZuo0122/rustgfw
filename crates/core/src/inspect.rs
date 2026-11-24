@@ -39,8 +39,8 @@ pub struct ObservationBatch {
     /// Facts restored for this event without marking them as fresh observations.
     pub context: Vec<Observation>,
     pub observations: Vec<Observation>,
-    /// Allow rules may match this event, but must keep inspecting later events.
-    pub provisional: bool,
+    /// An `Allow` match applies only to this message; later messages are still inspected.
+    pub allow_continues: bool,
 }
 
 pub trait StreamAnalyzer {
@@ -456,7 +456,7 @@ fn evaluate_tcp_batches(
         return;
     }
     for batch in analysis.batches {
-        let provisional = batch.provisional;
+        let allow_continues = batch.allow_continues;
         let mut batch_updated = analysis.updated.clone();
         for field in batch.clear_fields {
             flow.facts.remove(field);
@@ -472,7 +472,7 @@ fn evaluate_tcp_batches(
             event.destination,
             event.payload,
             &batch_updated,
-            provisional,
+            allow_continues,
         );
         if flow.allowed || flow.blocked {
             break;
@@ -488,7 +488,7 @@ fn apply_tcp_flow_rules(
     destination: SocketAddr,
     payload: &[u8],
     updated: &[&'static str],
-    provisional: bool,
+    allow_continues: bool,
 ) {
     let context = FlowContext {
         protocol: Protocol::Tcp,
@@ -510,8 +510,9 @@ fn apply_tcp_flow_rules(
             action = action_label(&action), source = %source, destination = %destination,
             "application rule matched");
         match action {
-            FlowAction::Allow if !provisional => flow.allowed = true,
+            FlowAction::Allow if !allow_continues => flow.allowed = true,
             FlowAction::Allow => {}
+            FlowAction::AllowFlow => flow.allowed = true,
             FlowAction::Block | FlowAction::DropPacket => flow.blocked = true,
             FlowAction::ReplaceUdpPayload(_) => continue,
         }
@@ -521,8 +522,10 @@ fn apply_tcp_flow_rules(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FlowAction {
-    /// Stop application inspection for this flow; transport policy still runs.
+    /// Allow this message. Non-batched observations end application inspection.
     Allow,
+    /// Stop application inspection for the entire flow; transport policy still runs.
+    AllowFlow,
     Block,
     /// Drop only the current UDP datagram; for TCP, block the stream.
     DropPacket,
@@ -533,6 +536,7 @@ pub enum FlowAction {
 fn action_label(action: &FlowAction) -> &'static str {
     match action {
         FlowAction::Allow => "allow",
+        FlowAction::AllowFlow => "allow_flow",
         FlowAction::Block => "block",
         FlowAction::DropPacket => "drop_packet",
         FlowAction::ReplaceUdpPayload(_) => "replace_udp_payload",
@@ -1080,6 +1084,7 @@ impl<P> Inspect<P> {
                     match action {
                         FlowAction::Allow if !event.provisional => flow.allowed = true,
                         FlowAction::Allow => {}
+                        FlowAction::AllowFlow => flow.allowed = true,
                         FlowAction::Block | FlowAction::DropPacket => flow.blocked = true,
                         FlowAction::ReplaceUdpPayload(_) => continue,
                     }
@@ -1292,7 +1297,7 @@ impl<P> Inspect<P> {
                         action = action_label(&action), source = %transport.source,
                         destination = %transport.destination, "application rule matched");
                     match action {
-                        FlowAction::Allow => flow.allowed = true,
+                        FlowAction::Allow | FlowAction::AllowFlow => flow.allowed = true,
                         FlowAction::Block => {
                             flow.blocked = true;
                             tracing::info!(scope = packet.scope.0, source = %transport.source,
@@ -2075,7 +2080,7 @@ mod tests {
                 clear_fields: crate::http::FIELDS,
                 context: Vec::new(),
                 observations,
-                provisional: false,
+                allow_continues: true,
             }],
             finished,
         }
@@ -3868,6 +3873,95 @@ mod tests {
         assert_eq!(feed(&mut policy, true, &informational), Verdict::Accept);
         assert_eq!(
             feed(&mut policy, true, &frame(1, 5, 1, b"\x08\x03403")),
+            Verdict::DropFlow
+        );
+    }
+
+    #[test]
+    fn http2_allow_applies_to_one_message_unless_flow_allow_is_explicit() {
+        fn frame(stream: u32, path: &str) -> Vec<u8> {
+            let mut header = vec![0x82, 0x04, path.len() as u8];
+            header.extend(path.as_bytes());
+            let mut bytes = vec![0, 0, header.len() as u8, 1, 4];
+            bytes.extend(stream.to_be_bytes());
+            bytes.extend(header);
+            bytes
+        }
+
+        for (action, split, expected) in [
+            (FlowAction::Allow, false, Verdict::DropFlow),
+            (FlowAction::Allow, true, Verdict::DropFlow),
+            (FlowAction::AllowFlow, false, Verdict::Accept),
+            (FlowAction::AllowFlow, true, Verdict::Accept),
+        ] {
+            let mut policy = Inspect::with_analyzers((), Vec::new())
+                .with_bidirectional_analyzers(vec![BidirectionalAnalyzerRule::observing(
+                    None,
+                    || Box::<crate::http2::Http2Conversation>::default(),
+                )])
+                .with_flow_rules(vec![FlowRule::new(move |context| {
+                    if !context.updated("http2.path") {
+                        return None;
+                    }
+                    match context.get("http2.path") {
+                        Some("/allowed") => Some(action.clone()),
+                        Some("/blocked") => Some(FlowAction::Block),
+                        _ => None,
+                    }
+                })]);
+            let origin = "192.0.2.1:12345".parse().unwrap();
+            let target = "198.51.100.2:80".parse().unwrap();
+            let feed = |policy: &mut Inspect<()>, bytes: &[u8]| {
+                policy.feed_decoded(DecodedStream {
+                    scope: FlowScope(111),
+                    stream_id: 0,
+                    origin,
+                    target,
+                    reverse: false,
+                    bytes,
+                })
+            };
+            let mut first = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+            first.extend([0, 0, 0, 4, 0, 0, 0, 0, 0]);
+            first.extend(frame(1, "/allowed"));
+            if !split {
+                first.extend(frame(3, "/blocked"));
+            }
+            assert_eq!(
+                feed(&mut policy, &first),
+                if split { Verdict::Accept } else { expected }
+            );
+            if split {
+                assert_eq!(feed(&mut policy, &frame(3, "/blocked")), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn http1_allow_on_first_request_does_not_hide_pipelined_second_request() {
+        let mut policy = Inspect::with_analyzers((), Vec::new())
+            .with_bidirectional_analyzers(vec![BidirectionalAnalyzerRule::observing(None, || {
+                Box::<crate::http::HttpConversation>::default()
+            })])
+            .with_flow_rules(vec![FlowRule::new(|context| {
+                if !context.updated("http.target") {
+                    return None;
+                }
+                match context.get("http.target") {
+                    Some("/allowed") => Some(FlowAction::Allow),
+                    Some("/blocked") => Some(FlowAction::Block),
+                    _ => None,
+                }
+            })]);
+        assert_eq!(
+            policy.feed_decoded(DecodedStream {
+                scope: FlowScope(112),
+                stream_id: 0,
+                origin: "192.0.2.1:12345".parse().unwrap(),
+                target: "198.51.100.2:80".parse().unwrap(),
+                reverse: false,
+                bytes: b"GET /allowed HTTP/1.1\r\n\r\nGET /blocked HTTP/1.1\r\n\r\n",
+            }),
             Verdict::DropFlow
         );
     }

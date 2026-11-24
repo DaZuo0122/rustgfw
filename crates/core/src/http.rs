@@ -89,11 +89,6 @@ impl HttpMessages {
                             break;
                         };
                         let context = on_message(&mut message);
-                        let provisional = message.observations.iter().any(|item| {
-                            item.field == "http.status"
-                                && item.value.starts_with('1')
-                                && item.value != "101"
-                        });
                         self.header.clear();
                         self.body = message.body;
                         self.finished = !message.continue_after;
@@ -101,7 +96,7 @@ impl HttpMessages {
                             clear_fields: message.clear_fields,
                             context,
                             observations: message.observations,
-                            provisional,
+                            allow_continues: true,
                         });
                         if self.finished {
                             break;
@@ -555,9 +550,7 @@ mod tests {
         assert_eq!(target(&responses[0]), Some("/one"));
         assert_eq!(target(&responses[1]), Some("/one"));
         assert_eq!(target(&responses[2]), Some("/two"));
-        assert!(responses[0].provisional);
-        assert!(!responses[1].provisional);
-        assert!(!responses[2].provisional);
+        assert!(responses.iter().all(|batch| batch.allow_continues));
         assert!(responses.iter().all(|batch| batch.clear_fields == FIELDS));
     }
 

@@ -83,6 +83,7 @@ pub fn compile(source: &str) -> Result<Vec<MatchRule>, String> {
             }
             let action = match spec.action.as_str() {
                 "allow" => FlowAction::Allow,
+                "allow_flow" => FlowAction::AllowFlow,
                 "block" => FlowAction::Block,
                 "drop_packet" => FlowAction::DropPacket,
                 "replace_udp_payload" => {
@@ -164,6 +165,11 @@ mod tests {
             .unwrap()
         );
         assert!(rules[1].condition.references_field("tls.sni"));
+        let flow_allow = compile(
+            r#"{"rules":[{"name":"trusted carrier","expr":"http2.path == /trusted","action":"allow_flow"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(flow_allow[0].action, FlowAction::AllowFlow);
 
         let presence = compile(
             r#"{"rules":[{"name":"data","expr":"wireguard.type exists && payload.len >= 32 && dst.port != 53","action":"drop_packet"}]}"#,

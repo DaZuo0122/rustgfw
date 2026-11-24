@@ -150,4 +150,4 @@ HTTP/3 的标准 ALPN 是 `h3`。表达式 `quic.alpn == h3 && quic.transport_pa
 
 UDP 分析器拒绝数据报时，该包直接丢弃，本次不再用流内旧观察值执行表达式规则；后续数据报仍可继续检查。
 
-动作有 `allow`、`block`、`drop_packet`、`replace_udp_payload`。`allow` 和 `block` 结束该流的应用层检查；`drop_packet` 只丢当前 UDP 数据报，在 TCP 上阻断整个流。`replace_udp_payload` 只用于 UDP，在 TCP 上继续尝试后续规则。修改内容可用 `replacement` 指定 UTF-8 文本，或用 `replacement_hex` 指定十六进制字节，两者选一个。内核静态卸载仅处理传输层规则；表达式规则由用户态引擎执行。
+动作有 `allow`、`allow_flow`、`block`、`drop_packet`、`replace_udp_payload`。TCP 分析器按消息产出批次时，`allow` 只接受当前消息，后续 HTTP 请求、HTTP/2 stream、DNS 消息或 mux 子流仍会检查；在非批次观察、UDP 流和 HTTP/3 请求流上，`allow` 仍结束该流的应用层检查。`allow_flow` 显式结束整条 TCP 连接或当前 UDP/HTTP/3 流的应用层检查。`block` 在原始 TCP 载体上阻断整条连接，不能只丢其中一个 HTTP/2 或 mux 子流；解码流入口的阻断由接入方按其逻辑流处理。`drop_packet` 只丢当前 UDP 数据报，在 TCP 上阻断整个流。`replace_udp_payload` 只用于 UDP，在 TCP 上继续尝试后续规则。修改内容可用 `replacement` 指定 UTF-8 文本，或用 `replacement_hex` 指定十六进制字节，两者选一个。内核静态卸载仅处理传输层规则；表达式规则由用户态引擎执行。

@@ -149,7 +149,7 @@ impl SingMuxH2 {
                     value: self.selector.padding.to_string(),
                 },
             ],
-            provisional: false,
+            allow_continues: true,
         }
     }
 
@@ -212,7 +212,7 @@ impl SingMuxH2 {
             clear_fields: H2_STREAM_FIELDS,
             context: state.headers.clone(),
             observations,
-            provisional: false,
+            allow_continues: true,
         })
     }
 }

@@ -110,12 +110,6 @@ impl Http2Conversation {
         }
         let is_request = values.iter().any(|item| item.field == "http2.method");
         let is_response = values.iter().any(|item| item.field == "http2.status");
-        let provisional = values.iter().any(|item| {
-            item.field == "http2.status"
-                && item.value.len() == 3
-                && item.value.starts_with('1')
-                && item.value != "101"
-        });
         if is_request {
             if !self.requests.contains_key(&block.stream) && self.requests.len() == MAX_STREAMS {
                 return Err(());
@@ -138,7 +132,7 @@ impl Http2Conversation {
             clear_fields: FIELDS,
             context,
             observations: values,
-            provisional,
+            allow_continues: true,
         }))
     }
 
@@ -463,12 +457,17 @@ mod tests {
         let mut server = frame(4, 0, 0, &[]);
         server.extend(frame(1, 4, 1, b"\x08\x03103"));
         let interim = batches(analyzer.feed(&server, true));
-        assert!(interim[0].provisional);
+        assert!(interim[0].allow_continues);
+        assert_eq!(value(&interim[0].observations, "http2.status"), Some("103"));
         assert_eq!(value(&interim[0].context, "http2.path"), Some("/probe"));
         assert!(analyzer.requests.contains_key(&1));
 
         let final_response = batches(analyzer.feed(&frame(1, 5, 1, b"\x08\x03403"), true));
-        assert!(!final_response[0].provisional);
+        assert!(final_response[0].allow_continues);
+        assert_eq!(
+            value(&final_response[0].observations, "http2.status"),
+            Some("403")
+        );
         assert_eq!(
             value(&final_response[0].context, "http2.path"),
             Some("/probe")

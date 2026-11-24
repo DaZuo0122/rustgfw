@@ -113,7 +113,7 @@ impl MuxCool {
             clear_fields: FIELDS,
             context,
             observations: values,
-            provisional: false,
+            allow_continues: true,
         }))
     }
 

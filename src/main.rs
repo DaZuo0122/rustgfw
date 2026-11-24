@@ -206,7 +206,9 @@ impl Options {
                 FlowAction::DropPacket => rule
                     .condition
                     .can_match_protocol(Protocol::Tcp, &observation_field_possible),
-                FlowAction::Allow | FlowAction::ReplaceUdpPayload(_) => false,
+                FlowAction::Allow | FlowAction::AllowFlow | FlowAction::ReplaceUdpPayload(_) => {
+                    false
+                }
             })
     }
 

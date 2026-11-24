@@ -11,7 +11,7 @@ QUICstep 的实验实现正好覆盖这个场景：通过 WireGuard 隧道传送
 ## 引擎处理
 
 - **逐包路径**：仍按 `FlowScope` 与 UDP 五元组隔离状态。迁移后首次出现的新五元组从新状态开始；不会仅凭可见连接 ID 继承旧路径的 `Allow`、`Block` 或解析事实。UDP 的 `DropFlow` 目前由用户态逐包执行，内核卸载不会跨五元组沿用旧判定。
-- **已解密流路径**：QUIC 解码接入方必须在连接迁移后继续使用同一个 `FlowScope`，并保持 QUIC stream ID。每次 `DecodedStream` 的 `origin`、`target` 提供该次输入所属路径的端点；规则里的 `source`、`destination` 随路径变化，`origin`、`target` 保留首次建流端点。HTTP/3 请求事实、QPACK 表和逐流裁决继续属于原连接。接入方负责认证包、关联连接 ID、处理路径验证和阻断执行。
+- **已解密流路径**：QUIC 解码接入方必须在连接迁移后继续使用同一个 `FlowScope`，并保持 QUIC stream ID。每次 `DecodedStream` 的 `origin`、`target` 提供该次输入所属路径的端点；规则里的 `source`、`destination` 随路径变化，`origin`、`target` 保留该请求流首次输入时的端点，包括 HEADERS 因 QPACK 等待、迁移后才被解码的情况。HTTP/3 请求事实、QPACK 表和逐流裁决继续属于原连接。接入方负责认证包、关联连接 ID、处理路径验证和阻断执行。
 - **没有解码接入方时**：可以用传输层目标或其他可见元数据做保守策略，但不能声称按 SNI/HTTP/3 内容准确识别 QUICstep 一类隐藏握手后的流量。短首部固定 bit 只能用作候选特征，不能用来证明连接身份或域名。
 
 后续若接入能提供已认证的连接事件，应把连接身份、当前路径与连接 ID 的增退从解码器传给核心，再决定是否向逐包路径共享判定。连接身份必须由解码器保证稳定，不能直接用 conntrack ID、五元组或任意可见连接 ID 替代。Linux 与 Windows 后端分别处理本平台的路径和卸载语义，规则层只使用上述连接身份与当前端点。

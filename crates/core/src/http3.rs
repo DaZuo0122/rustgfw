@@ -84,6 +84,10 @@ fn observation(field: &'static str, value: impl Into<String>) -> Observation {
 }
 
 impl Http3Conversation {
+    pub(crate) fn tracks_stream(&self, stream_id: u64, reverse: bool) -> bool {
+        self.streams.contains_key(&(stream_id, reverse))
+    }
+
     /// Feed one contiguous chunk from a QUIC stream. Stream IDs follow RFC 9000.
     pub fn feed(&mut self, stream_id: u64, reverse: bool, bytes: &[u8]) -> Analysis {
         let batches = self

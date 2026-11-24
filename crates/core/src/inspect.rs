@@ -177,6 +177,7 @@ struct Http3Flow {
 }
 struct Http3Connection {
     analyzer: Http3Conversation,
+    stream_origins: HashMap<u64, (SocketAddr, SocketAddr)>,
     seen: Instant,
 }
 impl UdpFlow {
@@ -984,12 +985,23 @@ impl<P> Inspect<P> {
             .entry(input.scope)
             .or_insert_with(|| Http3Connection {
                 analyzer: Http3Conversation::default(),
+                stream_origins: HashMap::new(),
                 seen: now,
             });
         connection.seen = now;
         let events = connection
             .analyzer
             .feed_events(input.stream_id, input.reverse, input.bytes);
+        if input.stream_id & 3 == 0
+            && connection
+                .analyzer
+                .tracks_stream(input.stream_id, input.reverse)
+        {
+            connection
+                .stream_origins
+                .entry(input.stream_id)
+                .or_insert((input.origin, input.target));
+        }
         let mut decisions = Vec::new();
         for event in events {
             let key = (input.scope, event.stream_id);
@@ -1007,9 +1019,14 @@ impl<P> Inspect<P> {
                 });
                 continue;
             }
+            let (origin, target) = self.http3_connections[&input.scope]
+                .stream_origins
+                .get(&event.stream_id)
+                .copied()
+                .unwrap_or((input.origin, input.target));
             let flow = self.http3_flows.entry(key).or_insert_with(|| Http3Flow {
-                origin: input.origin,
-                target: input.target,
+                origin,
+                target,
                 facts: HashMap::new(),
                 allowed: false,
                 blocked: false,
@@ -1093,6 +1110,7 @@ impl<P> Inspect<P> {
         self.http3_flows.remove(&(scope, stream_id));
         if let Some(connection) = self.http3_connections.get_mut(&scope) {
             connection.analyzer.close_stream(stream_id);
+            connection.stream_origins.remove(&stream_id);
         }
     }
 
@@ -1920,6 +1938,64 @@ mod tests {
         updates.extend(encoded.encoder_stream);
         assert_eq!(
             feed(&mut inspect, 2, &updates),
+            vec![DecodedVerdict {
+                stream_id: 0,
+                verdict: Verdict::DropFlow,
+            }]
+        );
+    }
+
+    #[test]
+    fn http3_qpack_unblock_after_migration_keeps_request_origin() {
+        use compcol::{hpack::HeaderField, qpack::QpackEncoder};
+
+        let old_client = "192.0.2.1:12345".parse().unwrap();
+        let old_server = "198.51.100.2:443".parse().unwrap();
+        let new_client = "192.0.2.9:54321".parse().unwrap();
+        let new_server = "198.51.100.8:443".parse().unwrap();
+        let mut inspect = Inspect::with_analyzers((), Vec::new()).with_udp_streams(
+            Vec::new(),
+            vec![FlowRule::new(move |context| {
+                (context.updated("http3.authority")
+                    && context.get("http3.authority") == Some("blocked.test")
+                    && context.origin == old_client
+                    && context.target == old_server
+                    && context.source == new_client
+                    && context.destination == new_server)
+                    .then_some(FlowAction::Block)
+            })],
+        );
+        let mut encoder = QpackEncoder::with_dynamic_table(512);
+        let encoded = encoder.encode(&[
+            HeaderField::new(b":method", b"GET"),
+            HeaderField::new(b":authority", b"blocked.test"),
+        ]);
+        assert!(!encoded.encoder_stream.is_empty());
+        let mut request = vec![1, encoded.field_section.len() as u8];
+        request.extend(encoded.field_section);
+        assert!(
+            inspect
+                .feed_http3(DecodedStream {
+                    scope: FlowScope(97),
+                    stream_id: 0,
+                    origin: old_client,
+                    target: old_server,
+                    reverse: false,
+                    bytes: &request,
+                })
+                .is_empty()
+        );
+        let mut updates = vec![2];
+        updates.extend(encoded.encoder_stream);
+        assert_eq!(
+            inspect.feed_http3(DecodedStream {
+                scope: FlowScope(97),
+                stream_id: 2,
+                origin: new_client,
+                target: new_server,
+                reverse: false,
+                bytes: &updates,
+            }),
             vec![DecodedVerdict {
                 stream_id: 0,
                 verdict: Verdict::DropFlow,

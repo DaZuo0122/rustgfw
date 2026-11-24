@@ -2180,6 +2180,68 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the local official Hysteria2 NAT rebinding capture"]
+    fn migrated_quic_path_starts_new_udp_shape_state() {
+        use crate::{
+            conditions::{MatchRule, parse_expression},
+            udp_shape::UdpShape,
+        };
+
+        let capture = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/hy2-capture/local-migrated-session.bin"),
+        )
+        .unwrap();
+        assert_eq!(&capture[..5], b"HY2M\x01");
+        let count = u16::from_be_bytes(capture[5..7].try_into().unwrap());
+        let rule = MatchRule {
+            condition: parse_expression(
+                "udp_shape.packet_count == 4 && fresh.udp_shape.short_header_fixed_bit_packets == 4",
+            )
+            .unwrap(),
+            action: FlowAction::DropPacket,
+        };
+        let mut policy =
+            Inspect::with_analyzers(crate::ConstantPolicy(Verdict::Accept), Vec::new())
+                .with_udp_streams(
+                    vec![UdpStreamRule::new(None, || Box::new(UdpShape::default()))],
+                    vec![rule.into_flow_rule()],
+                );
+        let mut cursor = 7;
+        let mut old_packets = 0;
+        let mut new_packets = 0;
+        for _ in 0..count {
+            let reverse = capture[cursor] == 1;
+            let path = capture[cursor + 1];
+            cursor += 2;
+            let length =
+                u16::from_be_bytes(capture[cursor..cursor + 2].try_into().unwrap()) as usize;
+            cursor += 2;
+            let mut packet = udp(&capture[cursor..cursor + length], reverse);
+            cursor += length;
+            if path == 1 {
+                let port = if reverse { 22 } else { 20 };
+                packet[port..port + 2].copy_from_slice(&12346u16.to_be_bytes());
+                new_packets += 1;
+            } else {
+                old_packets += 1;
+            }
+            let verdict = evaluate_bytes(&mut policy, &packet);
+            assert_eq!(
+                verdict,
+                if path == 1 && new_packets == 4 {
+                    Verdict::Drop
+                } else {
+                    Verdict::Accept
+                },
+                "path {path}, new packet {new_packets}"
+            );
+        }
+        assert_eq!(cursor, capture.len());
+        assert!(old_packets >= 8 && new_packets >= 4);
+    }
+
+    #[test]
     fn udp_stream_analyzer_combines_request_and_reverse_reply_per_scope() {
         struct Exchange {
             requested: bool,

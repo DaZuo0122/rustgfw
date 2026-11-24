@@ -58,6 +58,8 @@ Salamander 重复样本中有一轮的前两包未同时通过严格的随机外
 
 用 aioquic 1.9.1 在本机完成一条普通 HTTP/3 GET，请求得到 200 和预期正文；双向抓包只保存在 Git 忽略目录。客户端前两个 UDP 数据报均为 1200 字节，握手后出现短首部形态。相同环境下官方 Hysteria2 v2.14.0 默认客户端的前两个数据报为 1250 字节，后续同样出现短首部形态。选择性测试确认普通 HTTP/3 样本也能解出 `h3`、SNI 和 transport parameters。两条连接来自不同 QUIC 实现，包长差异可能只是实现或配置差异，不能由这一组样本推断 Hysteria2 的检出率或误报率。
 
+同一 [aioquic HTTP/3 客户端](https://github.com/aiortc/aioquic/blob/main/examples/http3_client.py) 在首次连接取得会话票据后，以 0-RTT 再发一次 GET；本机测试中请求在握手完成前送出、服务端接受早期数据且返回 200。两次连接的线缆抓包均只保存在 Git 忽略目录。选择性测试验证：首次连接的 `udp_shape.quic_zero_rtt_shape_datagrams` 为 0，恢复连接在前 8 个数据报内至少出现一次 0-RTT 长首部形态；`QuicInitial` 对两次连接仍可解出 `h3`、SNI 和 transport parameters。该形态字段只观察公开包头，无法验证 0-RTT 是否被接受或读取早期数据；接受事实来自受控客户端测试结果。
+
 ## 内层复用边界
 
 `Inspect::feed_decoded` 用与逐包 TCP 路径相同的 `AnalyzerRule`、`BidirectionalAnalyzerRule` 和 `FlowRule`；单元测试已验证裸 VLESS 请求头经该入口分段输入后，原有 `vless.*` 表达式会阻断对应逻辑流。其他 HTTP/1、TLS、SOCKS、SSH 和复用协议分析器同样通过注册工厂复用。调用方必须先解密、解复用，并剥离代理封装头；当前 Linux NFQUEUE 与 Windows WinDivert 路径没有这些密钥，也不会自动得到内层明文。HTTP/3 的解码入口 `feed_http3` 单独接收 QUIC 请求流及 QPACK 状态。

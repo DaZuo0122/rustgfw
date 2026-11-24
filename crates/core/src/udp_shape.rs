@@ -671,6 +671,39 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires locally captured ordinary HTTP/3 and resumed 0-RTT sessions"]
+    fn local_http3_resumption_exposes_zero_rtt_shape() {
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/hy2-capture");
+        let count_zero_rtt = |name| {
+            let capture = std::fs::read(base.join(name)).unwrap();
+            assert_eq!(&capture[..4], b"H3B1");
+            let count = u16::from_be_bytes(capture[4..6].try_into().unwrap());
+            let mut cursor = 6;
+            let mut shape = UdpShape::default();
+            let mut observed = Vec::new();
+            for index in 0..count {
+                let reverse = capture[cursor] == 1;
+                let length =
+                    u16::from_be_bytes(capture[cursor + 9..cursor + 11].try_into().unwrap())
+                        as usize;
+                cursor += 11;
+                if index < MAX_PACKETS as u16 {
+                    observed = values(shape.feed(&capture[cursor..cursor + length], reverse));
+                }
+                cursor += length;
+            }
+            assert_eq!(cursor, capture.len());
+            field(&observed, "udp_shape.quic_zero_rtt_shape_datagrams")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+        };
+        assert_eq!(count_zero_rtt("h3-baseline.bin"), 0);
+        assert!(count_zero_rtt("h3-zero-rtt.bin") >= 1);
+    }
+
+    #[test]
     #[ignore = "requires the read-only OpenGFW QUIC capture fixtures"]
     fn real_quic_initials_do_not_trigger_fragment_candidate() {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

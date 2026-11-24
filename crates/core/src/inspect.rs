@@ -39,6 +39,8 @@ pub struct ObservationBatch {
     /// Facts restored for this event without marking them as fresh observations.
     pub context: Vec<Observation>,
     pub observations: Vec<Observation>,
+    /// Allow rules may match this event, but must keep inspecting later events.
+    pub provisional: bool,
 }
 
 pub trait StreamAnalyzer {
@@ -449,10 +451,12 @@ fn evaluate_tcp_batches(
             event.destination,
             event.payload,
             &analysis.updated,
+            false,
         );
         return;
     }
     for batch in analysis.batches {
+        let provisional = batch.provisional;
         let mut batch_updated = analysis.updated.clone();
         for field in batch.clear_fields {
             flow.facts.remove(field);
@@ -468,6 +472,7 @@ fn evaluate_tcp_batches(
             event.destination,
             event.payload,
             &batch_updated,
+            provisional,
         );
         if flow.allowed || flow.blocked {
             break;
@@ -483,6 +488,7 @@ fn apply_tcp_flow_rules(
     destination: SocketAddr,
     payload: &[u8],
     updated: &[&'static str],
+    provisional: bool,
 ) {
     let context = FlowContext {
         protocol: Protocol::Tcp,
@@ -504,7 +510,8 @@ fn apply_tcp_flow_rules(
             action = action_label(&action), source = %source, destination = %destination,
             "application rule matched");
         match action {
-            FlowAction::Allow => flow.allowed = true,
+            FlowAction::Allow if !provisional => flow.allowed = true,
+            FlowAction::Allow => {}
             FlowAction::Block | FlowAction::DropPacket => flow.blocked = true,
             FlowAction::ReplaceUdpPayload(_) => continue,
         }
@@ -2068,6 +2075,7 @@ mod tests {
                 clear_fields: crate::http::FIELDS,
                 context: Vec::new(),
                 observations,
+                provisional: false,
             }],
             finished,
         }
@@ -3810,6 +3818,56 @@ mod tests {
                 reverse: false,
                 bytes: &data,
             }),
+            Verdict::DropFlow
+        );
+    }
+
+    #[test]
+    fn http2_informational_allow_does_not_hide_final_block() {
+        fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+            let mut bytes = vec![0, 0, payload.len() as u8, kind, flags];
+            bytes.extend(stream.to_be_bytes());
+            bytes.extend(payload);
+            bytes
+        }
+
+        let mut policy = Inspect::with_analyzers((), Vec::new())
+            .with_bidirectional_analyzers(vec![BidirectionalAnalyzerRule::observing(None, || {
+                Box::<crate::http2::Http2Conversation>::default()
+            })])
+            .with_flow_rules(vec![FlowRule::new(|context| {
+                if !context.updated("http2.status") || context.get("http2.path") != Some("/probe") {
+                    return None;
+                }
+                match context.get("http2.status") {
+                    Some("103") => Some(FlowAction::Allow),
+                    Some("403") => Some(FlowAction::Block),
+                    _ => None,
+                }
+            })]);
+        let origin = "192.0.2.1:12345".parse().unwrap();
+        let target = "198.51.100.2:443".parse().unwrap();
+        let feed = |policy: &mut Inspect<()>, reverse, bytes: &[u8]| {
+            policy.feed_decoded(DecodedStream {
+                scope: FlowScope(110),
+                stream_id: 1,
+                origin,
+                target,
+                reverse,
+                bytes,
+            })
+        };
+
+        let mut request = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        request.extend(frame(4, 0, 0, &[]));
+        request.extend(frame(1, 4, 1, b"\x82\x04\x06/probe"));
+        assert_eq!(feed(&mut policy, false, &request), Verdict::Accept);
+
+        let mut informational = frame(4, 0, 0, &[]);
+        informational.extend(frame(1, 4, 1, b"\x08\x03103"));
+        assert_eq!(feed(&mut policy, true, &informational), Verdict::Accept);
+        assert_eq!(
+            feed(&mut policy, true, &frame(1, 5, 1, b"\x08\x03403")),
             Verdict::DropFlow
         );
     }

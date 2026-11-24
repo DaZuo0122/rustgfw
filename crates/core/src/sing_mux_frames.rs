@@ -154,6 +154,7 @@ impl SingMuxFrames {
                 ),
                 observation("sing_mux.padding", self.selector.padding.to_string()),
             ],
+            provisional: false,
         }
     }
 
@@ -187,6 +188,7 @@ impl SingMuxFrames {
             clear_fields: FIELDS,
             context,
             observations,
+            provisional: false,
         }
     }
 }

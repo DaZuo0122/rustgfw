@@ -311,6 +311,7 @@ impl Http3Conversation {
                     clear_fields: FIELDS,
                     context: Vec::new(),
                     observations: values.clone(),
+                    provisional: false,
                 },
             }];
             if let Some(responses) = self.early_responses.remove(&stream_id) {
@@ -323,6 +324,7 @@ impl Http3Conversation {
                             clear_fields: FIELDS,
                             context: values.clone(),
                             observations,
+                            provisional: false,
                         },
                     }
                 }));
@@ -346,6 +348,7 @@ impl Http3Conversation {
                     clear_fields: FIELDS,
                     context,
                     observations: values,
+                    provisional: false,
                 },
             }];
         }

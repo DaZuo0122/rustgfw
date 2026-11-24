@@ -24,6 +24,10 @@ TCP 序列按照**包到达顺序**记录，不是 TCP 重组后的字节块大�
 
 `UdpShape` 在按需启用时观察同一 UDP 端点对的前 8 个数据报。它记录首包长度、前 64 字节的平均置位数、可打印字符比例与 Shannon 熵，以及相对首包方向的有符号包长序列、首次反向前的同向包数和累计字节数。`udp_shape.first_quic_initial_shape` 只检查 v1/v2 Initial 的可见头部形状，不进行 QUIC AEAD 验证；需要验证公开 Initial 时继续使用 `quic.*`。
 
+`udp_shape.short_header_form_packets` 计数首字节最高位为 0、长度至少 18 字节的数据报；`short_header_fixed_bit_packets` 进一步要求首字节次高位为 1。二者只读取每个数据报的第一个字节，前者覆盖 [RFC 9287](https://www.rfc-editor.org/rfc/rfc9287.html) 协商后 fixed bit 变为 0 的情况，后者对应 [RFC 9000 §17.3.1](https://www.rfc-editor.org/rfc/rfc9000.html#section-17.3.1) 的普通短首部外形。两者都不校验连接 ID、包号或 AEAD；其他 UDP 协议也可能具有同样的首字节。对 [QUICstep](https://arxiv.org/html/2304.01073) 一类只在直连侧看到短首部的路径，可用这些计数和包长、方向、时间字段做候选观察，不能用它们把新五元组绑定到旧连接。
+
+在本机用官方 Hysteria2 v2.14.0 客户端、服务端和 UDP 转发器完成的一条默认模式连接中，客户端成功认证；握手后连续 8 个双向数据报均符合上述两项短首部计数。可选测试从保存在 Git 忽略目录的完整会话抓包中截取这段数据并验证 8/8。这个实验没有改变路径或连接 ID，因此只能验证真实 QUIC 数据报的字段行为，不能当成迁移识别率。
+
 DTLS 的 epoch 0 握手也有可见外层结构；需要区分它与随机外观 UDP 候选时使用 `dtls.*`。`DtlsHello` 可在分片跨多个数据报时重组 ClientHello，提取 SNI、ALPN、扩展序列及 cookie 交换事实；这些字段描述载体握手，不指认其内部隧道应用。
 
 QUIC v1/v2 客户端 Initial 中，`quic.transport_parameter_ids` 保存 ClientHello transport parameters 的线缆顺序，`_no_grease` 版本删去 RFC 9000 的保留 ID。`disable_active_migration` 与 `active_connection_id_limit` 是客户端声明；它们可与 ALPN、TLS 扩展序列及 UDP 包形态组合，不代表后续迁移已经发生。

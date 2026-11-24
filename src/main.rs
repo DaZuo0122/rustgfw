@@ -1157,6 +1157,46 @@ mod tests {
     }
 
     #[test]
+    fn udp_short_header_shape_expression_counts_initial_datagrams() {
+        use rustgfw_core::{FlowScope, Packet, Policy};
+
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[{"name":"short header shape","expr":"proto == udp && udp_shape.packet_count == 4 && fresh.udp_shape.short_header_fixed_bit_packets >= 4","action":"drop_packet"}]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let mut packet = vec![0; 28 + 40];
+        let packet_len = packet.len() as u16;
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&packet_len.to_be_bytes());
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        packet[16..20].copy_from_slice(&[198, 51, 100, 2]);
+        packet[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&443u16.to_be_bytes());
+        packet[24..26].copy_from_slice(&48u16.to_be_bytes());
+        packet[28] = 0x43;
+        for expected in [
+            Verdict::Accept,
+            Verdict::Accept,
+            Verdict::Accept,
+            Verdict::Drop,
+        ] {
+            assert_eq!(
+                policy.evaluate(Packet {
+                    bytes: &packet,
+                    original_len: packet.len(),
+                    checksum_ready: true,
+                    scope: FlowScope::default(),
+                    capture_time: None,
+                }),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn wireguard_expression_correlates_directions_without_stale_fields() {
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(

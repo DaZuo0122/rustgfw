@@ -14,6 +14,8 @@ pub const FIELDS: &[&str] = &[
     "udp_shape.first_quic_initial_shape",
     "udp_shape.signed_lengths",
     "udp_shape.packet_count",
+    "udp_shape.short_header_form_packets",
+    "udp_shape.short_header_fixed_bit_packets",
     "udp_shape.origin_first_run",
     "udp_shape.origin_first_bytes",
     "udp_shape.origin_first_varied_lengths",
@@ -33,6 +35,8 @@ const MAX_PACKETS: usize = 8;
 #[derive(Default)]
 pub struct UdpShape {
     lengths: Vec<i64>,
+    short_header_form_packets: usize,
+    short_header_fixed_bit_packets: usize,
     first_quic: bool,
     origin_first_run: usize,
     origin_first_bytes: usize,
@@ -145,6 +149,15 @@ impl UdpStreamAnalyzer for UdpShape {
             }
         }
         let length = payload.len() as i64;
+        if payload.len() >= 18 {
+            let first_byte = payload[0];
+            if first_byte & 0x80 == 0 {
+                self.short_header_form_packets += 1;
+                if first_byte & 0x40 != 0 {
+                    self.short_header_fixed_bit_packets += 1;
+                }
+            }
+        }
         self.lengths.push(if reverse { -length } else { length });
         for (field, value) in [
             ("udp_shape.gaps_us", self.gaps.join(",")),
@@ -157,6 +170,14 @@ impl UdpStreamAnalyzer for UdpShape {
                     .join(","),
             ),
             ("udp_shape.packet_count", self.lengths.len().to_string()),
+            (
+                "udp_shape.short_header_form_packets",
+                self.short_header_form_packets.to_string(),
+            ),
+            (
+                "udp_shape.short_header_fixed_bit_packets",
+                self.short_header_fixed_bit_packets.to_string(),
+            ),
             (
                 "udp_shape.origin_first_run",
                 self.origin_first_run.to_string(),
@@ -307,6 +328,57 @@ mod tests {
         );
         assert_eq!(field(&observed, "udp_shape.gaps_us"), Some("3000,16000"));
         assert_eq!(field(&observed, "udp_shape.time_source"), Some("kernel"));
+    }
+
+    #[test]
+    fn short_header_form_and_greased_fixed_bit_are_separate() {
+        let mut shape = UdpShape::default();
+        let packet = |first, length| {
+            let mut bytes = vec![0x5a; length];
+            bytes[0] = first;
+            bytes
+        };
+        let observed = values(shape.feed(&packet(0x43, 40), false));
+        assert_eq!(
+            field(&observed, "udp_shape.short_header_form_packets"),
+            Some("1")
+        );
+        assert_eq!(
+            field(&observed, "udp_shape.short_header_fixed_bit_packets"),
+            Some("1")
+        );
+        let observed = values(shape.feed(&packet(0x03, 40), false));
+        assert_eq!(
+            field(&observed, "udp_shape.short_header_form_packets"),
+            Some("2")
+        );
+        assert_eq!(
+            field(&observed, "udp_shape.short_header_fixed_bit_packets"),
+            Some("1")
+        );
+        let observed = values(shape.feed(&packet(0xc3, 40), false));
+        assert_eq!(
+            field(&observed, "udp_shape.short_header_form_packets"),
+            Some("2")
+        );
+        assert_eq!(
+            field(&observed, "udp_shape.short_header_fixed_bit_packets"),
+            Some("1")
+        );
+        let observed = values(shape.feed(&packet(0x43, 17), false));
+        assert_eq!(
+            field(&observed, "udp_shape.short_header_form_packets"),
+            Some("2")
+        );
+        let observed = values(shape.feed(&packet(0x43, 40), true));
+        assert_eq!(
+            field(&observed, "udp_shape.short_header_form_packets"),
+            Some("3")
+        );
+        assert_eq!(
+            field(&observed, "udp_shape.short_header_fixed_bit_packets"),
+            Some("2")
+        );
     }
 
     #[test]
@@ -465,6 +537,59 @@ mod tests {
                 assert_eq!(candidate, expected, "{mode} run {run}");
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires a local official Hysteria2 client/server session capture"]
+    fn official_hysteria2_session_exposes_short_header_run() {
+        let capture = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/hy2-capture/local-session.bin"),
+        )
+        .unwrap();
+        assert_eq!(&capture[..5], b"HY2S\x01");
+        let count = u16::from_be_bytes(capture[5..7].try_into().unwrap());
+        let mut cursor = 7;
+        let mut packets = Vec::new();
+        for _ in 0..count {
+            let reverse = capture[cursor] != 0;
+            cursor += 1;
+            let length =
+                u16::from_be_bytes(capture[cursor..cursor + 2].try_into().unwrap()) as usize;
+            cursor += 2;
+            packets.push((reverse, &capture[cursor..cursor + length]));
+            cursor += length;
+        }
+        assert_eq!(cursor, capture.len());
+        let window = packets
+            .windows(MAX_PACKETS)
+            .find(|window| {
+                window
+                    .iter()
+                    .all(|(_, packet)| packet.len() >= 18 && packet[0] & 0xc0 == 0x40)
+            })
+            .unwrap();
+        let first_direction = window[0].0;
+        let mut shape = UdpShape::default();
+        let mut observed = Vec::new();
+        for (index, &(direction, packet)) in window.iter().enumerate() {
+            observed = values(shape.feed(packet, direction != first_direction));
+            if index == 0 {
+                assert_eq!(
+                    field(&observed, "udp_shape.first_quic_initial_shape"),
+                    Some("false")
+                );
+            }
+        }
+        assert_eq!(field(&observed, "udp_shape.packet_count"), Some("8"));
+        assert_eq!(
+            field(&observed, "udp_shape.short_header_form_packets"),
+            Some("8")
+        );
+        assert_eq!(
+            field(&observed, "udp_shape.short_header_fixed_bit_packets"),
+            Some("8")
+        );
     }
 
     #[test]

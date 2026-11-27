@@ -312,6 +312,7 @@ impl Http3Conversation {
                     context: Vec::new(),
                     observations: values.clone(),
                     allow_continues: true,
+                    end_stream: None,
                 },
             }];
             if let Some(responses) = self.early_responses.remove(&stream_id) {
@@ -325,6 +326,7 @@ impl Http3Conversation {
                             context: values.clone(),
                             observations,
                             allow_continues: true,
+                            end_stream: None,
                         },
                     }
                 }));
@@ -349,6 +351,7 @@ impl Http3Conversation {
                     context,
                     observations: values,
                     allow_continues: true,
+                    end_stream: None,
                 },
             }];
         }

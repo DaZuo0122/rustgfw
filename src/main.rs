@@ -1,11 +1,11 @@
 use rustgfw_core::{
     Verdict,
-    conditions::MatchRule,
     inspect::{
         AnalyzerRule, BidirectionalAnalyzerRule, DatagramPort, DatagramRule, InspectLimits,
         TcpPacketRule, UdpStreamRule,
     },
     packet::Protocol,
+    rule_graph::{RuleGraph, RuleNode},
     rules::{Rule, RulesLimits},
 };
 use std::time::Duration;
@@ -86,7 +86,7 @@ struct Options {
     http_hosts: Vec<String>,
     tls_sni: Vec<String>,
     dns_names: Vec<String>,
-    expr_rules: Vec<MatchRule>,
+    expr_rules: RuleGraph,
     nft_hook: Option<String>,
     ctmark: Option<u32>,
     inspect_limits: InspectLimits,
@@ -109,7 +109,7 @@ impl Options {
             http_hosts: Vec::new(),
             tls_sni: Vec::new(),
             dns_names: Vec::new(),
-            expr_rules: Vec::new(),
+            expr_rules: RuleGraph::default(),
             nft_hook: None,
             ctmark: None,
             inspect_limits: InspectLimits::default(),
@@ -196,26 +196,24 @@ impl Options {
             || !self.tls_sni.is_empty()
             || !self.dns_names.is_empty()
             || self.expr_rules.iter().any(|rule| match rule.action {
-                FlowAction::Block => {
+                Some(FlowAction::Block) => {
                     rule.condition
                         .can_match_protocol(Protocol::Tcp, &observation_field_possible)
                         || rule
                             .condition
                             .can_match_protocol(Protocol::Udp, &observation_field_possible)
                 }
-                FlowAction::DropPacket => rule
+                Some(FlowAction::DropPacket) => rule
                     .condition
                     .can_match_protocol(Protocol::Tcp, &observation_field_possible),
-                FlowAction::Allow | FlowAction::AllowFlow | FlowAction::ReplaceUdpPayload(_) => {
-                    false
-                }
+                _ => false,
             })
     }
 
     fn into_policy(self) -> rustgfw_core::inspect::Inspect<rustgfw_core::rules::Rules> {
         use rustgfw_core::{
             dns::{DnsDatagram, DnsUdp},
-            inspect::{FlowRule, Inspect},
+            inspect::Inspect,
             rules::Rules,
         };
         let http_header_bytes = self.http_header_bytes;
@@ -223,7 +221,7 @@ impl Options {
         let dns_message_bytes = self.dns_message_bytes;
         let ssh_banner_bytes = self.ssh_banner_bytes;
         let dns_names = self.dns_names;
-        let eligible = |rule: &MatchRule, protocol| {
+        let eligible = |rule: &RuleNode, protocol| {
             rule.condition
                 .can_match_protocol(protocol, &observation_field_possible)
         };
@@ -323,19 +321,6 @@ impl Options {
                     .iter()
                     .any(|field| rule.condition.references_field(field))
         });
-        let tcp_rules: Vec<FlowRule> = self
-            .expr_rules
-            .iter()
-            .filter(|rule| eligible(rule, Protocol::Tcp))
-            .cloned()
-            .map(MatchRule::into_flow_rule)
-            .collect();
-        let udp_rules: Vec<FlowRule> = self
-            .expr_rules
-            .into_iter()
-            .filter(|rule| eligible(rule, Protocol::Udp))
-            .map(MatchRule::into_flow_rule)
-            .collect();
         let analyzers = [
             if self.tls_sni.is_empty() {
                 needs_tls.then(|| {
@@ -513,8 +498,8 @@ impl Options {
             .flatten()
             .collect(),
         )
-        .with_flow_rules(tcp_rules)
-        .with_udp_streams(udp_analyzers, udp_rules)
+        .with_udp_streams(udp_analyzers, Vec::new())
+        .with_rule_graph(self.expr_rules)
     }
 }
 
@@ -741,25 +726,93 @@ mod tests {
     use super::*;
     use rustgfw_core::{FlowScope, Packet, Policy};
 
+    #[test]
+    fn dependent_rules_remember_prior_udp_packets_and_resolve_priority() {
+        let udp = |source_port: u16, payload: &[u8]| {
+            let mut bytes = vec![0; 28 + payload.len()];
+            let length = bytes.len() as u16;
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&length.to_be_bytes());
+            bytes[9] = 17;
+            bytes[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
+            bytes[20..22].copy_from_slice(&source_port.to_be_bytes());
+            bytes[22..24].copy_from_slice(&443u16.to_be_bytes());
+            bytes[24..26].copy_from_slice(&(8 + payload.len() as u16).to_be_bytes());
+            bytes[28..].copy_from_slice(payload);
+            bytes
+        };
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[
+                {"id":"drop_after_hello","requires":"hello","expr":"payload == world","action":"drop_packet","priority":5},
+                {"id":"hello","expr":"payload == hello"},
+                {"id":"allow_after_hello","requires":"hello","expr":"payload == world","action":"allow","priority":1}
+            ]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let evaluate = |policy: &mut dyn Policy, bytes: &[u8]| {
+            policy.evaluate(Packet {
+                bytes,
+                original_len: bytes.len(),
+                checksum_ready: true,
+                scope: FlowScope(7),
+                capture_time: None,
+            })
+        };
+        assert_eq!(
+            evaluate(&mut policy, &udp(12345, b"hello")),
+            Verdict::Accept
+        );
+        assert_eq!(
+            evaluate(&mut policy, &udp(12346, b"world")),
+            Verdict::Accept
+        );
+        assert_eq!(
+            evaluate(&mut policy, &udp(12345, b"world")),
+            Verdict::Accept
+        );
+
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[
+                {"id":"drop_after_hello","requires":"hello","expr":"payload == world","action":"drop_packet"},
+                {"id":"hello","expr":"payload == hello"}
+            ]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        assert_eq!(
+            evaluate(&mut policy, &udp(12345, b"hello")),
+            Verdict::Accept
+        );
+        assert_eq!(
+            evaluate(&mut policy, &udp(12346, b"world")),
+            Verdict::Accept
+        );
+        assert_eq!(evaluate(&mut policy, &udp(12345, b"world")), Verdict::Drop);
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn expression_only_flow_blocks_enable_wfp_offload() {
         let mut options = Options::parse("accept", &[]).unwrap();
         assert!(!options.needs_wfp_flow_offload());
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"TLS block","expr":"proto == tcp && tls.sni == blocked.test","action":"block"}]}"#,
+            r#"{"rules":[{"id":"tls_block","expr":"proto == tcp && tls.sni == blocked.test","action":"block"}]}"#,
         )
         .unwrap();
         assert!(options.needs_wfp_flow_offload());
 
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"UDP packet drop","expr":"proto == udp && dns.qname == blocked.test","action":"drop_packet"}]}"#,
+            r#"{"rules":[{"id":"udp_packet_drop","expr":"proto == udp && dns.qname == blocked.test","action":"drop_packet"}]}"#,
         )
         .unwrap();
         assert!(!options.needs_wfp_flow_offload());
 
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"TCP packet drop","expr":"proto == tcp && http.host == blocked.test","action":"drop_packet"}]}"#,
+            r#"{"rules":[{"id":"tcp_packet_drop","expr":"proto == tcp && http.host == blocked.test","action":"drop_packet"}]}"#,
         )
         .unwrap();
         assert!(options.needs_wfp_flow_offload());
@@ -801,7 +854,7 @@ mod tests {
         }
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"web substring","expr":"proto == tcp && http.host contains LOCKED","action":"block"}]}"#,
+            r#"{"rules":[{"id":"web_substring","expr":"proto == tcp && http.host contains LOCKED","action":"block"}]}"#,
         )
         .unwrap();
         assert_eq!(options.into_policy().evaluate(packet), Verdict::DropFlow);
@@ -811,7 +864,7 @@ mod tests {
     #[test]
     fn ssh_expression_inspects_fragmented_banner_on_nonstandard_port() {
         let rules = expr_config::compile(
-            r#"{"rules":[{"name":"ssh software","expr":"proto == tcp && fresh.ssh.software contains openssh","action":"block"}]}"#,
+            r#"{"rules":[{"id":"ssh_software","expr":"proto == tcp && fresh.ssh.software contains openssh","action":"block"}]}"#,
         )
         .unwrap();
         let tcp = |sequence: u32, payload: &[u8]| {
@@ -899,9 +952,9 @@ mod tests {
                 "blocked_dns":"proto == udp && fresh.dns.qname == blocked.test",
                 "rewrite_old":"proto == udp && payload == \"old\""
             },"rules":[
-                {"name":"blocked DNS","expr":"@blocked_dns","action":"drop_packet"},
-                {"name":"rewrite","expr":"@rewrite_old","action":"replace_udp_payload","replacement":"new"},
-                {"name":"binary","expr":"proto == udp && payload_hex starts_with 0x00ff","action":"drop_packet"}
+                {"id":"blocked_dns","expr":"@blocked_dns","action":"drop_packet"},
+                {"id":"rewrite","expr":"@rewrite_old","action":"replace_udp_payload","replacement":"new"},
+                {"id":"binary","expr":"proto == udp && payload_hex starts_with 0x00ff","action":"drop_packet"}
             ]}"#,
         )
         .unwrap();
@@ -1011,7 +1064,7 @@ mod tests {
             bytes.extend_from_slice(payload);
             bytes
         };
-        let source = r#"{"rules":[{"name":"AAAA query","expr":"proto == udp && dns.qname == example.test && dns.qtype == 28 && fresh.dns.qr == query","action":"drop_packet"},{"name":"NXDOMAIN response","expr":"proto == udp && dns.qname == example.test && fresh.dns.rcode == 3","action":"drop_packet"},{"name":"address answer","expr":"proto == udp && dns.qname == example.test && fresh.dns.answer_ipv4 in 203.0.113.0/24","action":"drop_packet"}]}"#;
+        let source = r#"{"rules":[{"id":"aaaa_query","expr":"proto == udp && dns.qname == example.test && dns.qtype == 28 && fresh.dns.qr == query","action":"drop_packet"},{"id":"nxdomain_response","expr":"proto == udp && dns.qname == example.test && fresh.dns.rcode == 3","action":"drop_packet"},{"id":"address_answer","expr":"proto == udp && dns.qname == example.test && fresh.dns.answer_ipv4 in 203.0.113.0/24","action":"drop_packet"}]}"#;
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(source).unwrap();
         let mut policy = options.into_policy();
@@ -1082,7 +1135,7 @@ mod tests {
         packet[32] = 0x50;
         packet[33] = 0x18;
         packet[40..].copy_from_slice(&payload);
-        let source = r#"{"rules":[{"name":"paired question","expr":"proto == tcp && dns.qname == blocked.test && dns.qtype == 28","action":"block"}]}"#;
+        let source = r#"{"rules":[{"id":"paired_question","expr":"proto == tcp && dns.qname == blocked.test && dns.qtype == 28","action":"block"}]}"#;
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(source).unwrap();
         let mut policy = options.into_policy();
@@ -1118,7 +1171,7 @@ mod tests {
 
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"random fragments","expr":"proto == udp && fresh.udp_shape.fragmented_random_candidate == true && udp_shape.origin_first_varied_lengths == true && udp_shape.origin_first_random_like_packets >= 2 && udp_shape.origin_first_run == 2 && udp_shape.first_entropy_milli >= 4500 && fresh.udp_shape.origin_first_span_us <= 5000","action":"drop_packet"}]}"#,
+            r#"{"rules":[{"id":"random_fragments","expr":"proto == udp && fresh.udp_shape.fragmented_random_candidate == true && udp_shape.origin_first_varied_lengths == true && udp_shape.origin_first_random_like_packets >= 2 && udp_shape.origin_first_run == 2 && udp_shape.first_entropy_milli >= 4500 && fresh.udp_shape.origin_first_span_us <= 5000","action":"drop_packet"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -1164,7 +1217,7 @@ mod tests {
 
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"short header shape","expr":"proto == udp && udp_shape.packet_count == 4 && fresh.udp_shape.short_header_fixed_bit_packets >= 4","action":"drop_packet"}]}"#,
+            r#"{"rules":[{"id":"short_header_shape","expr":"proto == udp && udp_shape.packet_count == 4 && fresh.udp_shape.short_header_fixed_bit_packets >= 4","action":"drop_packet"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -1203,8 +1256,8 @@ mod tests {
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
             r#"{"rules":[
-                {"name":"stale sender","expr":"wireguard.sender_index == 99 && wireguard.type == data","action":"block"},
-                {"name":"matched data","expr":"fresh.wireguard.receiver_matched == true && wireguard.type == data","action":"drop_packet"}
+                {"id":"stale_sender","expr":"wireguard.sender_index == 99 && wireguard.type == data","action":"block"},
+                {"id":"matched_data","expr":"fresh.wireguard.receiver_matched == true && wireguard.type == data","action":"drop_packet"}
             ]}"#,
         )
         .unwrap();
@@ -1270,8 +1323,8 @@ mod tests {
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
             r#"{"rules":[
-                {"name":"handshake","expr":"openvpn.stage == handshake && openvpn.client_reset == 7 && openvpn.server_reset == 8","action":"drop_packet"},
-                {"name":"first client data","expr":"fresh.openvpn.opcode == 6 && openvpn.tx_packets == 1 && payload.len >= 6","action":"drop_packet"}
+                {"id":"handshake","expr":"openvpn.stage == handshake && openvpn.client_reset == 7 && openvpn.server_reset == 8","action":"drop_packet"},
+                {"id":"first_client_data","expr":"fresh.openvpn.opcode == 6 && openvpn.tx_packets == 1 && payload.len >= 6","action":"drop_packet"}
             ]}"#,
         )
         .unwrap();
@@ -1324,7 +1377,7 @@ mod tests {
     fn openvpn_tcp_expression_waits_for_split_reverse_reset() {
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"openvpn tcp","expr":"proto == tcp && openvpn.stage == handshake && openvpn.client_reset == 7 && openvpn.server_reset == 8","action":"block"}]}"#,
+            r#"{"rules":[{"id":"openvpn_tcp","expr":"proto == tcp && openvpn.stage == handshake && openvpn.client_reset == 7 && openvpn.server_reset == 8","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -1387,7 +1440,7 @@ mod tests {
             r#"{"expressions":{
                 "proxy_target":"socks.target_type == domain && socks.target_host == blocked.test",
                 "socks_request":"socks.version == 5 && socks.command == connect && socks.target_port == 443"
-            },"rules":[{"name":"proxy target","expr":"proto == tcp && @proxy_target && @socks_request","action":"block"}]}"#,
+            },"rules":[{"id":"proxy_target","expr":"proto == tcp && @proxy_target && @socks_request","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -1462,7 +1515,7 @@ mod tests {
         }
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"h2 stream","expr":"http2.path == /two && fresh.http2.status == 404","action":"block"}]}"#,
+            r#"{"rules":[{"id":"h2_stream","expr":"http2.path == /two && fresh.http2.status == 404","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -1497,6 +1550,34 @@ mod tests {
             evaluate(&mut policy, &tcp(500 + server.len() as u32, &last, true)),
             Verdict::DropFlow
         );
+
+        let mut options = Options::parse("accept", &[]).unwrap();
+        options.expr_rules = expr_config::compile(
+            r#"{"rules":[
+                {"id":"error_on_requested_stream","scope":"http2.stream_id","requires":"requested","expr":"fresh.http2.status == 404","action":"block"},
+                {"id":"requested","scope":"http2.stream_id","expr":"fresh.http2.path == /one"}
+            ]}"#,
+        )
+        .unwrap();
+        let mut policy = options.into_policy();
+        let mut server_three = frame(4, 0, 0, &[]);
+        server_three.extend(frame(1, 5, 3, &[0x8d]));
+        let response_one = frame(1, 5, 1, &[0x8d]);
+        assert_eq!(
+            evaluate(&mut policy, &tcp(100, &client, false)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            evaluate(&mut policy, &tcp(500, &server_three, true)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            evaluate(
+                &mut policy,
+                &tcp(500 + server_three.len() as u32, &response_one, true),
+            ),
+            Verdict::DropFlow
+        );
     }
 
     #[test]
@@ -1519,7 +1600,7 @@ mod tests {
         }
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"mux h2 target","expr":"sing_mux.protocol == h2mux && fresh.sing_mux.host == example.org && http2.method == CONNECT && http2.authority == localhost","action":"block"}]}"#,
+            r#"{"rules":[{"id":"mux_h2_target","expr":"sing_mux.protocol == h2mux && fresh.sing_mux.host == example.org && http2.method == CONNECT && http2.authority == localhost","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -1584,7 +1665,7 @@ mod tests {
         }
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"mux target","expr":"sing_mux.protocol == smux && fresh.sing_mux.host == example.org && sing_mux.port == 443","action":"block"}]}"#,
+            r#"{"rules":[{"id":"mux_target","expr":"sing_mux.protocol == smux && fresh.sing_mux.host == example.org && sing_mux.port == 443","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -1613,7 +1694,7 @@ mod tests {
     fn tls_alpn_expression_enables_inspection_without_sni() {
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"HTTP/2 offer","expr":"proto == tcp && fresh.tls.alpn == h2 && tls.ech_extension == false && tls.client_cipher_suite == 0x1301 && tls.client_extension == 0x0010 && tls.client_supported_group == 0x001d && tls.client_signature_algorithm == 0x0804 && tls.client_key_share_group == 0x001d","action":"block"}]}"#,
+            r#"{"rules":[{"id":"http_2_offer","expr":"proto == tcp && fresh.tls.alpn == h2 && tls.ech_extension == false && tls.client_cipher_suite == 0x1301 && tls.client_extension == 0x0010 && tls.client_supported_group == 0x001d && tls.client_signature_algorithm == 0x0804 && tls.client_key_share_group == 0x001d","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -1659,7 +1740,7 @@ mod tests {
     fn tls_expression_combines_client_and_server_hello() {
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"selected TLS","expr":"proto == tcp && tls.alpn == h2 && tls.supported_version == 0x0304 && tls.ech_extension == true && fresh.tls.server_version == 0x0304 && tls.server_cipher == 0x1301","action":"block"}]}"#,
+            r#"{"rules":[{"id":"selected_tls","expr":"proto == tcp && tls.alpn == h2 && tls.supported_version == 0x0304 && tls.ech_extension == true && fresh.tls.server_version == 0x0304 && tls.server_cipher == 0x1301","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -1722,7 +1803,7 @@ mod tests {
     fn http_upgrade_rule_requires_server_selection() {
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"WebSocket upgrade","expr":"proto == tcp && http.upgrade_offer == websocket && fresh.http.upgrade_selected == websocket && fresh.http.status == 101","action":"block"}]}"#,
+            r#"{"rules":[{"id":"websocket_upgrade","expr":"proto == tcp && http.upgrade_offer == websocket && fresh.http.upgrade_selected == websocket && fresh.http.status == 101","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -1776,7 +1857,7 @@ mod tests {
     fn http_expression_combines_request_and_response_fields() {
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"failed request","expr":"proto == tcp && http.method == GET && http.target == /blocked && http.status >= 400","action":"block"}]}"#,
+            r#"{"rules":[{"id":"failed_request","expr":"proto == tcp && http.method == GET && http.target == /blocked && http.status >= 400","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -1877,7 +1958,7 @@ mod tests {
             ),
         ] {
             let source = format!(
-                r#"{{"rules":[{{"name":"paired","expr":"{expression}","action":"block"}}]}}"#
+                r#"{{"rules":[{{"id":"paired","expr":"{expression}","action":"block"}}]}}"#
             );
             let mut options = Options::parse("accept", &[]).unwrap();
             options.expr_rules = expr_config::compile(&source).unwrap();
@@ -1903,7 +1984,7 @@ mod tests {
     fn http_expression_keeps_pipelined_request_fields_together() {
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"POST target","expr":"proto == tcp && http.method == POST && http.host == blocked.test","action":"block"}]}"#,
+            r#"{"rules":[{"id":"post_target","expr":"proto == tcp && http.method == POST && http.host == blocked.test","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -1948,7 +2029,7 @@ mod tests {
     fn vless_expression_matches_fragmented_raw_request() {
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"raw VLESS target","expr":"proto == tcp && vless.candidate == true && vless.command == tcp && vless.target_host == blocked.test && vless.target_port == 443","action":"block"}]}"#,
+            r#"{"rules":[{"id":"raw_vless_target","expr":"proto == tcp && vless.candidate == true && vless.command == tcp && vless.target_host == blocked.test && vless.target_port == 443","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -1994,7 +2075,7 @@ mod tests {
 
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"inner VLESS target","expr":"proto == tcp && vless.candidate == true && vless.target_host == blocked.test","action":"block"}]}"#,
+            r#"{"rules":[{"id":"inner_vless_target","expr":"proto == tcp && vless.candidate == true && vless.target_host == blocked.test","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -2022,7 +2103,7 @@ mod tests {
     fn tcp_shape_expression_uses_raw_packets_and_ignores_retransmission() {
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"early burst","expr":"proto == tcp && tcp_shape.first_random_like == true && fet.candidate == true && tcp_shape.packet_count == 3 && tcp_shape.handshake_rtt_us == 10000 && tcp_shape.size_trigram == \"1,-2,-2\" && fresh.tcp_shape.timed_bursts == \"100,-500\" && tcp_shape.first_reply_delay_us >= 30000 && fresh.tcp_shape.last_gap_us >= 10000","action":"block"}]}"#,
+            r#"{"rules":[{"id":"early_burst","expr":"proto == tcp && tcp_shape.first_random_like == true && fet.candidate == true && tcp_shape.packet_count == 3 && tcp_shape.handshake_rtt_us == 10000 && tcp_shape.size_trigram == \"1,-2,-2\" && fresh.tcp_shape.timed_bursts == \"100,-500\" && tcp_shape.first_reply_delay_us >= 30000 && fresh.tcp_shape.last_gap_us >= 10000","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -2100,7 +2181,7 @@ mod tests {
     fn tcp_rtt_expression_uses_ack_and_three_response_rounds() {
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"rtt gap","expr":"proto == tcp && fresh.tcp_rtt.diff_us >= 40000 && tcp_rtt.completed_pairs == 3 && tcp_rtt.transport_samples == 3","action":"block"}]}"#,
+            r#"{"rules":[{"id":"rtt_gap","expr":"proto == tcp && fresh.tcp_rtt.diff_us >= 40000 && tcp_rtt.completed_pairs == 3 && tcp_rtt.transport_samples == 3","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -2176,7 +2257,7 @@ mod tests {
 
     #[test]
     fn fet_observations_combine_with_sample_length_and_port() {
-        let expression = r#"{"rules":[{"name":"candidate","expr":"proto == tcp && fet.candidate == true && fet.sample_len >= 32 && dst.port == 443","action":"block"}]}"#;
+        let expression = r#"{"rules":[{"id":"candidate","expr":"proto == tcp && fet.candidate == true && fet.sample_len >= 32 && dst.port == 443","action":"block"}]}"#;
         let tcp = |payload: &[u8]| {
             let mut bytes = vec![0; 40 + payload.len()];
             let length = bytes.len() as u16;
@@ -2217,7 +2298,7 @@ mod tests {
             r#"{"expressions":{
                 "tls_like":"fet.tls_http_prefix == true",
                 "lengths":"fresh.trojan.candidate == true && trojan.seq1 >= 200"
-            },"rules":[{"name":"length candidate","expr":"proto == tcp && dst.port == 443 && @tls_like && @lengths","action":"block"}]}"#,
+            },"rules":[{"id":"length_candidate","expr":"proto == tcp && dst.port == 443 && @tls_like && @lengths","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -2270,7 +2351,7 @@ mod tests {
 
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"DTLS SNI","expr":"proto == udp && fresh.dtls.sni == dtls.example && dtls.alpn == h2 && dtls.client_session_id_len == 0 && dtls.client_compression_methods == 0x00","action":"drop_packet"}]}"#,
+            r#"{"rules":[{"id":"dtls_sni","expr":"proto == udp && fresh.dtls.sni == dtls.example && dtls.alpn == h2 && dtls.client_session_id_len == 0 && dtls.client_compression_methods == 0x00","action":"drop_packet"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -2316,7 +2397,7 @@ mod tests {
         let payload = std::fs::read(fixture).unwrap();
         let mut options = Options::parse("accept", &[]).unwrap();
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"QUIC SNI","expr":"proto == udp && fresh.quic.sni == ngtcp2.sniff.test && quic.transport_parameter_id == 0xf && quic.disable_active_migration exists","action":"drop_packet"}]}"#,
+            r#"{"rules":[{"id":"quic_sni","expr":"proto == udp && fresh.quic.sni == ngtcp2.sniff.test && quic.transport_parameter_id == 0xf && quic.disable_active_migration exists","action":"drop_packet"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();
@@ -2352,7 +2433,7 @@ mod tests {
         let mut options = Options::parse("accept", &[]).unwrap();
         options.inspect_limits.max_flows = 0;
         options.expr_rules = expr_config::compile(
-            r#"{"rules":[{"name":"web","expr":"proto == tcp && http.host == blocked.test","action":"block"}]}"#,
+            r#"{"rules":[{"id":"web","expr":"proto == tcp && http.host == blocked.test","action":"block"}]}"#,
         )
         .unwrap();
         let mut policy = options.into_policy();

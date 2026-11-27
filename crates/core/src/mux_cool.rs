@@ -114,6 +114,7 @@ impl MuxCool {
             context,
             observations: values,
             allow_continues: true,
+            end_stream: (status == "end").then(|| ("mux_cool.session_id", id.to_string())),
         }))
     }
 

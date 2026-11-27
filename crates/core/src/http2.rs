@@ -133,6 +133,8 @@ impl Http2Conversation {
             context,
             observations: values,
             allow_continues: true,
+            end_stream: (block.end_stream && self.client != Some(direction))
+                .then(|| ("http2.stream_id", block.stream.to_string())),
         }))
     }
 

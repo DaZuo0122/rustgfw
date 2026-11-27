@@ -16,6 +16,7 @@ pub mod offload;
 pub mod openvpn;
 pub mod packet;
 pub mod quic;
+pub mod rule_graph;
 pub mod rules;
 pub mod sing_mux;
 pub mod sing_mux_frames;

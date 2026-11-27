@@ -155,6 +155,7 @@ impl SingMuxFrames {
                 observation("sing_mux.padding", self.selector.padding.to_string()),
             ],
             allow_continues: true,
+            end_stream: None,
         }
     }
 
@@ -189,6 +190,7 @@ impl SingMuxFrames {
             context,
             observations,
             allow_continues: true,
+            end_stream: closed.then(|| ("sing_mux.stream_id", frame.stream_id.to_string())),
         }
     }
 }

@@ -1,7 +1,7 @@
 {
   "rules": [
     {
-      "name": "block selected HTTP/3 authority",
+      "id":"block_selected_http_3_authority",
       "expr": "http3.authority == blocked.test && fresh.http3.method == GET",
       "action": "block"
     }

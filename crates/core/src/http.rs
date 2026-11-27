@@ -97,6 +97,7 @@ impl HttpMessages {
                             context,
                             observations: message.observations,
                             allow_continues: true,
+                            end_stream: None,
                         });
                         if self.finished {
                             break;

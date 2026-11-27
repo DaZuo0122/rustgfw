@@ -1,6 +1,7 @@
 use rustgfw_core::{
-    conditions::{Condition, MatchRule, parse_expression_with, parse_hex_bytes},
+    conditions::{Condition, parse_expression_with, parse_hex_bytes},
     inspect::FlowAction,
+    rule_graph::{RuleGraph, RuleSpec as GraphRuleSpec},
 };
 use serde::Deserialize;
 use std::{collections::HashMap, error::Error, fs, path::Path};
@@ -16,9 +17,12 @@ struct RuleFile {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuleSpec {
-    name: String,
+    id: String,
     expr: String,
-    action: String,
+    requires: Option<String>,
+    scope: Option<String>,
+    action: Option<String>,
+    priority: Option<u8>,
     replacement: Option<String>,
     replacement_hex: Option<String>,
 }
@@ -45,13 +49,13 @@ fn parse_with_expressions(
     })
 }
 
-pub fn compile(source: &str) -> Result<Vec<MatchRule>, String> {
+pub fn compile(source: &str) -> Result<RuleGraph, String> {
     let file: RuleFile = serde_json::from_str(source).map_err(|error| error.to_string())?;
     file.rules
         .into_iter()
         .map(|spec| {
             let condition = parse_with_expressions(&spec.expr, &file.expressions, &mut Vec::new())
-                .map_err(|error| format!("rule {:?}: {error}", spec.name))?;
+                .map_err(|error| format!("rule {:?}: {error}", spec.id))?;
             for field in condition.fields() {
                 if !matches!(
                     field,
@@ -78,36 +82,45 @@ pub fn compile(source: &str) -> Result<Vec<MatchRule>, String> {
                     && !rustgfw_core::dtls::FIELDS.contains(&field)
                     && !rustgfw_core::udp_shape::FIELDS.contains(&field)
                 {
-                    return Err(format!("rule {:?}: unknown observation field {field}", spec.name));
+                    return Err(format!("rule {:?}: unknown observation field {field}", spec.id));
                 }
             }
-            let action = match spec.action.as_str() {
-                "allow" => FlowAction::Allow,
-                "allow_flow" => FlowAction::AllowFlow,
-                "block" => FlowAction::Block,
-                "drop_packet" => FlowAction::DropPacket,
-                "replace_udp_payload" => {
+            let action = match spec.action.as_deref() {
+                None => None,
+                Some("allow") => Some(FlowAction::Allow),
+                Some("allow_flow") => Some(FlowAction::AllowFlow),
+                Some("block") => Some(FlowAction::Block),
+                Some("drop_packet") => Some(FlowAction::DropPacket),
+                Some("replace_udp_payload") => {
                     let payload = match (spec.replacement, spec.replacement_hex) {
                         (Some(value), None) => value.into_bytes(),
                         (None, Some(value)) => parse_hex_bytes(&value)
-                            .map_err(|error| format!("rule {:?}: invalid replacement_hex: {error}", spec.name))?,
+                            .map_err(|error| format!("rule {:?}: invalid replacement_hex: {error}", spec.id))?,
                         _ => {
                             return Err(format!(
                                 "rule {:?}: replace_udp_payload requires one replacement or replacement_hex",
-                                spec.name
+                                spec.id
                             ));
                         }
                     };
-                    FlowAction::ReplaceUdpPayload(payload)
+                    Some(FlowAction::ReplaceUdpPayload(payload))
                 }
-                other => return Err(format!("rule {:?}: unknown action {other}", spec.name)),
+                Some(other) => return Err(format!("rule {:?}: unknown action {other}", spec.id)),
             };
-            Ok(MatchRule { condition, action })
+            Ok(GraphRuleSpec {
+                id: spec.id,
+                condition,
+                requires: spec.requires,
+                scope: spec.scope,
+                action,
+                priority: spec.priority.unwrap_or(3),
+            })
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()
+        .and_then(RuleGraph::compile)
 }
 
-pub fn load(path: &Path) -> Result<Vec<MatchRule>, Box<dyn Error>> {
+pub fn load(path: &Path) -> Result<RuleGraph, Box<dyn Error>> {
     let source = fs::read_to_string(path)?;
     compile(&source).map_err(|error| format!("{}: {error}", path.display()).into())
 }
@@ -120,8 +133,8 @@ mod tests {
     fn compiles_ordered_expression_rules_and_rejects_invalid_fields() {
         let rules = compile(
             r#"{"rules":[
-                {"name":"web","expr":"proto == tcp && (http.host == \"blocked.test\" || tls.sni == \"blocked.test\")","action":"block"},
-                {"name":"rewrite","expr":"proto == udp && payload == \"old\"","action":"replace_udp_payload","replacement_hex":"0x6e6577"}
+                {"id":"web","expr":"proto == tcp && (http.host == \"blocked.test\" || tls.sni == \"blocked.test\")","action":"block"},
+                {"id":"rewrite","expr":"proto == udp && payload == \"old\"","action":"replace_udp_payload","replacement_hex":"0x6e6577"}
             ]}"#,
         )
         .unwrap();
@@ -129,14 +142,14 @@ mod tests {
         assert!(rules[0].condition.references_field("http.host"));
         assert_eq!(
             rules[1].action,
-            FlowAction::ReplaceUdpPayload(b"new".to_vec())
+            Some(FlowAction::ReplaceUdpPayload(b"new".to_vec()))
         );
         assert!(
-            compile(r#"{"rules":[{"name":"bad","expr":"typo.host == x","action":"block"}]}"#)
+            compile(r#"{"rules":[{"id":"bad","expr":"typo.host == x","action":"block"}]}"#)
                 .unwrap_err()
                 .contains("unknown observation field")
         );
-        assert!(compile(r#"{"rules":[{"name":"bad","expr":"proto == udp","action":"replace_udp_payload","replacement_hex":"z0"}]}"#)
+        assert!(compile(r#"{"rules":[{"id":"bad","expr":"proto == udp","action":"replace_udp_payload","replacement_hex":"z0"}]}"#)
             .unwrap_err()
             .contains("invalid replacement_hex"));
     }
@@ -150,8 +163,8 @@ mod tests {
                     "restricted": "proto == tcp && @web"
                 },
                 "rules": [
-                    {"name":"block web", "expr":"@restricted && !reverse == true", "action":"block"},
-                    {"name":"allow web", "expr":"@web", "action":"allow"}
+                    {"id":"block_web", "expr":"@restricted && !reverse == true", "action":"block"},
+                    {"id":"allow_web", "expr":"@web", "action":"allow"}
                 ]
             }"#,
         )
@@ -166,23 +179,23 @@ mod tests {
         );
         assert!(rules[1].condition.references_field("tls.sni"));
         let flow_allow = compile(
-            r#"{"rules":[{"name":"trusted carrier","expr":"http2.path == /trusted","action":"allow_flow"}]}"#,
+            r#"{"rules":[{"id":"trusted_carrier","expr":"http2.path == /trusted","action":"allow_flow"}]}"#,
         )
         .unwrap();
-        assert_eq!(flow_allow[0].action, FlowAction::AllowFlow);
+        assert_eq!(flow_allow[0].action, Some(FlowAction::AllowFlow));
 
         let presence = compile(
-            r#"{"rules":[{"name":"data","expr":"wireguard.type exists && payload.len >= 32 && dst.port != 53","action":"drop_packet"}]}"#,
+            r#"{"rules":[{"id":"data","expr":"wireguard.type exists && payload.len >= 32 && dst.port != 53","action":"drop_packet"}]}"#,
         )
         .unwrap();
         assert!(presence[0].condition.references_field("wireguard.type"));
         let quic = compile(
-            r#"{"rules":[{"name":"datagram","expr":"fresh.quic.alpn == h3 && quic.datagram_max_size > 0","action":"drop_packet"}]}"#,
+            r#"{"rules":[{"id":"datagram","expr":"fresh.quic.alpn == h3 && quic.datagram_max_size > 0","action":"drop_packet"}]}"#,
         )
         .unwrap();
         assert!(quic[0].condition.references_field("quic.datagram_max_size"));
         let http3 = compile(
-            r#"{"rules":[{"name":"auth","expr":"fresh.http3.status == 233 && http3.request_header_name == hysteria-auth","action":"block"}]}"#,
+            r#"{"rules":[{"id":"auth","expr":"fresh.http3.status == 233 && http3.request_header_name == hysteria-auth","action":"block"}]}"#,
         )
         .unwrap();
         assert!(
@@ -191,19 +204,18 @@ mod tests {
                 .references_field("http3.request_header_name")
         );
         assert!(
-            compile(r#"{"rules":[{"name":"bad","expr":"unknown.field exists","action":"block"}]}"#)
+            compile(r#"{"rules":[{"id":"bad","expr":"unknown.field exists","action":"block"}]}"#)
                 .unwrap_err()
                 .contains("unknown observation field")
         );
 
         let cycle = compile(
-            r#"{"expressions":{"a":"@b","b":"@a"},"rules":[{"name":"loop","expr":"@a","action":"block"}]}"#,
+            r#"{"expressions":{"a":"@b","b":"@a"},"rules":[{"id":"loop","expr":"@a","action":"block"}]}"#,
         )
         .unwrap_err();
         assert!(cycle.contains("cyclic expression reference: a -> b -> a"));
-        let unknown =
-            compile(r#"{"rules":[{"name":"missing","expr":"@missing","action":"block"}]}"#)
-                .unwrap_err();
+        let unknown = compile(r#"{"rules":[{"id":"missing","expr":"@missing","action":"block"}]}"#)
+            .unwrap_err();
         assert!(unknown.contains("unknown expression reference @missing"));
     }
 }

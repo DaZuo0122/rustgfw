@@ -296,6 +296,7 @@ impl StreamAnalyzer for DnsTcp {
                     context: Vec::new(),
                     observations: observations(message),
                     allow_continues: true,
+                    end_stream: None,
                 }),
                 Err(_) => return finished_batches(batches),
             }

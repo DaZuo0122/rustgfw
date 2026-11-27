@@ -1,6 +1,6 @@
 # 表达式规则
 
-Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按数组顺序匹配，首个产生动作的规则生效。它不是 OpenGFW 配置格式的兼容实现。
+Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON。每条规则有唯一的 `id` 和匹配条件 `expr`；可用 `requires` 引用同一文件中已命中的规则，把跨包或跨子流事件串成规则链。它不是 OpenGFW 配置格式的兼容实现。
 
 ```json
 {
@@ -10,38 +10,38 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
   },
   "rules": [
     {
-      "name": "block web host",
+      "id":"block_web_host",
       "expr": "proto == tcp && @blocked_web",
       "action": "block"
     },
     {
-      "name": "drop one DNS query",
+      "id":"drop_one_dns_query",
       "expr": "@blocked_dns",
       "action": "drop_packet"
     },
     {
-      "name": "rewrite UDP payload",
+      "id":"rewrite_udp_payload",
       "expr": "proto == udp && dst.port == 5353 && payload == \"old\"",
       "action": "replace_udp_payload",
       "replacement": "new"
     },
     {
-      "name": "drop correlated WireGuard data",
+      "id":"drop_correlated_wireguard_data",
       "expr": "proto == udp && fresh.wireguard.type == data && wireguard.receiver_matched == true",
       "action": "drop_packet"
     },
     {
-      "name": "drop OpenVPN after reverse reset",
+      "id":"drop_openvpn_after_reverse_reset",
       "expr": "proto == udp && openvpn.stage == handshake && openvpn.client_reset == 7 && openvpn.server_reset == 8",
       "action": "drop_packet"
     },
     {
-      "name": "block SOCKS proxy target",
+      "id":"block_socks_proxy_target",
       "expr": "proto == tcp && socks.command == connect && socks.target_host == blocked.test",
       "action": "block"
     },
     {
-      "name": "drop QUIC Initial by SNI",
+      "id":"drop_quic_initial_by_sni",
       "expr": "proto == udp && fresh.quic.sni == blocked.test",
       "action": "drop_packet"
     }
@@ -50,6 +50,25 @@ Linux 和 Windows 命令都接受 `rules-file=path`。文件是 JSON；规则按
 ```
 
 例如 `rustgfw nfqueue 100 accept nft=forward rules-file=rules.json`。`rules-file` 可以和现有的传输层规则、资源预算参数一起使用；传输层规则先执行。当前没有规则文件热更新入口。
+
+## 规则依赖与裁决
+
+下面的规则先记录同一条 UDP 流里的 DNS 查询；之后的响应满足第二条规则时才丢包：
+
+```json
+{
+  "rules": [
+    { "id": "query_seen", "expr": "proto == udp && fresh.dns.qname == blocked.test && dns.qr == query" },
+    { "id": "drop_answer", "requires": "query_seen", "expr": "proto == udp && fresh.dns.qname == blocked.test && dns.qr == response", "action": "drop_packet", "priority": 2 }
+  ]
+}
+```
+
+`requires` 使用规则 ID、`&&`、`||` 和括号，例如 `(query_seen || fallback_seen) && server_seen`。它检查同一作用域内此前或当前观察批次的命中记录；规则本身的 `expr` 仍必须在当前批次成立。无动作的规则可充当依赖标记，有动作的规则也会留下命中记录。`@名称` 引用的是静态表达式，不能代替跨包命中记录。依赖按拓扑顺序求值，因此文件中可以先写子规则再写父规则；加载时拒绝未知 ID、重复 ID、循环依赖和不兼容的作用域，`||` 的所有分支都参与循环检查。`requires` 不支持否定：历史命中不会自动撤销。
+
+同一次裁决中若多条有动作的规则成立，`priority` 数字较小者生效，范围为 1 到 5，默认 3；相同优先级按文件顺序。其余已成立的规则仍留下命中记录，后续规则可以引用。传输层规则仍在应用规则之前执行。
+
+`scope` 默认为 `flow`，命中记录随外层连接或 UDP 会话保存。需要按子流隔离时可设为 `http2.stream_id`、`http3.stream_id`、`sing_mux.stream_id` 或 `mux_cool.session_id`。子流作用域规则只在当前观察批次更新了相应 ID 时求值；它可以依赖同一子流作用域或外层 `flow` 规则，不能依赖另一种子流作用域。即使条件定位到某个 HTTP/2 子流，原始 TCP 路径的 `block` 动作仍阻断整个 TCP 连接；已解密 HTTP/3 路径则按请求流返回裁决。
 
 表达式使用 `!`、`&&`、`||` 和括号，优先级依次递减。比较值可用裸词或双引号字符串；字符串支持 `\"`、`\\`、`\n`、`\r`、`\t`。观察字段、`payload` 和 `payload_hex` 支持 `==`、`!=`、`contains`、`starts_with`、`ends_with`；域名等观察字段比较忽略 ASCII 大小写，`http.method`、`http.target`、`tls.alpn`、`tls.server_alpn`、`quic.alpn`、`dtls.alpn`、`dtls.server_alpn` 及载荷区分大小写。端口和 `payload.len` 支持 `==`、`!=`、`<`、`<=`、`>`、`>=`；`proto`、`reverse` 和 IP 地址支持 `==`、`!=`。可比较的内容：
 

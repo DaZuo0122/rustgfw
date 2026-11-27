@@ -4,6 +4,7 @@ use crate::{
     CaptureTime, Decision, FlowScope, Packet, Policy, Verdict,
     http3::Http3Conversation,
     packet::{self, Protocol},
+    rule_graph::{RuleDecision, RuleGraph, RuleState},
     tcp::Reassembler,
 };
 use std::{
@@ -41,6 +42,8 @@ pub struct ObservationBatch {
     pub observations: Vec<Observation>,
     /// An `Allow` match applies only to this message; later messages are still inspected.
     pub allow_continues: bool,
+    /// Remove rule hits for a completed multiplexed child after this batch is evaluated.
+    pub end_stream: Option<(&'static str, String)>,
 }
 
 pub trait StreamAnalyzer {
@@ -153,6 +156,8 @@ struct Flow {
     bidirectional: Vec<Option<Box<dyn BidirectionalStreamAnalyzer>>>,
     packet_analyzers: Vec<Option<Box<dyn TcpPacketAnalyzer>>>,
     facts: HashMap<&'static str, Vec<String>>,
+    rule_state: RuleState,
+    rule_decision: Option<RuleDecision>,
     allowed: bool,
     blocked: bool,
     seen: Instant,
@@ -165,6 +170,8 @@ struct UdpFlow {
     target: SocketAddr,
     analyzers: Vec<Option<Box<dyn UdpStreamAnalyzer>>>,
     facts: HashMap<&'static str, Vec<String>>,
+    rule_state: RuleState,
+    rule_decision: Option<RuleDecision>,
     allowed: bool,
     blocked: bool,
     seen: Instant,
@@ -173,6 +180,8 @@ struct Http3Flow {
     origin: SocketAddr,
     target: SocketAddr,
     facts: HashMap<&'static str, Vec<String>>,
+    rule_state: RuleState,
+    rule_decision: Option<RuleDecision>,
     allowed: bool,
     blocked: bool,
     seen: Instant,
@@ -195,6 +204,7 @@ impl Flow {
         analyzers: TcpAnalyzerSets<'_>,
         reorder_bytes: usize,
         now: Instant,
+        rule_state: RuleState,
     ) -> Self {
         let port_matches =
             |port: Option<u16>| port.is_none_or(|p| origin.port() == p || target.port() == p);
@@ -220,6 +230,8 @@ impl Flow {
                 .map(|rule| port_matches(rule.port).then(|| (rule.factory)()))
                 .collect(),
             facts: HashMap::new(),
+            rule_state,
+            rule_decision: None,
             allowed: false,
             blocked: false,
             seen: now,
@@ -377,6 +389,7 @@ struct TcpAnalysis {
     batches: Vec<ObservationBatch>,
 }
 
+#[derive(Clone, Copy)]
 struct TcpEvent<'a> {
     scope: FlowScope,
     source: SocketAddr,
@@ -436,27 +449,29 @@ fn analyze_tcp_bytes(
 fn evaluate_tcp_batches(
     flow: &mut Flow,
     rules: &[FlowRule],
+    graph: &RuleGraph,
     event: TcpEvent<'_>,
     analysis: TcpAnalysis,
+    stream_id: Option<u64>,
 ) {
-    if flow.blocked || flow.allowed || rules.is_empty() {
+    if flow.blocked || flow.allowed || (rules.is_empty() && graph.is_empty()) {
         return;
     }
     if analysis.batches.is_empty() {
         apply_tcp_flow_rules(
             flow,
             rules,
-            event.scope,
-            event.source,
-            event.destination,
-            event.payload,
+            graph,
+            event,
             &analysis.updated,
             false,
+            stream_id,
         );
         return;
     }
     for batch in analysis.batches {
         let allow_continues = batch.allow_continues;
+        let end_stream = batch.end_stream;
         let mut batch_updated = analysis.updated.clone();
         for field in batch.clear_fields {
             flow.facts.remove(field);
@@ -467,13 +482,15 @@ fn evaluate_tcp_batches(
         apply_tcp_flow_rules(
             flow,
             rules,
-            event.scope,
-            event.source,
-            event.destination,
-            event.payload,
+            graph,
+            event,
             &batch_updated,
             allow_continues,
+            stream_id,
         );
+        if let Some((field, id)) = end_stream {
+            flow.rule_state.clear_stream(field, &id);
+        }
         if flow.allowed || flow.blocked {
             break;
         }
@@ -483,31 +500,53 @@ fn evaluate_tcp_batches(
 fn apply_tcp_flow_rules(
     flow: &mut Flow,
     rules: &[FlowRule],
-    scope: FlowScope,
-    source: SocketAddr,
-    destination: SocketAddr,
-    payload: &[u8],
+    graph: &RuleGraph,
+    event: TcpEvent<'_>,
     updated: &[&'static str],
     allow_continues: bool,
+    stream_id: Option<u64>,
 ) {
     let context = FlowContext {
         protocol: Protocol::Tcp,
-        scope,
-        source,
-        destination,
+        scope: event.scope,
+        source: event.source,
+        destination: event.destination,
         origin: flow.origin,
         target: flow.target,
-        reverse: source != flow.origin,
-        payload,
+        reverse: event.source != flow.origin,
+        payload: event.payload,
         facts: &flow.facts,
         updated,
     };
+    flow.rule_decision = None;
+    for (id_field, event_field, opening) in [
+        ("sing_mux.stream_id", "sing_mux.frame", "open"),
+        ("mux_cool.session_id", "mux_cool.status", "new"),
+    ] {
+        if context.updated(event_field)
+            && context.get(event_field) == Some(opening)
+            && let Some(id) = context.get(id_field)
+        {
+            flow.rule_state.clear_stream(id_field, id);
+        }
+    }
+    if let Some(decision) = graph.evaluate(&context, &mut flow.rule_state, stream_id, false) {
+        match &decision.action {
+            FlowAction::Allow if !allow_continues => flow.allowed = true,
+            FlowAction::Allow => {}
+            FlowAction::AllowFlow => flow.allowed = true,
+            FlowAction::Block | FlowAction::DropPacket => flow.blocked = true,
+            FlowAction::ReplaceUdpPayload(_) => unreachable!("TCP replacement is not selected"),
+        }
+        flow.rule_decision = Some(decision);
+        return;
+    }
     for (rule_index, rule) in rules.iter().enumerate() {
         let Some(action) = (rule.matches)(&context) else {
             continue;
         };
-        tracing::debug!(protocol = "tcp", scope = scope.0, rule_index,
-            action = action_label(&action), source = %source, destination = %destination,
+        tracing::debug!(protocol = "tcp", scope = event.scope.0, rule_index,
+            action = action_label(&action), source = %event.source, destination = %event.destination,
             "application rule matched");
         match action {
             FlowAction::Allow if !allow_continues => flow.allowed = true,
@@ -533,7 +572,7 @@ pub enum FlowAction {
     ReplaceUdpPayload(Vec<u8>),
 }
 
-fn action_label(action: &FlowAction) -> &'static str {
+pub(crate) fn action_label(action: &FlowAction) -> &'static str {
     match action {
         FlowAction::Allow => "allow",
         FlowAction::AllowFlow => "allow_flow",
@@ -747,6 +786,8 @@ pub struct Inspect<P> {
     datagrams: Vec<DatagramRule>,
     udp_analyzers: Vec<UdpStreamRule>,
     udp_rules: Vec<FlowRule>,
+    rule_graph: RuleGraph,
+    next_flow_id: u64,
     flows: HashMap<Key, Flow>,
     decoded_flows: HashMap<DecodedKey, Flow>,
     http3_connections: HashMap<FlowScope, Http3Connection>,
@@ -787,6 +828,8 @@ impl<P> Inspect<P> {
             datagrams,
             udp_analyzers: Vec::new(),
             udp_rules: Vec::new(),
+            rule_graph: RuleGraph::default(),
+            next_flow_id: 1,
             flows: HashMap::new(),
             decoded_flows: HashMap::new(),
             http3_connections: HashMap::new(),
@@ -809,6 +852,12 @@ impl<P> Inspect<P> {
     pub fn with_flow_rules(mut self, rules: Vec<FlowRule>) -> Self {
         self.clear_flows();
         self.flow_rules = rules;
+        self
+    }
+
+    pub fn with_rule_graph(mut self, graph: RuleGraph) -> Self {
+        self.clear_flows();
+        self.rule_graph = graph;
         self
     }
 
@@ -852,8 +901,8 @@ impl<P> Inspect<P> {
 
     fn compact_completed_flows(&mut self) {
         if self.completed_since_compaction {
-            let tcp_has_rules = !self.flow_rules.is_empty();
-            let udp_has_rules = !self.udp_rules.is_empty();
+            let tcp_has_rules = !self.flow_rules.is_empty() || !self.rule_graph.is_empty();
+            let udp_has_rules = !self.udp_rules.is_empty() || !self.rule_graph.is_empty();
             self.flows.retain(|_, flow| !flow.finished(tcp_has_rules));
             self.udp_flows
                 .retain(|_, flow| !flow.finished(udp_has_rules));
@@ -876,6 +925,7 @@ impl<P> Inspect<P> {
         if self.analyzers.is_empty()
             && self.bidirectional_analyzers.is_empty()
             && self.flow_rules.is_empty()
+            && self.rule_graph.is_empty()
         {
             return Verdict::Accept;
         }
@@ -887,6 +937,10 @@ impl<P> Inspect<P> {
                 .flow_rules
                 .iter()
                 .any(|rule| rule.might_match(Protocol::Tcp, input.origin, input.target))
+            && !self.rule_graph.nodes().iter().any(|node| {
+                node.condition
+                    .can_match_new_flow(Protocol::Tcp, input.origin, input.target)
+            })
             && !self.analyzers.iter().any(|rule| {
                 rule.port
                     .is_none_or(|p| input.origin.port() == p || input.target.port() == p)
@@ -910,6 +964,10 @@ impl<P> Inspect<P> {
                 return Verdict::DropFlow;
             }
         }
+        let new_flow_id = self.next_flow_id;
+        if !self.decoded_flows.contains_key(&key) {
+            self.next_flow_id += 1;
+        }
         let flow = self.decoded_flows.entry(key).or_insert_with(|| {
             Flow::new(
                 input.origin,
@@ -922,6 +980,7 @@ impl<P> Inspect<P> {
                 },
                 self.limits.reorder_bytes,
                 now,
+                RuleState::new(self.rule_graph.len(), new_flow_id),
             )
         });
         flow.seen = now;
@@ -941,7 +1000,7 @@ impl<P> Inspect<P> {
                 input.reverse,
                 &self.analyzers,
                 &self.bidirectional_analyzers,
-                !self.flow_rules.is_empty(),
+                !self.flow_rules.is_empty() || !self.rule_graph.is_empty(),
             )
         } else {
             TcpAnalysis::default()
@@ -949,6 +1008,7 @@ impl<P> Inspect<P> {
         evaluate_tcp_batches(
             flow,
             &self.flow_rules,
+            &self.rule_graph,
             TcpEvent {
                 scope: input.scope,
                 source,
@@ -956,10 +1016,20 @@ impl<P> Inspect<P> {
                 payload: input.bytes,
             },
             analysis,
+            Some(input.stream_id),
         );
         if flow.blocked {
-            tracing::info!(scope = input.scope.0, stream_id = input.stream_id,
-                origin = %flow.origin, target = %flow.target, "decoded TCP stream blocked");
+            if let Some(decision) = &flow.rule_decision {
+                tracing::info!(scope = input.scope.0, stream_id = input.stream_id,
+                    flow_id = decision.flow_id, event_seq = decision.event_seq,
+                    rule_id = %decision.id, priority = decision.priority,
+                    via = %decision.via, stream_scope = ?decision.stream_scope,
+                    action = action_label(&decision.action),
+                    origin = %flow.origin, target = %flow.target, "decoded TCP stream blocked");
+            } else {
+                tracing::info!(scope = input.scope.0, stream_id = input.stream_id,
+                    origin = %flow.origin, target = %flow.target, "decoded TCP stream blocked");
+            }
             Verdict::DropFlow
         } else {
             Verdict::Accept
@@ -1035,10 +1105,16 @@ impl<P> Inspect<P> {
                 .get(&event.stream_id)
                 .copied()
                 .unwrap_or((input.origin, input.target));
+            let new_flow_id = self.next_flow_id;
+            if !self.http3_flows.contains_key(&key) {
+                self.next_flow_id += 1;
+            }
             let flow = self.http3_flows.entry(key).or_insert_with(|| Http3Flow {
                 origin,
                 target,
                 facts: HashMap::new(),
+                rule_state: RuleState::new(self.rule_graph.len(), new_flow_id),
+                rule_decision: None,
                 allowed: false,
                 blocked: false,
                 seen: now,
@@ -1069,31 +1145,57 @@ impl<P> Inspect<P> {
                     facts: &flow.facts,
                     updated: &updated,
                 };
-                for (rule_index, rule) in self.udp_rules.iter().enumerate() {
-                    let Some(action) = (rule.matches)(&context) else {
-                        continue;
-                    };
-                    tracing::debug!(
-                        protocol = "http3",
-                        scope = input.scope.0,
-                        stream_id = event.stream_id,
-                        rule_index,
-                        action = action_label(&action),
-                        "application rule matched"
-                    );
-                    match action {
+                flow.rule_decision = None;
+                if let Some(decision) = self.rule_graph.evaluate(
+                    &context,
+                    &mut flow.rule_state,
+                    Some(event.stream_id),
+                    false,
+                ) {
+                    match &decision.action {
                         FlowAction::Allow if !event.provisional => flow.allowed = true,
                         FlowAction::Allow => {}
                         FlowAction::AllowFlow => flow.allowed = true,
                         FlowAction::Block | FlowAction::DropPacket => flow.blocked = true,
-                        FlowAction::ReplaceUdpPayload(_) => continue,
+                        FlowAction::ReplaceUdpPayload(_) => unreachable!(),
                     }
-                    break;
+                    flow.rule_decision = Some(decision);
+                } else {
+                    for (rule_index, rule) in self.udp_rules.iter().enumerate() {
+                        let Some(action) = (rule.matches)(&context) else {
+                            continue;
+                        };
+                        tracing::debug!(
+                            protocol = "http3",
+                            scope = input.scope.0,
+                            stream_id = event.stream_id,
+                            rule_index,
+                            action = action_label(&action),
+                            "application rule matched"
+                        );
+                        match action {
+                            FlowAction::Allow if !event.provisional => flow.allowed = true,
+                            FlowAction::Allow => {}
+                            FlowAction::AllowFlow => flow.allowed = true,
+                            FlowAction::Block | FlowAction::DropPacket => flow.blocked = true,
+                            FlowAction::ReplaceUdpPayload(_) => continue,
+                        }
+                        break;
+                    }
                 }
             }
             if !was_blocked && flow.blocked {
-                tracing::info!(scope = input.scope.0, stream_id = event.stream_id,
-                    origin = %flow.origin, target = %flow.target, "HTTP/3 request blocked");
+                if let Some(decision) = &flow.rule_decision {
+                    tracing::info!(scope = input.scope.0, stream_id = event.stream_id,
+                        flow_id = decision.flow_id, event_seq = decision.event_seq,
+                        rule_id = %decision.id, priority = decision.priority,
+                        via = %decision.via, stream_scope = ?decision.stream_scope,
+                        action = action_label(&decision.action),
+                        origin = %flow.origin, target = %flow.target, "HTTP/3 request blocked");
+                } else {
+                    tracing::info!(scope = input.scope.0, stream_id = event.stream_id,
+                        origin = %flow.origin, target = %flow.target, "HTTP/3 request blocked");
+                }
             }
             decisions.push(DecodedVerdict {
                 stream_id: event.stream_id,
@@ -1133,7 +1235,9 @@ impl<P> Inspect<P> {
     }
 
     fn inspect_udp(&mut self, packet: Packet<'_>, transport: &packet::Transport<'_>) -> Decision {
-        let has_stream = !self.udp_analyzers.is_empty() || !self.udp_rules.is_empty();
+        let has_stream = !self.udp_analyzers.is_empty()
+            || !self.udp_rules.is_empty()
+            || !self.rule_graph.is_empty();
         let state = has_stream.then(|| {
             let now = Instant::now();
             self.expire_idle_flows(now);
@@ -1196,6 +1300,13 @@ impl<P> Inspect<P> {
             && !self.udp_rules.iter().any(|rule| {
                 rule.might_match(Protocol::Udp, transport.source, transport.destination)
             })
+            && !self.rule_graph.nodes().iter().any(|node| {
+                node.condition.can_match_new_flow(
+                    Protocol::Udp,
+                    transport.source,
+                    transport.destination,
+                )
+            })
         {
             return Verdict::Accept.into();
         }
@@ -1207,6 +1318,10 @@ impl<P> Inspect<P> {
                     "UDP inspection capacity reached");
                 return Verdict::Drop.into();
             }
+        }
+        let new_flow_id = self.next_flow_id;
+        if !self.udp_flows.contains_key(&key) {
+            self.next_flow_id += 1;
         }
         let flow = self.udp_flows.entry(key).or_insert_with(|| UdpFlow {
             origin: transport.source,
@@ -1223,6 +1338,8 @@ impl<P> Inspect<P> {
                 })
                 .collect(),
             facts: HashMap::new(),
+            rule_state: RuleState::new(self.rule_graph.len(), new_flow_id),
+            rule_decision: None,
             allowed: false,
             blocked: false,
             seen: now,
@@ -1234,6 +1351,7 @@ impl<P> Inspect<P> {
         let mut drop_packet = false;
         let mut replacement = None;
         let mut updated = Vec::new();
+        flow.rule_decision = None;
         if !flow.allowed {
             let reverse = transport.source != flow.origin;
             for slot in &mut flow.analyzers {
@@ -1243,7 +1361,7 @@ impl<P> Inspect<P> {
                 match analyzer.feed_timed(transport.payload, reverse, packet.capture_time) {
                     UdpStreamAnalysis::Pending => {}
                     UdpStreamAnalysis::Observations(observations) => {
-                        if !self.udp_rules.is_empty() {
+                        if !self.udp_rules.is_empty() || !self.rule_graph.is_empty() {
                             store_observations(&mut flow.facts, observations, &mut updated);
                         }
                     }
@@ -1255,12 +1373,12 @@ impl<P> Inspect<P> {
                             flow.facts.remove(field);
                             updated.retain(|value| *value != field);
                         }
-                        if !self.udp_rules.is_empty() {
+                        if !self.udp_rules.is_empty() || !self.rule_graph.is_empty() {
                             store_observations(&mut flow.facts, observations, &mut updated);
                         }
                     }
                     UdpStreamAnalysis::FinalObservations(observations) => {
-                        if !self.udp_rules.is_empty() {
+                        if !self.udp_rules.is_empty() || !self.rule_graph.is_empty() {
                             store_observations(&mut flow.facts, observations, &mut updated);
                         }
                         *slot = None;
@@ -1275,7 +1393,7 @@ impl<P> Inspect<P> {
                     }
                 }
             }
-            if !drop_packet && !self.udp_rules.is_empty() {
+            if !drop_packet && (!self.udp_rules.is_empty() || !self.rule_graph.is_empty()) {
                 let context = FlowContext {
                     protocol: Protocol::Udp,
                     scope: packet.scope,
@@ -1288,7 +1406,29 @@ impl<P> Inspect<P> {
                     facts: &flow.facts,
                     updated: &updated,
                 };
-                if let Some((rule_index, action)) =
+                if let Some(decision) =
+                    self.rule_graph
+                        .evaluate(&context, &mut flow.rule_state, None, true)
+                {
+                    match &decision.action {
+                        FlowAction::Allow | FlowAction::AllowFlow => flow.allowed = true,
+                        FlowAction::Block => {
+                            flow.blocked = true;
+                            tracing::info!(scope = packet.scope.0, flow_id = decision.flow_id,
+                                event_seq = decision.event_seq, rule_id = %decision.id,
+                                priority = decision.priority, via = %decision.via,
+                                stream_scope = ?decision.stream_scope,
+                                action = action_label(&decision.action),
+                                source = %transport.source, destination = %transport.destination,
+                                "UDP flow blocked");
+                        }
+                        FlowAction::DropPacket => drop_packet = true,
+                        FlowAction::ReplaceUdpPayload(payload) => {
+                            replacement = Some(payload.clone())
+                        }
+                    }
+                    flow.rule_decision = Some(decision);
+                } else if let Some((rule_index, action)) =
                     self.udp_rules.iter().enumerate().find_map(|(index, rule)| {
                         (rule.matches)(&context).map(|action| (index, action))
                     })
@@ -1303,22 +1443,41 @@ impl<P> Inspect<P> {
                             tracing::info!(scope = packet.scope.0, source = %transport.source,
                                 destination = %transport.destination, "UDP flow blocked");
                         }
-                        FlowAction::DropPacket => {
-                            drop_packet = true;
-                        }
+                        FlowAction::DropPacket => drop_packet = true,
                         FlowAction::ReplaceUdpPayload(payload) => replacement = Some(payload),
                     }
                 }
             }
         }
-        self.completed_since_compaction |= flow.finished(!self.udp_rules.is_empty());
+        self.completed_since_compaction |=
+            flow.finished(!self.udp_rules.is_empty() || !self.rule_graph.is_empty());
         if flow.blocked {
             Verdict::DropFlow.into()
         } else if drop_packet {
-            tracing::info!(scope = packet.scope.0, source = %transport.source,
-                destination = %transport.destination, "UDP packet dropped");
+            if let Some(decision) = &flow.rule_decision {
+                tracing::info!(scope = packet.scope.0, flow_id = decision.flow_id,
+                    event_seq = decision.event_seq, rule_id = %decision.id,
+                    priority = decision.priority, via = %decision.via,
+                    stream_scope = ?decision.stream_scope,
+                    stream_scope = ?decision.stream_scope,
+                    action = action_label(&decision.action),
+                    source = %transport.source, destination = %transport.destination,
+                    "UDP packet dropped");
+            } else {
+                tracing::info!(scope = packet.scope.0, source = %transport.source,
+                    destination = %transport.destination, "UDP packet dropped");
+            }
             Verdict::Drop.into()
         } else if let Some(payload) = replacement {
+            if let Some(decision) = &flow.rule_decision {
+                tracing::info!(scope = packet.scope.0, flow_id = decision.flow_id,
+                    event_seq = decision.event_seq, rule_id = %decision.id,
+                    priority = decision.priority, via = %decision.via,
+                    stream_scope = ?decision.stream_scope,
+                    action = action_label(&decision.action),
+                    source = %transport.source, destination = %transport.destination,
+                    "UDP payload replaced");
+            }
             packet::replace_udp_payload(packet.bytes, &payload)
                 .map(Decision::Replace)
                 .unwrap_or_else(|_| Verdict::Drop.into())
@@ -1349,7 +1508,8 @@ impl<P: Policy> Policy for Inspect<P> {
                 && self.datagrams.is_empty()
                 && self.flow_rules.is_empty()
                 && self.udp_analyzers.is_empty()
-                && self.udp_rules.is_empty())
+                && self.udp_rules.is_empty()
+                && self.rule_graph.is_empty())
         {
             return transport_decision;
         }
@@ -1376,6 +1536,7 @@ impl<P: Policy> Policy for Inspect<P> {
             && self.bidirectional_analyzers.is_empty()
             && self.tcp_packet_analyzers.is_empty()
             && self.flow_rules.is_empty()
+            && self.rule_graph.is_empty()
         {
             return transport_decision;
         }
@@ -1407,6 +1568,10 @@ impl<P: Policy> Policy for Inspect<P> {
                 .flow_rules
                 .iter()
                 .any(|rule| rule.might_match(Protocol::Tcp, t.source, t.destination))
+            && !self.rule_graph.nodes().iter().any(|node| {
+                node.condition
+                    .can_match_new_flow(Protocol::Tcp, t.source, t.destination)
+            })
             && !self.analyzers.iter().any(|a| {
                 a.port
                     .is_none_or(|port| t.source.port() == port || t.destination.port() == port)
@@ -1432,6 +1597,10 @@ impl<P: Policy> Policy for Inspect<P> {
                 return Verdict::Drop.into();
             }
         }
+        let new_flow_id = self.next_flow_id;
+        if !self.flows.contains_key(&key) {
+            self.next_flow_id += 1;
+        }
         let flow = self.flows.entry(key).or_insert_with(|| {
             Flow::new(
                 t.source,
@@ -1444,6 +1613,7 @@ impl<P: Policy> Policy for Inspect<P> {
                 },
                 self.limits.reorder_bytes,
                 now,
+                RuleState::new(self.rule_graph.len(), new_flow_id),
             )
         });
         flow.seen = now;
@@ -1470,7 +1640,7 @@ impl<P: Policy> Policy for Inspect<P> {
                     &mut flow.blocked,
                     &mut analysis.updated,
                     &mut analysis.batches,
-                    !self.flow_rules.is_empty(),
+                    !self.flow_rules.is_empty() || !self.rule_graph.is_empty(),
                 );
                 if !finished && !t.payload.is_empty() {
                     finished = collect_tcp_analysis(
@@ -1485,7 +1655,7 @@ impl<P: Policy> Policy for Inspect<P> {
                         &mut flow.blocked,
                         &mut analysis.updated,
                         &mut analysis.batches,
-                        !self.flow_rules.is_empty(),
+                        !self.flow_rules.is_empty() || !self.rule_graph.is_empty(),
                     );
                 }
                 if finished {
@@ -1514,7 +1684,7 @@ impl<P: Policy> Policy for Inspect<P> {
                             reverse,
                             &self.analyzers,
                             &self.bidirectional_analyzers,
-                            !self.flow_rules.is_empty(),
+                            !self.flow_rules.is_empty() || !self.rule_graph.is_empty(),
                         );
                         analysis.updated.extend(stream_analysis.updated);
                         analysis.batches.extend(stream_analysis.batches);
@@ -1530,6 +1700,7 @@ impl<P: Policy> Policy for Inspect<P> {
         evaluate_tcp_batches(
             flow,
             &self.flow_rules,
+            &self.rule_graph,
             TcpEvent {
                 scope: packet.scope,
                 source: t.source,
@@ -1537,16 +1708,28 @@ impl<P: Policy> Policy for Inspect<P> {
                 payload: t.payload,
             },
             analysis,
+            None,
         );
         let result = if flow.blocked {
-            tracing::info!(scope = packet.scope.0, source = %t.source,
-                destination = %t.destination, origin = %flow.origin, target = %flow.target,
-                "TCP flow blocked");
+            if let Some(decision) = &flow.rule_decision {
+                tracing::info!(scope = packet.scope.0, flow_id = decision.flow_id,
+                    event_seq = decision.event_seq, rule_id = %decision.id,
+                    priority = decision.priority, via = %decision.via,
+                    stream_scope = ?decision.stream_scope,
+                    action = action_label(&decision.action), source = %t.source,
+                    destination = %t.destination, origin = %flow.origin, target = %flow.target,
+                    "TCP flow blocked");
+            } else {
+                tracing::info!(scope = packet.scope.0, source = %t.source,
+                    destination = %t.destination, origin = %flow.origin, target = %flow.target,
+                    "TCP flow blocked");
+            }
             Verdict::DropFlow
         } else {
             verdict
         };
-        self.completed_since_compaction |= flow.finished(!self.flow_rules.is_empty());
+        self.completed_since_compaction |=
+            flow.finished(!self.flow_rules.is_empty() || !self.rule_graph.is_empty());
         // A half-close leaves the other direction active. Blocked flows retain
         // their verdict until timeout or a new initial SYN replaces them.
         if t.tcp_flags & 1 != 0 {
@@ -1566,6 +1749,174 @@ impl<P: Policy> Policy for Inspect<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reused_mux_stream_id_does_not_inherit_rule_hits() {
+        use crate::{conditions::parse_expression, rule_graph::RuleSpec};
+
+        let graph = RuleGraph::compile(vec![
+            RuleSpec {
+                id: "data_seen".into(),
+                condition: parse_expression("fresh.sing_mux.frame == data").unwrap(),
+                requires: None,
+                scope: Some("sing_mux.stream_id".into()),
+                action: None,
+                priority: 3,
+            },
+            RuleSpec {
+                id: "finish_after_data".into(),
+                condition: parse_expression("fresh.sing_mux.frame == fin").unwrap(),
+                requires: Some("data_seen".into()),
+                scope: Some("sing_mux.stream_id".into()),
+                action: Some(FlowAction::Block),
+                priority: 3,
+            },
+        ])
+        .unwrap();
+        let origin = "192.0.2.1:12345".parse().unwrap();
+        let target = "198.51.100.2:443".parse().unwrap();
+        let mut flow = Flow::new(
+            origin,
+            target,
+            None,
+            TcpAnalyzerSets {
+                directional: &[],
+                bidirectional: &[],
+                packets: &[],
+            },
+            1024,
+            Instant::now(),
+            RuleState::new(graph.len(), 1),
+        );
+        for (frame, expected_block) in [
+            ("data", false),
+            ("open", false),
+            ("fin", false),
+            ("data", false),
+            ("fin", true),
+        ] {
+            flow.facts.insert("sing_mux.stream_id", vec!["7".into()]);
+            flow.facts.insert("sing_mux.frame", vec![frame.into()]);
+            apply_tcp_flow_rules(
+                &mut flow,
+                &[],
+                &graph,
+                TcpEvent {
+                    scope: FlowScope(1),
+                    source: origin,
+                    destination: target,
+                    payload: &[],
+                },
+                &["sing_mux.stream_id", "sing_mux.frame"],
+                true,
+                None,
+            );
+            assert_eq!(flow.blocked, expected_block, "frame {frame}");
+        }
+    }
+
+    #[test]
+    fn graph_dependencies_do_not_cross_http2_streams() {
+        use crate::{conditions::parse_expression, rule_graph::RuleSpec};
+
+        let graph = RuleGraph::compile(vec![
+            RuleSpec {
+                id: "decision".into(),
+                condition: parse_expression("fresh.http2.status == 404").unwrap(),
+                requires: Some("carrier && request".into()),
+                scope: Some("http2.stream_id".into()),
+                action: Some(FlowAction::Block),
+                priority: 2,
+            },
+            RuleSpec {
+                id: "request".into(),
+                condition: parse_expression("fresh.http2.path == /one").unwrap(),
+                requires: None,
+                scope: Some("http2.stream_id".into()),
+                action: None,
+                priority: 3,
+            },
+            RuleSpec {
+                id: "carrier".into(),
+                condition: parse_expression("fresh.tls.alpn == h2").unwrap(),
+                requires: None,
+                scope: None,
+                action: None,
+                priority: 3,
+            },
+        ])
+        .unwrap();
+        let mut state = RuleState::new(graph.len(), 7);
+        let origin = "192.0.2.1:12345".parse().unwrap();
+        let target = "198.51.100.2:443".parse().unwrap();
+        let mut facts = HashMap::new();
+        facts.insert("tls.alpn", vec!["h2".into()]);
+        fn context<'a>(
+            facts: &'a HashMap<&'static str, Vec<String>>,
+            updated: &'a [&'static str],
+            origin: SocketAddr,
+            target: SocketAddr,
+        ) -> FlowContext<'a> {
+            FlowContext {
+                protocol: Protocol::Tcp,
+                scope: FlowScope(9),
+                source: origin,
+                destination: target,
+                origin,
+                target,
+                reverse: false,
+                payload: &[],
+                facts,
+                updated,
+            }
+        }
+        assert!(
+            graph
+                .evaluate(
+                    &context(&facts, &["tls.alpn"], origin, target),
+                    &mut state,
+                    None,
+                    false
+                )
+                .is_none()
+        );
+        facts.insert("http2.stream_id", vec!["1".into()]);
+        facts.insert("http2.path", vec!["/one".into()]);
+        assert!(
+            graph
+                .evaluate(
+                    &context(&facts, &["http2.stream_id", "http2.path"], origin, target),
+                    &mut state,
+                    None,
+                    false,
+                )
+                .is_none()
+        );
+        facts.insert("http2.stream_id", vec!["3".into()]);
+        facts.insert("http2.status", vec!["404".into()]);
+        assert!(
+            graph
+                .evaluate(
+                    &context(&facts, &["http2.stream_id", "http2.status"], origin, target),
+                    &mut state,
+                    None,
+                    false,
+                )
+                .is_none()
+        );
+        facts.insert("http2.stream_id", vec!["1".into()]);
+        let decision = graph
+            .evaluate(
+                &context(&facts, &["http2.stream_id", "http2.status"], origin, target),
+                &mut state,
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(decision.id, "decision");
+        assert_eq!(decision.via, "carrier,request");
+        assert_eq!(decision.stream_scope.as_deref(), Some("http2.stream_id:1"));
+    }
 
     #[test]
     fn http3_rules_evaluate_the_matching_request_stream() {
@@ -2081,6 +2432,7 @@ mod tests {
                 context: Vec::new(),
                 observations,
                 allow_continues: true,
+                end_stream: None,
             }],
             finished,
         }

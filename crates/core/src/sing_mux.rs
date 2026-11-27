@@ -150,6 +150,7 @@ impl SingMuxH2 {
                 },
             ],
             allow_continues: true,
+            end_stream: None,
         }
     }
 
@@ -213,6 +214,7 @@ impl SingMuxH2 {
             context: state.headers.clone(),
             observations,
             allow_continues: true,
+            end_stream: None,
         })
     }
 }
